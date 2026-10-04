@@ -3565,6 +3565,16 @@ fn normalize_provider_hint(provider_id: Option<&str>) -> Option<&str> {
 /// normalization only under an OpenAI provider hint prevents those rows from
 /// displacing OpenAI's base tariff while preserving literal lookups for every
 /// other provider.
+/// The standard GPT model a `gpt-<version>-fast` terminal id names, or `None`
+/// when the id is not an OpenAI Fast-mode alias. Shared by price resolution
+/// (`normalize_openai_fast_mode`) and premium inference
+/// (`has_openai_gpt_fast_suffix` in lib.rs) so the two cannot drift on what
+/// counts as a Fast alias.
+pub(crate) fn openai_gpt_fast_base(terminal: &str) -> Option<&str> {
+    let base = terminal.strip_suffix("-fast")?;
+    (base.starts_with("gpt-") && base.len() > "gpt-".len()).then_some(base)
+}
+
 fn normalize_openai_fast_mode(model_id: &str, provider_id: Option<&str>) -> Option<String> {
     if provider_id
         .and_then(provider_identity::canonical_provider)
@@ -3579,10 +3589,7 @@ fn normalize_openai_fast_mode(model_id: &str, provider_id: Option<&str>) -> Opti
         .map_or((None, model_id), |(prefix, terminal)| {
             (Some(prefix), terminal)
         });
-    let base = terminal.strip_suffix("-fast")?;
-    if !base.starts_with("gpt-") || base.len() == "gpt-".len() {
-        return None;
-    }
+    let base = openai_gpt_fast_base(terminal)?;
 
     Some(match prefix {
         Some(prefix) => format!("{prefix}/{base}"),
