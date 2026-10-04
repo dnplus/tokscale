@@ -1000,9 +1000,12 @@ pub(crate) fn merge_message_completeness(
     // (with no cached tokens the remainder IS the whole prompt).
     let existing_has_cache = existing.tokens.cache_read > 0 || existing.tokens.cache_write > 0;
     let candidate_has_cache = candidate.tokens.cache_read > 0 || candidate.tokens.cache_write > 0;
+    // A cache-bearing copy can still be silent about `input_tokens` (parsed as
+    // 0, see `merge_claude_duplicate`); silence is not a claim of zero, so it
+    // only wins when it actually states a positive remainder.
     existing.tokens.input = match (existing_has_cache, candidate_has_cache) {
-        (true, false) => existing.tokens.input,
-        (false, true) => candidate.tokens.input,
+        (true, false) if existing.tokens.input > 0 => existing.tokens.input,
+        (false, true) if candidate.tokens.input > 0 => candidate.tokens.input,
         _ => existing.tokens.input.max(candidate.tokens.input),
     };
     existing.tokens.output = existing.tokens.output.max(candidate.tokens.output);
@@ -3672,6 +3675,16 @@ mod tests {
         let mut neither = message(10, 0, 0);
         merge_message_completeness(&mut neither, &message(50, 0, 0));
         assert_eq!(neither.tokens.input, 50);
+
+        // A cache-bearing copy silent about input (parsed as 0) must not erase
+        // a snapshot's real input, in either direction.
+        let mut silent = message(0, 42_000, 120);
+        merge_message_completeness(&mut silent, &message(42_494, 0, 0));
+        assert_eq!(silent.tokens.input, 42_494);
+        let mut snapshot_first = message(42_494, 0, 0);
+        merge_message_completeness(&mut snapshot_first, &message(0, 42_000, 120));
+        assert_eq!(snapshot_first.tokens.input, 42_494);
+        assert_eq!(snapshot_first.tokens.cache_read, 42_000);
     }
 
     #[test]

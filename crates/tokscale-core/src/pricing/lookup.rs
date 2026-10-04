@@ -3557,14 +3557,6 @@ fn normalize_provider_hint(provider_id: Option<&str>) -> Option<&str> {
         .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("unknown"))
 }
 
-/// Strip OpenAI's request-speed mode from the model identity.
-///
-/// Codex records `-fast` on GPT ids when the request used OpenAI's fast mode,
-/// but the mode does not identify a separately priced model. Catalogs can
-/// still contain reseller rows whose literal id ends in `-fast`; applying this
-/// normalization only under an OpenAI provider hint prevents those rows from
-/// displacing OpenAI's base tariff while preserving literal lookups for every
-/// other provider.
 /// The standard GPT model a `gpt-<version>-fast` terminal id names, or `None`
 /// when the id is not an OpenAI Fast-mode alias. Shared by price resolution
 /// (`normalize_openai_fast_mode`) and premium inference
@@ -3575,6 +3567,14 @@ pub(crate) fn openai_gpt_fast_base(terminal: &str) -> Option<&str> {
     (base.starts_with("gpt-") && base.len() > "gpt-".len()).then_some(base)
 }
 
+/// Strip OpenAI's request-speed mode from the model identity.
+///
+/// Codex records `-fast` on GPT ids when the request used OpenAI's fast mode,
+/// but the mode does not identify a separately priced model. Catalogs can
+/// still contain reseller rows whose literal id ends in `-fast`; applying this
+/// normalization only under an OpenAI provider hint prevents those rows from
+/// displacing OpenAI's base tariff while preserving literal lookups for every
+/// other provider.
 fn normalize_openai_fast_mode(model_id: &str, provider_id: Option<&str>) -> Option<String> {
     if provider_id
         .and_then(provider_identity::canonical_provider)
