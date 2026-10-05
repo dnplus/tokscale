@@ -10,14 +10,22 @@
 //! {}
 //! ```
 //!
-//! No CSRF token is required for this method, and tokscale never has to hold
-//! an Antigravity credential of its own for that path — the token stays inside
-//! the language server and we only read the numbers it already computed.
+//! The `agy` CLI's own language server answers this without a CSRF token on
+//! its plain-HTTP port. The IDE's language server (`Antigravity.app`) rejects
+//! the same request with `401 missing CSRF token`, so it is asked through
+//! [`crate::antigravity::rpc_request`] with the token from its command line,
+//! on whichever of its HTTP / HTTPS ports answered the heartbeat. Either way
+//! tokscale never holds an Antigravity credential of its own for that path —
+//! the token stays inside the language server and we only read the numbers it
+//! already computed.
 //!
-//! When the language server is down or signed out, fall back to
+//! When no language server answers, fall back to
 //! `agy --print /usage --output-format json`. That command uses the CLI's own
-//! login under `~/.gemini/oauth_creds.json` and returns the same group/bucket
-//! shape. Tokscale still does not refresh or rewrite those credentials.
+//! login and returns the same group/bucket shape. The login lives at
+//! `~/.gemini/antigravity-cli/antigravity-oauth-token` on current installs and
+//! at `~/.gemini/oauth_creds.json` on older ones; either file (under
+//! `$GEMINI_CLI_HOME` when set) admits the provider. Tokscale only checks that
+//! one exists and never reads, refreshes, or rewrites it.
 //!
 //! Calling Google's `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota`
 //! directly was tried first and rejected: authentication succeeds, but a
@@ -135,10 +143,11 @@ struct QuotaBucket {
 
 /// Whether quota can be read right now.
 ///
-/// Prefer a language server that answers with at least one group. When that
-/// probe finds nothing, admit the CLI fallback when `agy` is on `PATH` and
-/// `~/.gemini/oauth_creds.json` (or `$GEMINI_CLI_HOME/oauth_creds.json`) exists.
-/// The file check is cheap; the CLI itself is only spawned in [`fetch_all`].
+/// Mirrors [`fetch_all`]'s order so the gate never rejects a provider the
+/// fetch could have served: a language server that answers with at least one
+/// group, else the CLI fallback when `agy` resolves (`$TOKSCALE_AGY_BIN` or
+/// `PATH`) and a login signal exists -- see [`agy_login_signal_paths`]. The
+/// file checks are cheap; the CLI itself is only spawned in [`fetch_all`].
 pub fn has_credentials() -> bool {
     off_caller_runtime(|| {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -170,6 +179,9 @@ pub fn fetch_all() -> Result<Vec<UsageOutput>> {
                 }
             }
 
+            // No older credential path follows this one: calling Code Assist
+            // directly with a Gemini CLI identity is refused (see the module
+            // docs), so `agy` is the last layer.
             let summary = fetch_via_agy_cli().context(
                 "Antigravity language server has no quota and `agy --print /usage` failed. \
                  Run `agy` and sign in, then retry.",
@@ -207,12 +219,50 @@ fn gemini_home() -> Option<PathBuf> {
         .or_else(|| tokscale_core::paths::home_dir().map(|home| home.join(".gemini")))
 }
 
-fn oauth_creds_path() -> Option<PathBuf> {
-    Some(gemini_home()?.join("oauth_creds.json"))
+/// Gemini homes to look for an `agy` login in: `$GEMINI_CLI_HOME` when set,
+/// and `~/.gemini` regardless, because `agy` keeps its own login under the
+/// real home even when `GEMINI_CLI_HOME` points the Gemini CLI elsewhere.
+fn gemini_homes() -> Vec<PathBuf> {
+    let mut homes: Vec<PathBuf> = Vec::new();
+    for home in [
+        gemini_home(),
+        tokscale_core::paths::home_dir().map(|home| home.join(".gemini")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !homes.contains(&home) {
+            homes.push(home);
+        }
+    }
+    homes
+}
+
+/// Files whose presence says `agy` has a login `/usage` can answer with.
+///
+/// - `antigravity-cli/antigravity-oauth-token`: where current `agy` keeps its
+///   login. A machine signed in only through `agy` has this and nothing else.
+/// - `oauth_creds.json`: the older Gemini CLI login, which `agy` also reads.
+///
+/// Existence only: tokscale never opens either file.
+fn agy_login_signal_paths() -> Vec<PathBuf> {
+    gemini_homes()
+        .into_iter()
+        .flat_map(|home| {
+            [
+                home.join("antigravity-cli").join("antigravity-oauth-token"),
+                home.join("oauth_creds.json"),
+            ]
+        })
+        .collect()
+}
+
+fn has_agy_login_signal() -> bool {
+    agy_login_signal_paths().iter().any(|path| path.is_file())
 }
 
 fn agy_cli_available() -> bool {
-    oauth_creds_path().is_some_and(|path| path.is_file()) && resolve_agy_bin().is_some()
+    resolve_agy_bin().is_some() && has_agy_login_signal()
 }
 
 fn resolve_agy_bin() -> Option<PathBuf> {
@@ -356,7 +406,7 @@ fn fetch_via_agy_cli() -> Result<QuotaSummary> {
 /// impossible for whatever entry point is added next. The scope joins before
 /// returning, so both entry points stay as synchronous as they were.
 /// `crate::antigravity::https_rpc_request` isolates its own `block_on` the
-/// same way, and that one is reachable today: [`detected_ports`] walks into it
+/// same way, and that one is reachable today: [`quota_from_detected_language_servers`] walks into it
 /// synchronously from inside the runtime `has_credentials` just entered.
 fn off_caller_runtime<T: Send>(work: impl FnOnce() -> T + Send) -> std::thread::Result<T> {
     std::thread::scope(|scope| scope.spawn(work).join())
@@ -524,8 +574,10 @@ async fn call_rpc(client: reqwest::Client, port: u16) -> Result<QuotaSummary> {
 /// 1. The CLI log, which records `listening on random port at NNNN for HTTP`
 ///    on every start. Reading one file beats enumerating processes.
 /// 2. [`crate::antigravity::detect_antigravity_connections`], which finds the
-///    IDE's language server. That path needs a CSRF token on the process
-///    command line, which the `agy` CLI does not have — hence source 1.
+///    IDE's language server. That server demands the CSRF token from its
+///    command line (the `agy` CLI's server has none and needs none — hence
+///    source 1), so it is asked by [`quota_from_detected_language_servers`]
+///    rather than raced token-less like the logged ports.
 ///
 /// Candidates are asked rather than trusted: the process listens on both an
 /// HTTPS (gRPC) port and an HTTP one, and only the latter speaks plain JSON.
@@ -534,7 +586,10 @@ async fn call_rpc(client: reqwest::Client, port: u16) -> Result<QuotaSummary> {
 /// port the same question again, which is a second round trip for an answer
 /// already in hand.
 async fn discover_quota() -> Option<QuotaSummary> {
-    discover_quota_from(&[&ports_from_cli_log, &detected_ports]).await
+    if let Some(summary) = discover_quota_from(&[&ports_from_cli_log]).await {
+        return Some(summary);
+    }
+    quota_from_detected_language_servers()
 }
 
 /// Ask each source in turn and stop at the first that answers.
@@ -552,21 +607,35 @@ async fn discover_quota_from(sources: &[&dyn Fn() -> Vec<u16>]) -> Option<QuotaS
     None
 }
 
-/// Ports of the IDE language servers found by scanning processes.
+/// Quota from an IDE language server found by scanning processes.
 ///
 /// Reached only when the log offered nothing, which keeps `ps` plus a
 /// heartbeat per port off the common path. Unlike source 1 this is
 /// synchronous and brings its own per-socket timeouts, so it sits outside
 /// either round's deadline.
-fn detected_ports() -> Vec<u16> {
-    crate::antigravity::detect_antigravity_connections()
-        .map(|connections| {
-            connections
-                .into_iter()
-                .map(|connection| connection.port)
-                .collect()
-        })
-        .unwrap_or_default()
+///
+/// The token-less [`call_rpc`] used to be raced against these ports, which a
+/// current IDE server answers with `401 missing CSRF token` on its HTTP port
+/// and a protocol error on its HTTPS one -- so an IDE-only machine never got
+/// quota from here. [`crate::antigravity::rpc_request`] sends the token the
+/// heartbeat was verified with and picks HTTP or HTTPS per port.
+fn quota_from_detected_language_servers() -> Option<QuotaSummary> {
+    let connections = crate::antigravity::detect_antigravity_connections().ok()?;
+    connections.iter().find_map(|connection| {
+        let value = crate::antigravity::rpc_request(
+            connection,
+            "RetrieveUserQuotaSummary",
+            &serde_json::json!({}),
+        )
+        .ok()?;
+        quota_summary_from_rpc_value(value).filter(|summary| !summary.groups.is_empty())
+    })
+}
+
+fn quota_summary_from_rpc_value(value: serde_json::Value) -> Option<QuotaSummary> {
+    serde_json::from_value::<QuotaSummaryEnvelope>(value)
+        .ok()
+        .map(|envelope| envelope.response)
 }
 
 /// Ask every candidate at once and keep the best answer.
@@ -1483,10 +1552,7 @@ mod tests {
         assert_eq!(summary.groups.len(), 1);
         assert_eq!(summary.groups[0].display_name, "Gemini Models");
         assert_eq!(summary.groups[0].buckets.len(), 1);
-        assert_eq!(
-            summary.groups[0].buckets[0].remaining_fraction,
-            Some(0.84)
-        );
+        assert_eq!(summary.groups[0].buckets[0].remaining_fraction, Some(0.84));
         let outputs = outputs_from_summary(summary, Some("cli"));
         assert_eq!(outputs[0].credential_source.as_deref(), Some("cli"));
         assert!((outputs[0].metrics[0].remaining_percent - 84.0).abs() < 1e-6);
@@ -1706,6 +1772,152 @@ mod tests {
             let _ = has_credentials();
             let _ = fetch_all();
         });
+    }
+
+    /// Keys the login-signal tests redirect. `PATH` is included so the real
+    /// `agy` on a developer machine cannot satisfy the binary check.
+    const AGY_ENV_KEYS: [&str; 5] = [
+        "HOME",
+        "USERPROFILE",
+        "GEMINI_CLI_HOME",
+        "TOKSCALE_AGY_BIN",
+        "PATH",
+    ];
+
+    fn isolate_agy_env(env: &mut EnvGuard, home: &TempDir) {
+        for key in HOME_ENV_KEYS {
+            env.set(key, home.path());
+        }
+        unsafe { std::env::remove_var("GEMINI_CLI_HOME") };
+        unsafe { std::env::remove_var("TOKSCALE_AGY_BIN") };
+        let empty_path = home.path().join("empty-path");
+        std::fs::create_dir_all(&empty_path).unwrap();
+        env.set("PATH", &empty_path);
+    }
+
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"fixture").unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn agy_cli_oauth_token_alone_is_a_login_signal() {
+        let mut env = EnvGuard::capture(&AGY_ENV_KEYS);
+        let home = TempDir::new().unwrap();
+        isolate_agy_env(&mut env, &home);
+
+        assert!(!has_agy_login_signal(), "an empty home has no login");
+
+        touch(
+            &home
+                .path()
+                .join(".gemini")
+                .join("antigravity-cli")
+                .join("antigravity-oauth-token"),
+        );
+        assert!(
+            has_agy_login_signal(),
+            "agy's own token must count without oauth_creds.json"
+        );
+        assert!(!home
+            .path()
+            .join(".gemini")
+            .join("oauth_creds.json")
+            .exists());
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_oauth_creds_is_still_a_login_signal() {
+        let mut env = EnvGuard::capture(&AGY_ENV_KEYS);
+        let home = TempDir::new().unwrap();
+        isolate_agy_env(&mut env, &home);
+
+        touch(&home.path().join(".gemini").join("oauth_creds.json"));
+        assert!(has_agy_login_signal());
+    }
+
+    #[test]
+    #[serial]
+    fn gemini_cli_home_is_searched_for_the_agy_token() {
+        let mut env = EnvGuard::capture(&AGY_ENV_KEYS);
+        let home = TempDir::new().unwrap();
+        isolate_agy_env(&mut env, &home);
+        let custom = TempDir::new().unwrap();
+        env.set("GEMINI_CLI_HOME", custom.path());
+
+        assert!(!has_agy_login_signal());
+        touch(
+            &custom
+                .path()
+                .join("antigravity-cli")
+                .join("antigravity-oauth-token"),
+        );
+        assert!(has_agy_login_signal());
+    }
+
+    #[test]
+    #[serial]
+    fn real_home_token_counts_when_gemini_cli_home_points_elsewhere() {
+        let mut env = EnvGuard::capture(&AGY_ENV_KEYS);
+        let home = TempDir::new().unwrap();
+        isolate_agy_env(&mut env, &home);
+        let custom = TempDir::new().unwrap();
+        env.set("GEMINI_CLI_HOME", custom.path());
+
+        touch(
+            &home
+                .path()
+                .join(".gemini")
+                .join("antigravity-cli")
+                .join("antigravity-oauth-token"),
+        );
+        assert!(has_agy_login_signal());
+    }
+
+    #[test]
+    #[serial]
+    fn cli_fallback_needs_both_a_binary_and_a_login() {
+        let mut env = EnvGuard::capture(&AGY_ENV_KEYS);
+        let home = TempDir::new().unwrap();
+        isolate_agy_env(&mut env, &home);
+
+        let token = home
+            .path()
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("antigravity-oauth-token");
+        let agy = home.path().join("bin").join("agy");
+
+        assert!(!agy_cli_available(), "neither binary nor login");
+
+        touch(&token);
+        assert!(!agy_cli_available(), "login without a binary");
+
+        std::fs::remove_file(&token).unwrap();
+        touch(&agy);
+        env.set("TOKSCALE_AGY_BIN", &agy);
+        assert!(!agy_cli_available(), "binary without a login");
+
+        touch(&token);
+        assert!(agy_cli_available(), "TOKSCALE_AGY_BIN plus agy token");
+
+        unsafe { std::env::remove_var("TOKSCALE_AGY_BIN") };
+        env.set("PATH", agy.parent().unwrap());
+        assert!(agy_cli_available(), "agy on PATH plus agy token");
+    }
+
+    #[test]
+    fn csrf_rpc_value_parses_like_the_plain_http_answer() {
+        let value: serde_json::Value = serde_json::from_str(FIXTURE_QUOTA).unwrap();
+        let summary = quota_summary_from_rpc_value(value).expect("envelope parses");
+        assert_eq!(summary.groups.len(), 1);
+        assert_eq!(summary.groups[0].display_name, "Fixture Models");
+
+        assert!(
+            quota_summary_from_rpc_value(serde_json::json!({"code": "unauthenticated"})).is_none()
+        );
     }
 
     #[test]

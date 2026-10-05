@@ -2066,7 +2066,11 @@ fn fetch_historical_session_artifact(
     Ok(None)
 }
 
-fn rpc_request(connection: &AntigravityConnection, method: &str, body: &Value) -> Result<Value> {
+pub(crate) fn rpc_request(
+    connection: &AntigravityConnection,
+    method: &str,
+    body: &Value,
+) -> Result<Value> {
     // A port already known to speak TLS will never answer plaintext, so the
     // plaintext leg here is pure latency — see [`RpcTransport`]. Deliberately
     // no plaintext retry on failure: a listener does not change protocol
