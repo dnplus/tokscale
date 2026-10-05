@@ -419,7 +419,7 @@ fn usage_providers(codex_fetch: Fetch) -> Vec<UsageProvider> {
             "grok-bot",
             "Grok Bot",
             cursor::has_grok_bot_credentials,
-            Fetch::Single(cursor::fetch_grok_bot),
+            Fetch::Multi(cursor::fetch_grok_bot),
         ),
         (
             "grok",

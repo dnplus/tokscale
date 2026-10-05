@@ -114,7 +114,7 @@ pub fn fetch() -> Result<UsageOutput> {
 }
 
 /// Grok Bot weekly included usage for the active Cursor desktop account.
-pub fn fetch_grok_bot() -> Result<UsageOutput> {
+pub fn fetch_grok_bot() -> Result<Vec<UsageOutput>> {
     let auth = resolve_local_auth()?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -124,8 +124,10 @@ pub fn fetch_grok_bot() -> Result<UsageOutput> {
         let access = bearer_for_request(&auth, now).await?;
         let client = plan_http_client()?;
         let sand = connect_post(&client, SAND_USAGE_URL, &access, "GetSandUsageStatus").await?;
-        let parsed = parse_sand_usage(&sand)?;
-        Ok(UsageOutput {
+        let Some(parsed) = parse_sand_usage(&sand)? else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![UsageOutput {
             provider: GROK_BOT_PROVIDER.to_string(),
             account: None,
             credential_source: Some("desktop".into()),
@@ -135,7 +137,7 @@ pub fn fetch_grok_bot() -> Result<UsageOutput> {
             reset_credits: None,
             credit_status: None,
             spend_control: None,
-        })
+        }])
     })
 }
 
@@ -147,22 +149,33 @@ struct ParsedSandUsage {
 
 /// Parse `GetSandUsageStatus`. Hide when the account has no personal included
 /// Grok Bot allowance (pooled enterprise, zero limit, or missing percent).
-fn parse_sand_usage(value: &Value) -> Result<ParsedSandUsage> {
+fn parse_sand_usage(value: &Value) -> Result<Option<ParsedSandUsage>> {
     if value
         .get("usesPooledEnterpriseAllowance")
         .and_then(Value::as_bool)
         == Some(true)
     {
-        anyhow::bail!("Grok Bot uses a pooled enterprise allowance with no personal share");
+        return Ok(None);
     }
-    if value.get("hasNonZeroIncludedLimit").and_then(Value::as_bool) == Some(false) {
-        anyhow::bail!("Grok Bot has no included weekly allowance on this Cursor account");
+    if value
+        .get("hasNonZeroIncludedLimit")
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        return Ok(None);
     }
-    let used = value
+    let Some(percent) = value
         .get("usagePercent")
-        .and_then(Value::as_f64)
+        .filter(|percent| !percent.is_null())
+    else {
+        return Ok(None);
+    };
+    let used = percent
+        .as_f64()
         .filter(|percent| percent.is_finite() && (0.0..=100.0).contains(percent))
-        .ok_or_else(|| anyhow::anyhow!("Grok Bot GetSandUsageStatus had no usagePercent"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("Grok Bot GetSandUsageStatus had an invalid usagePercent")
+        })?;
     let (used_percent, remaining_percent) = round_pair(used);
     let resets_at = sand_reset_iso(value.get("nextResetTimestampUtc"));
     let plan = value
@@ -179,7 +192,7 @@ fn parse_sand_usage(value: &Value) -> Result<ParsedSandUsage> {
                 .filter(|name| !name.is_empty())
                 .map(str::to_string)
         });
-    Ok(ParsedSandUsage {
+    Ok(Some(ParsedSandUsage {
         metric: UsageMetric {
             label: "Weekly".into(),
             used_percent,
@@ -188,7 +201,7 @@ fn parse_sand_usage(value: &Value) -> Result<ParsedSandUsage> {
             resets_at,
         },
         plan,
-    })
+    }))
 }
 
 fn sand_reset_iso(value: Option<&Value>) -> Option<String> {
@@ -216,7 +229,11 @@ fn metrics_from_tracks(tracks: &ParsedPlanTracks) -> Vec<UsageMetric> {
     metrics
 }
 
-fn metric_from_window(label: &str, window: &ParsedPlanWindow, reset_at: Option<String>) -> UsageMetric {
+fn metric_from_window(
+    label: &str,
+    window: &ParsedPlanWindow,
+    reset_at: Option<String>,
+) -> UsageMetric {
     UsageMetric {
         label: label.into(),
         used_percent: window.used_percent,
@@ -233,7 +250,9 @@ fn plan_http_client() -> Result<reqwest::Client> {
     let builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
     #[cfg(not(target_os = "android"))]
     let builder = builder.use_native_tls();
-    builder.build().context("Failed to build Cursor plan HTTP client")
+    builder
+        .build()
+        .context("Failed to build Cursor plan HTTP client")
 }
 
 fn access_token_usable(token: &str) -> bool {
@@ -374,15 +393,14 @@ fn read_vscdb_value(db_path: &std::path::Path, key: &str) -> Result<Option<Strin
     )
     .with_context(|| format!("Failed to open Cursor state DB at {}", db_path.display()))?;
 
-    let value: Option<String> = match conn.query_row(
-        "SELECT value FROM ItemTable WHERE key = ?1",
-        [key],
-        |row| row.get(0),
-    ) {
-        Ok(value) => Some(value),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(err) => return Err(err.into()),
-    };
+    let value: Option<String> =
+        match conn.query_row("SELECT value FROM ItemTable WHERE key = ?1", [key], |row| {
+            row.get(0)
+        }) {
+            Ok(value) => Some(value),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(err) => return Err(err.into()),
+        };
     Ok(value
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty()))
@@ -419,8 +437,7 @@ async fn refresh_access_token(refresh_token: &str) -> Result<String> {
     if !status.is_success() {
         anyhow::bail!("Cursor token refresh returned HTTP {status}");
     }
-    let value: Value =
-        serde_json::from_str(&body).context("Cursor token refresh was not JSON")?;
+    let value: Value = serde_json::from_str(&body).context("Cursor token refresh was not JSON")?;
     if value
         .get("shouldLogout")
         .and_then(Value::as_bool)
@@ -471,20 +488,18 @@ fn parse_plan_tracks(usage: &Value, plan: Option<&Value>) -> Result<ParsedPlanTr
     let reset_at = billing_reset_iso(usage.get("billingCycleEnd")).or_else(|| {
         billing_reset_iso(plan.and_then(|value| value.pointer("/planInfo/billingCycleEnd")))
     });
-    let auto = percent_field(plan_usage, "autoPercentUsed").map(|(used, remaining)| {
-        ParsedPlanWindow {
+    let auto =
+        percent_field(plan_usage, "autoPercentUsed").map(|(used, remaining)| ParsedPlanWindow {
             used_percent: used,
             remaining_percent: remaining,
             reset_at: reset_at.clone(),
-        }
-    });
-    let api = percent_field(plan_usage, "apiPercentUsed").map(|(used, remaining)| {
-        ParsedPlanWindow {
+        });
+    let api =
+        percent_field(plan_usage, "apiPercentUsed").map(|(used, remaining)| ParsedPlanWindow {
             used_percent: used,
             remaining_percent: remaining,
             reset_at: reset_at.clone(),
-        }
-    });
+        });
     let total = plan_percents(plan_usage)
         .ok()
         .map(|(used_percent, remaining_percent)| ParsedPlanWindow {
@@ -612,10 +627,7 @@ mod tests {
         let window = parse_plan_window(&usage, None).unwrap();
         assert!((window.used_percent - 37.5).abs() < f64::EPSILON);
         assert!((window.remaining_percent - 62.5).abs() < f64::EPSILON);
-        assert_eq!(
-            window.reset_at.as_deref(),
-            Some("2026-01-01T00:00:00.000Z")
-        );
+        assert_eq!(window.reset_at.as_deref(), Some("2026-01-01T00:00:00.000Z"));
     }
 
     #[test]
@@ -646,7 +658,7 @@ mod tests {
             "grokPlanLabel": "Grok Bot Plan",
             "cursorPlanName": "Ultra"
         });
-        let parsed = parse_sand_usage(&sand).unwrap();
+        let parsed = parse_sand_usage(&sand).unwrap().unwrap();
         assert_eq!(parsed.metric.label, "Weekly");
         assert!((parsed.metric.used_percent - 15.95).abs() < 0.01);
         assert!((parsed.metric.remaining_percent - 84.05).abs() < 0.01);
@@ -658,24 +670,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_sand_usage_hides_pooled_and_zero_limit() {
-        assert!(parse_sand_usage(&json!({
-            "usesPooledEnterpriseAllowance": true,
-            "usagePercent": 10.0,
-            "hasNonZeroIncludedLimit": true
-        }))
-        .is_err());
-        assert!(parse_sand_usage(&json!({
-            "hasNonZeroIncludedLimit": false,
-            "usagePercent": 10.0
-        }))
-        .is_err());
-        assert!(parse_sand_usage(&json!({
-            "hasNonZeroIncludedLimit": true
-        }))
-        .is_err());
+    fn no_personal_grok_bot_quota_is_a_successful_empty_result() {
+        for response in [
+            json!({"usesPooledEnterpriseAllowance": true, "usagePercent": 10.0}),
+            json!({"hasNonZeroIncludedLimit": false, "usagePercent": 10.0}),
+            json!({"hasNonZeroIncludedLimit": true}),
+        ] {
+            assert!(
+                parse_sand_usage(&response).unwrap().is_none(),
+                "no personal quota must not create a fetch diagnostic"
+            );
+        }
     }
 
+    #[test]
+    fn invalid_grok_bot_percent_is_still_reported() {
+        for percent in [json!(-1), json!(101), json!("unrecognized")] {
+            assert!(parse_sand_usage(
+                &json!({"hasNonZeroIncludedLimit": true, "usagePercent": percent})
+            )
+            .is_err());
+        }
+        assert!(parse_sand_usage(&json!({"usagePercent": null}))
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn parse_plan_window_from_remaining_and_limit() {
@@ -687,7 +706,11 @@ mod tests {
         let window = parse_plan_window(&usage, Some(&plan)).unwrap();
         assert!((window.used_percent - 75.0).abs() < f64::EPSILON);
         assert!((window.remaining_percent - 25.0).abs() < f64::EPSILON);
-        assert!(window.reset_at.as_deref().unwrap().starts_with("2026-02-01"));
+        assert!(window
+            .reset_at
+            .as_deref()
+            .unwrap()
+            .starts_with("2026-02-01"));
     }
 
     #[test]
@@ -703,6 +726,7 @@ mod tests {
         assert!(!access_token_usable("ciphertext-or-empty"));
         assert!(!access_token_usable("a.b"));
     }
+
     fn auth_with_expiry(exp: i64, refresh: Option<&str>) -> LocalCursorAuth {
         use base64::Engine;
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
