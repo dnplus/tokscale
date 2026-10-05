@@ -76,10 +76,12 @@ unicode-normalization = "0.1"
 unicode-width = { workspace = true }
 unicode-segmentation = { workspace = true }
 
-# Trae iCubeAuthInfo decryption (Electron globalStorage)
+# Trae iCubeAuthInfo + Grok Bot Electron safeStorage decryption
 aes = { workspace = true }
 cbc = { workspace = true }
 base64 = { workspace = true }
+pbkdf2 = "0.12"
+sha1 = "0.10"
 
 # Cursor desktop state.vscdb accessToken import
 rusqlite = { workspace = true }
