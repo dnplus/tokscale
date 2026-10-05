@@ -273,8 +273,8 @@ fn clear_cooldown() {
 // usage instead.
 //
 // On macOS, Claude Code keeps the durable login in Keychain and may leave a
-// stale `~/.claude/.credentials.json` behind. Prefer the store whose
-// `expiresAt` is later so a leftover file cannot shadow a live Keychain login.
+// stale `~/.claude/.credentials.json` behind. Prefer a usable Keychain login:
+// `expiresAt` describes token lifetime, not when the account last logged in.
 
 #[derive(Debug, Clone, Deserialize)]
 struct Credentials {
@@ -283,18 +283,26 @@ struct Credentials {
 }
 
 /// Deliberately does not model `refreshToken`: tokscale has no use for a
-/// credential it must not spend. `expiresAt` is read only to choose between the
-/// file and Keychain copies of the same login.
+/// credential it must not spend. `expiresAt` is read only to detect a known
+/// expired Keychain token when a usable file token is available.
 #[derive(Debug, Clone, Deserialize)]
 struct Oauth {
     #[serde(rename = "accessToken")]
     access_token: Option<String>,
-    #[serde(rename = "expiresAt")]
+    #[serde(rename = "expiresAt", default, deserialize_with = "lenient_expiry_ms")]
     expires_at: Option<i64>,
     #[serde(rename = "subscriptionType")]
     subscription_type: Option<String>,
     #[serde(rename = "rateLimitTier")]
     rate_limit_tier: Option<String>,
+}
+
+fn lenient_expiry_ms<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Optional metadata must not make an otherwise usable login unreadable.
+    Ok(serde_json::Value::deserialize(deserializer)?.as_i64())
 }
 
 #[derive(Debug, Deserialize)]
@@ -406,25 +414,42 @@ fn access_token(creds: &Credentials) -> Option<&str> {
 }
 
 fn expiry_ms(creds: &Credentials) -> Option<i64> {
-    creds.claude_ai_oauth.as_ref().and_then(|oauth| oauth.expires_at)
+    creds
+        .claude_ai_oauth
+        .as_ref()
+        .and_then(|oauth| oauth.expires_at)
 }
 
 /// Choose between the on-disk and Keychain copies of Claude Code's login.
 ///
 /// Claude Code's durable store on macOS is Keychain. A leftover
-/// `~/.claude/.credentials.json` must not win when its `expiresAt` is older.
+/// `~/.claude/.credentials.json` must not win just because its token lives
+/// longer, since it may belong to a previous account. Only a known expired
+/// Keychain token allows a usable file credential to take precedence.
 fn select_claude_credentials(
     file: Option<Credentials>,
     keychain: Option<Credentials>,
 ) -> Result<Credentials> {
+    select_claude_credentials_at(file, keychain, chrono::Utc::now().timestamp_millis())
+}
+
+fn select_claude_credentials_at(
+    file: Option<Credentials>,
+    keychain: Option<Credentials>,
+    now_ms: i64,
+) -> Result<Credentials> {
     let file = file.filter(|creds| access_token(creds).is_some());
     let keychain = keychain.filter(|creds| access_token(creds).is_some());
     match (file, keychain) {
-        (Some(file), Some(keychain)) => match (expiry_ms(&file), expiry_ms(&keychain)) {
-            (Some(file_exp), Some(keychain_exp)) if keychain_exp > file_exp => Ok(keychain),
-            (None, Some(_)) => Ok(keychain),
-            _ => Ok(file),
-        },
+        (Some(file), Some(keychain)) => {
+            let keychain_expired = expiry_ms(&keychain).is_some_and(|expiry| expiry <= now_ms);
+            let file_expired = expiry_ms(&file).is_some_and(|expiry| expiry <= now_ms);
+            if keychain_expired && !file_expired {
+                Ok(file)
+            } else {
+                Ok(keychain)
+            }
+        }
         (Some(file), None) => Ok(file),
         (None, Some(keychain)) => Ok(keychain),
         (None, None) => {
@@ -724,8 +749,8 @@ mod tests {
     use crate::commands::usage::test_server::{spawn_server, Seen};
 
     /// A Claude Code credential document with the fields tokscale models
-    /// (`accessToken`, `subscriptionType`, `rateLimitTier`), the fields it does
-    /// not (`refreshToken`, `expiresAt`, `scopes`), and a key that does not
+    /// (`accessToken`, `expiresAt`, `subscriptionType`, `rateLimitTier`), the
+    /// fields it does not (`refreshToken`, `scopes`), and a key that does not
     /// exist today -- Claude Code owns the schema and may add more.
     const FIXTURE: &str = r#"{
   "claudeAiOauth": {
@@ -886,7 +911,7 @@ mod tests {
 
     /// File-only reader for HomeGuard tests. Production [`read_credentials`]
     /// also consults the real Keychain, which on a developer Mac can outrank
-    /// the fixture by `expiresAt`.
+    /// the fixture as Claude Code's durable login store.
     fn file_only_credentials() -> Result<Credentials> {
         read_file_credentials()
     }
@@ -903,33 +928,30 @@ mod tests {
     }
 
     #[test]
-    fn select_credentials_prefers_keychain_when_its_expires_at_is_later() {
+    fn select_credentials_prefers_live_keychain_over_expired_file() {
         let file = creds_with("file-token", Some(1_000));
         let keychain = creds_with("keychain-token", Some(2_000));
-        let selected = select_claude_credentials(Some(file), Some(keychain)).unwrap();
+        let selected = select_claude_credentials_at(Some(file), Some(keychain), 1_500).unwrap();
         assert_eq!(access_token(&selected), Some("keychain-token"));
     }
 
     #[test]
-    fn select_credentials_keeps_file_when_it_is_newer_or_tied() {
-        let file = creds_with("file-token", Some(3_000));
-        let keychain = creds_with("keychain-token", Some(2_000));
-        let selected = select_claude_credentials(Some(file), Some(keychain)).unwrap();
-        assert_eq!(access_token(&selected), Some("file-token"));
-
-        let tied = select_claude_credentials(
+    fn select_credentials_prefers_keychain_when_expiries_tie() {
+        let selected = select_claude_credentials_at(
             Some(creds_with("file-token", Some(2_000))),
             Some(creds_with("keychain-token", Some(2_000))),
+            1_500,
         )
         .unwrap();
-        assert_eq!(access_token(&tied), Some("file-token"));
+        assert_eq!(access_token(&selected), Some("keychain-token"));
     }
 
     #[test]
     fn select_credentials_prefers_keychain_when_file_has_no_expiry() {
-        let selected = select_claude_credentials(
+        let selected = select_claude_credentials_at(
             Some(creds_with("file-token", None)),
             Some(creds_with("keychain-token", Some(2_000))),
+            1_500,
         )
         .unwrap();
         assert_eq!(access_token(&selected), Some("keychain-token"));
@@ -937,12 +959,113 @@ mod tests {
 
     #[test]
     fn select_credentials_uses_whichever_side_has_an_access_token() {
-        let from_keychain = select_claude_credentials(None, Some(creds_with("keychain-token", None)))
-            .unwrap();
+        let from_keychain =
+            select_claude_credentials(None, Some(creds_with("keychain-token", None))).unwrap();
         assert_eq!(access_token(&from_keychain), Some("keychain-token"));
 
-        let from_file = select_claude_credentials(Some(creds_with("file-token", None)), None).unwrap();
+        let from_file =
+            select_claude_credentials(Some(creds_with("file-token", None)), None).unwrap();
         assert_eq!(access_token(&from_file), Some("file-token"));
+    }
+
+    #[test]
+    fn select_credentials_does_not_treat_longer_token_lifetime_as_newer_login() {
+        let selected = select_claude_credentials(
+            Some(creds_with("previous-account-token", Some(i64::MAX))),
+            Some(creds_with("current-account-token", Some(i64::MAX - 1))),
+        )
+        .unwrap();
+        assert_eq!(access_token(&selected), Some("current-account-token"));
+    }
+
+    #[test]
+    fn select_credentials_prefers_keychain_without_expiry_over_live_file() {
+        let selected = select_claude_credentials(
+            Some(creds_with("previous-account-token", Some(i64::MAX))),
+            Some(creds_with("current-account-token", None)),
+        )
+        .unwrap();
+        assert_eq!(access_token(&selected), Some("current-account-token"));
+    }
+
+    #[test]
+    fn select_credentials_uses_file_when_keychain_is_expired() {
+        for file_expiry in [Some(i64::MAX), None] {
+            let selected = select_claude_credentials(
+                Some(creds_with("file-token", file_expiry)),
+                Some(creds_with("expired-keychain-token", Some(0))),
+            )
+            .unwrap();
+            assert_eq!(access_token(&selected), Some("file-token"));
+        }
+    }
+
+    #[test]
+    fn select_credentials_treats_expiry_at_current_time_as_expired() {
+        let selected = select_claude_credentials_at(
+            Some(creds_with("file-token", Some(2_000))),
+            Some(creds_with("expired-keychain-token", Some(1_500))),
+            1_500,
+        )
+        .unwrap();
+        assert_eq!(access_token(&selected), Some("file-token"));
+    }
+
+    #[test]
+    fn select_credentials_keeps_durable_account_when_both_tokens_are_expired() {
+        let selected = select_claude_credentials_at(
+            Some(creds_with("previous-account-token", Some(2_000))),
+            Some(creds_with("current-account-token", Some(1_000))),
+            3_000,
+        )
+        .unwrap();
+        assert_eq!(access_token(&selected), Some("current-account-token"));
+    }
+
+    #[test]
+    fn credential_parsing_accepts_missing_or_null_expiry() {
+        for document in [
+            serde_json::json!({"claudeAiOauth": {"accessToken": "valid-access-token"}}),
+            serde_json::json!({
+                "claudeAiOauth": {"accessToken": "valid-access-token", "expiresAt": null}
+            }),
+        ] {
+            let credentials = parse_credentials_json(&document.to_string()).unwrap();
+            assert_eq!(access_token(&credentials), Some("valid-access-token"));
+            assert_eq!(expiry_ms(&credentials), None);
+        }
+    }
+
+    #[test]
+    fn credential_parsing_ignores_noninteger_expiry() {
+        for expiry in [
+            serde_json::json!("1757000000000"),
+            serde_json::json!(1.5),
+            serde_json::json!(true),
+            serde_json::json!({"value": 1757000000000_i64}),
+            serde_json::json!([1757000000000_i64]),
+            serde_json::json!(u64::MAX),
+        ] {
+            let document = serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "valid-access-token",
+                    "expiresAt": expiry,
+                    "subscriptionType": "max"
+                }
+            });
+            let credentials = parse_credentials_json(&document.to_string())
+                .expect("unrecognized expiry must not discard a valid access token");
+            assert_eq!(access_token(&credentials), Some("valid-access-token"));
+            assert_eq!(expiry_ms(&credentials), None);
+            assert_eq!(
+                credentials
+                    .claude_ai_oauth
+                    .unwrap()
+                    .subscription_type
+                    .as_deref(),
+                Some("max")
+            );
+        }
     }
 
     /// #1001: a rejected access token must not make tokscale rewrite Claude
