@@ -5,20 +5,14 @@
 //! saved Tokscale Cursor session cookie. The IDE plan window is
 //! `GetCurrentPeriodUsage` on `api2.cursor.sh`. Grok Bot weekly usage is a
 //! separate Cursor-metered pool from `GetSandUsageStatus` (not the SuperGrok
-//! `cli-chat-proxy` credits used by the Grok / Grok Build card).
-//!
-//! On macOS, Grok Bot.app may store multiple Cursor accounts under
-//! `~/Library/Application Support/Grok Bot/sand-secrets.json` (`cursor-accounts`),
-//! encrypted with Electron safeStorage. Those tokens are decrypted via the
-//! Keychain item `Grok Bot Safe Storage` / `Grok Bot Key` so each signed-in
-//! account can get its own Grok Bot card. Refreshed access tokens stay in
-//! memory and are never written back.
+//! `cli-chat-proxy` credits used by the Grok / Grok Build card). Refreshed
+//! access tokens stay in memory and are never written back.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use serde_json::Value;
 
-use super::{UsageAccount, UsageMetric, UsageOutput};
+use super::{UsageMetric, UsageOutput};
 
 const USAGE_URL: &str = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage";
 const PLAN_URL: &str = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo";
@@ -32,9 +26,6 @@ const ACCESS_SERVICE: &str = "cursor-access-token";
 const REFRESH_SERVICE: &str = "cursor-refresh-token";
 const PROVIDER: &str = "Cursor";
 const GROK_BOT_PROVIDER: &str = "Grok Bot";
-/// Chromium / Electron safeStorage KDF salt and iteration count.
-const SAFE_STORAGE_SALT: &[u8] = b"saltysalt";
-const SAFE_STORAGE_ITERATIONS: u32 = 1003;
 
 #[derive(Debug, Clone, PartialEq)]
 struct ParsedPlanWindow {
@@ -65,9 +56,9 @@ pub fn has_credentials() -> bool {
     resolve_local_auth().is_ok()
 }
 
-/// Grok Bot.app multi-account store, or Cursor desktop auth as a fallback.
+/// Grok Bot is metered on the Cursor account, so the same desktop auth works.
 pub fn has_grok_bot_credentials() -> bool {
-    grok_bot_secrets_path().is_some_and(|path| path.is_file()) || has_credentials()
+    has_credentials()
 }
 
 pub fn fetch() -> Result<UsageOutput> {
@@ -122,63 +113,8 @@ pub fn fetch() -> Result<UsageOutput> {
     })
 }
 
-/// One Grok Bot card per signed-in Cursor account in Grok Bot.app when that
-/// store decrypts; otherwise a single card from Cursor desktop auth.
-pub fn fetch_grok_bot_all() -> Result<Vec<UsageOutput>> {
-    match load_grok_bot_app_accounts() {
-        Ok(accounts) if !accounts.is_empty() => {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(async {
-                let client = plan_http_client()?;
-                let mut outputs = Vec::new();
-                let mut errors = Vec::new();
-                for account in accounts {
-                    match fetch_sand_for_token(&client, &account.access_token).await {
-                        Ok(parsed) => outputs.push(UsageOutput {
-                            provider: GROK_BOT_PROVIDER.to_string(),
-                            account: Some(UsageAccount {
-                                id: account.id,
-                                label: account
-                                    .name
-                                    .clone()
-                                    .or_else(|| account.email.clone()),
-                                is_active: account.is_active,
-                            }),
-                            credential_source: Some("grok-bot-app".into()),
-                            plan: parsed.plan,
-                            email: account.email,
-                            metrics: vec![parsed.metric],
-                            reset_credits: None,
-                            credit_status: None,
-                            spend_control: None,
-                        }),
-                        Err(error) => errors.push(error.to_string()),
-                    }
-                }
-                if outputs.is_empty() {
-                    anyhow::bail!(
-                        "Grok Bot app accounts found but Sand usage failed: {}",
-                        errors.join("; ")
-                    );
-                }
-                // Active account first so the card order matches the app switcher.
-                outputs.sort_by_key(|output| {
-                    !output
-                        .account
-                        .as_ref()
-                        .map(|account| account.is_active)
-                        .unwrap_or(false)
-                });
-                Ok(outputs)
-            })
-        }
-        Ok(_) | Err(_) => fetch_grok_bot_desktop().map(|output| vec![output]),
-    }
-}
-
-fn fetch_grok_bot_desktop() -> Result<UsageOutput> {
+/// Grok Bot weekly included usage for the active Cursor desktop account.
+pub fn fetch_grok_bot() -> Result<UsageOutput> {
     let auth = resolve_local_auth()?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -187,7 +123,8 @@ fn fetch_grok_bot_desktop() -> Result<UsageOutput> {
         let now = Utc::now().timestamp();
         let access = bearer_for_request(&auth, now).await?;
         let client = plan_http_client()?;
-        let parsed = fetch_sand_for_token(&client, &access).await?;
+        let sand = connect_post(&client, SAND_USAGE_URL, &access, "GetSandUsageStatus").await?;
+        let parsed = parse_sand_usage(&sand)?;
         Ok(UsageOutput {
             provider: GROK_BOT_PROVIDER.to_string(),
             account: None,
@@ -200,160 +137,6 @@ fn fetch_grok_bot_desktop() -> Result<UsageOutput> {
             spend_control: None,
         })
     })
-}
-
-async fn fetch_sand_for_token(
-    client: &reqwest::Client,
-    access: &str,
-) -> Result<ParsedSandUsage> {
-    let sand = connect_post(client, SAND_USAGE_URL, access, "GetSandUsageStatus").await?;
-    parse_sand_usage(&sand)
-}
-
-#[derive(Debug, Clone)]
-struct GrokBotAppAccount {
-    id: String,
-    access_token: String,
-    email: Option<String>,
-    name: Option<String>,
-    is_active: bool,
-}
-
-fn grok_bot_secrets_path() -> Option<std::path::PathBuf> {
-    crate::paths::home_dir().map(|home| {
-        home.join("Library/Application Support/Grok Bot/sand-secrets.json")
-    })
-}
-
-/// Decrypt every Cursor account stored by Grok Bot.app (macOS Electron
-/// safeStorage). Non-macOS builds return an empty list so the desktop fallback
-/// stays in charge.
-fn load_grok_bot_app_accounts() -> Result<Vec<GrokBotAppAccount>> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok(Vec::new())
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let path = grok_bot_secrets_path()
-            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        let secrets: Value =
-            serde_json::from_str(&raw).context("Grok Bot sand-secrets.json was not JSON")?;
-        let accounts_blob = secrets
-            .get("cursor-accounts")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("Grok Bot sand-secrets.json had no cursor-accounts"))?;
-        let doc: Value = serde_json::from_str(accounts_blob)
-            .context("Grok Bot cursor-accounts was not JSON")?;
-        let active = doc
-            .get("active")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let accounts = doc
-            .get("accounts")
-            .and_then(Value::as_object)
-            .ok_or_else(|| anyhow::anyhow!("Grok Bot cursor-accounts had no accounts object"))?;
-        let password = read_grok_bot_safe_storage_key()?;
-        let mut out = Vec::new();
-        for (id, entry) in accounts {
-            let Some(entry) = entry.as_object() else {
-                continue;
-            };
-            let Some(cipher) = entry
-                .get("cursor-access-token")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|token| !token.is_empty())
-            else {
-                continue;
-            };
-            let access_token = match decrypt_electron_safe_storage(cipher, password.as_bytes()) {
-                Ok(token) if access_token_usable(&token) => token,
-                _ => continue,
-            };
-            let profile = entry
-                .get("cursor-account-profile")
-                .and_then(Value::as_str)
-                .and_then(|cipher| decrypt_electron_safe_storage(cipher, password.as_bytes()).ok())
-                .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-            let email = profile
-                .as_ref()
-                .and_then(|value| value.get("email"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|email| !email.is_empty())
-                .map(str::to_string);
-            let name = profile
-                .as_ref()
-                .and_then(|value| value.get("name"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(str::to_string);
-            out.push(GrokBotAppAccount {
-                id: id.clone(),
-                access_token,
-                email,
-                name,
-                is_active: id == &active,
-            });
-        }
-        if out.is_empty() {
-            anyhow::bail!("Grok Bot sand-secrets.json had no decryptable access tokens");
-        }
-        Ok(out)
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn read_grok_bot_safe_storage_key() -> Result<String> {
-    let out = std::process::Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            "Grok Bot Safe Storage",
-            "-a",
-            "Grok Bot Key",
-            "-w",
-        ])
-        .output()
-        .context("Failed to invoke macOS security for Grok Bot Safe Storage")?;
-    if !out.status.success() {
-        anyhow::bail!("Grok Bot Safe Storage Keychain item was not readable");
-    }
-    Ok(String::from_utf8(out.stdout)
-        .context("Grok Bot Safe Storage key was not UTF-8")?
-        .trim_end()
-        .to_string())
-}
-
-/// Decrypt a Chromium / Electron `v10` safeStorage blob (base64).
-fn decrypt_electron_safe_storage(cipher_b64: &str, password: &[u8]) -> Result<String> {
-    use aes::Aes128;
-    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-    use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
-    use pbkdf2::pbkdf2_hmac;
-    use sha1::Sha1;
-
-    let raw = B64
-        .decode(cipher_b64.trim())
-        .context("Grok Bot safeStorage blob was not base64")?;
-    let payload = raw
-        .strip_prefix(b"v10")
-        .ok_or_else(|| anyhow::anyhow!("Grok Bot safeStorage blob was not a v10 envelope"))?;
-    let mut key = [0u8; 16];
-    pbkdf2_hmac::<Sha1>(password, SAFE_STORAGE_SALT, SAFE_STORAGE_ITERATIONS, &mut key);
-    let iv = [b' '; 16];
-    type Aes128CbcDec = cbc::Decryptor<Aes128>;
-    let mut buffer = payload.to_vec();
-    let plaintext = Aes128CbcDec::new(&key.into(), &iv.into())
-        .decrypt_padded_mut::<Pkcs7>(&mut buffer)
-        .map_err(|_| anyhow::anyhow!("Grok Bot safeStorage decrypt failed"))?;
-    String::from_utf8(plaintext.to_vec()).context("Grok Bot safeStorage plaintext was not UTF-8")
 }
 
 #[derive(Debug, Clone)]
@@ -874,33 +657,6 @@ mod tests {
         .is_err());
     }
 
-    #[test]
-    fn decrypt_electron_safe_storage_round_trip() {
-        use aes::Aes128;
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
-        use pbkdf2::pbkdf2_hmac;
-        use sha1::Sha1;
-
-        let password = b"unit-test-password";
-        let mut key = [0u8; 16];
-        pbkdf2_hmac::<Sha1>(password, SAFE_STORAGE_SALT, SAFE_STORAGE_ITERATIONS, &mut key);
-        let iv = [b' '; 16];
-        let plaintext = b"{\"email\":\"dnplus@example.com\"}";
-        let mut buffer = vec![0u8; plaintext.len() + 16];
-        buffer[..plaintext.len()].copy_from_slice(plaintext);
-        type Aes128CbcEnc = cbc::Encryptor<Aes128>;
-        let encrypted_len = Aes128CbcEnc::new(&key.into(), &iv.into())
-            .encrypt_padded_mut::<Pkcs7>(&mut buffer, plaintext.len())
-            .expect("encrypt")
-            .len();
-        let mut envelope = Vec::with_capacity(3 + encrypted_len);
-        envelope.extend_from_slice(b"v10");
-        envelope.extend_from_slice(&buffer[..encrypted_len]);
-        let cipher_b64 = B64.encode(envelope);
-        let decrypted = decrypt_electron_safe_storage(&cipher_b64, password).unwrap();
-        assert_eq!(decrypted, "{\"email\":\"dnplus@example.com\"}");
-    }
 
     #[test]
     fn parse_plan_window_from_remaining_and_limit() {

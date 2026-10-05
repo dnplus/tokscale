@@ -419,9 +419,7 @@ fn usage_providers(codex_fetch: Fetch) -> Vec<UsageProvider> {
             "grok-bot",
             "Grok Bot",
             cursor::has_grok_bot_credentials,
-            // One card per Cursor account signed into Grok Bot.app when the
-            // local sand-secrets store decrypts; otherwise Cursor desktop auth.
-            Fetch::Multi(cursor::fetch_grok_bot_all),
+            Fetch::Single(cursor::fetch_grok_bot),
         ),
         (
             "grok",
