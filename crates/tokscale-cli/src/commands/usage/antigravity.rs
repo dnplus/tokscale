@@ -35,11 +35,13 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
 
 use super::{UsageAccount, UsageMetric, UsageOutput};
 
@@ -136,7 +138,8 @@ struct QuotaBucket {
 /// Whether quota can be read right now.
 ///
 /// Prefer a language server that answers with at least one group. When that
-/// probe finds nothing, admit the CLI fallback when `agy` is on `PATH` and
+/// probe finds nothing, admit the CLI fallback when `agy` is runnable via
+/// `PATH` or `TOKSCALE_AGY_BIN` and
 /// `~/.gemini/oauth_creds.json` (or `$GEMINI_CLI_HOME/oauth_creds.json`) exists.
 /// The file check is cheap; the CLI itself is only spawned in [`fetch_all`].
 pub fn has_credentials() -> bool {
@@ -170,7 +173,7 @@ pub fn fetch_all() -> Result<Vec<UsageOutput>> {
                 }
             }
 
-            let summary = fetch_via_agy_cli().context(
+            let summary = fetch_via_agy_cli().await.context(
                 "Antigravity language server has no quota and `agy --print /usage` failed. \
                  Run `agy` and sign in, then retry.",
             )?;
@@ -199,6 +202,7 @@ fn outputs_from_summary(
 }
 
 const AGY_CLI_TIMEOUT: Duration = Duration::from_secs(35);
+const AGY_CLI_STDOUT_CAP: usize = 1024 * 1024;
 
 fn gemini_home() -> Option<PathBuf> {
     std::env::var_os("GEMINI_CLI_HOME")
@@ -216,24 +220,80 @@ fn agy_cli_available() -> bool {
 }
 
 fn resolve_agy_bin() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("TOKSCALE_AGY_BIN") {
-        let path = PathBuf::from(explicit);
-        if path.is_file() {
+    if let Some(explicit) = std::env::var_os("TOKSCALE_AGY_BIN").filter(|path| !path.is_empty()) {
+        if let Some(path) = resolve_agy_candidate(&PathBuf::from(explicit)) {
             return Some(path);
         }
     }
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join("agy");
+        if let Some(path) = resolve_agy_candidate(&dir.join("agy")) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn resolve_agy_candidate(path: &Path) -> Option<PathBuf> {
+    #[cfg(unix)]
+    let candidate = {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        if !path.is_file() {
+            return None;
+        }
+        let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+        // SAFETY: c_path remains alive and is a NUL-terminated filesystem path.
+        // access checks this login's permissions, including ACLs; an execute
+        // bit belonging only to another user does not make agy runnable.
+        (unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } == 0).then(|| path.to_path_buf())?
+    };
+    #[cfg(windows)]
+    let candidate = resolve_windows_command(
+        path,
+        &std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into()),
+    )?;
+    #[cfg(not(any(unix, windows)))]
+    let candidate = path.is_file().then(|| path.to_path_buf())?;
+
+    // An empty or relative PATH entry must remain a filesystem path when
+    // handed to Command, rather than being searched again on PATH.
+    if candidate.is_absolute() {
+        Some(candidate)
+    } else {
+        Some(std::env::current_dir().ok()?.join(candidate))
+    }
+}
+
+#[cfg(any(windows, test))]
+fn resolve_windows_command(path: &Path, pathext: &str) -> Option<PathBuf> {
+    fn supported_extension(extension: &str) -> bool {
+        [".COM", ".EXE", ".BAT", ".CMD"]
+            .iter()
+            .any(|supported| extension.eq_ignore_ascii_case(supported))
+    }
+
+    // Rust's Command can launch native executables and batch wrappers. Other
+    // PATHEXT entries need an interpreter or a file association it does not use.
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| supported_extension(&format!(".{extension}")))
+        && path.is_file()
+    {
+        return Some(path.to_path_buf());
+    }
+    for extension in pathext
+        .split(';')
+        .map(str::trim)
+        .filter(|extension| supported_extension(extension))
+    {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(extension);
+        let candidate = PathBuf::from(name);
         if candidate.is_file() {
             return Some(candidate);
-        }
-        #[cfg(windows)]
-        {
-            let exe = dir.join("agy.exe");
-            if exe.is_file() {
-                return Some(exe);
-            }
         }
     }
     None
@@ -299,8 +359,13 @@ fn parse_agy_print_usage(stdout: &[u8]) -> Result<QuotaSummary> {
     })
 }
 
-fn fetch_via_agy_cli() -> Result<QuotaSummary> {
-    let agy = resolve_agy_bin().context("agy was not found on PATH")?;
+async fn fetch_via_agy_cli() -> Result<QuotaSummary> {
+    let agy = resolve_agy_bin().context("no runnable agy found via PATH or TOKSCALE_AGY_BIN")?;
+    fetch_agy_command(&agy, AGY_CLI_TIMEOUT).await
+}
+
+async fn fetch_agy_command(agy: &Path, timeout: Duration) -> Result<QuotaSummary> {
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut child = Command::new(agy)
         .args([
             "--print",
@@ -313,35 +378,52 @@ fn fetch_via_agy_cli() -> Result<QuotaSummary> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .spawn()
         .context("failed to spawn agy --print /usage")?;
 
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stdout = Vec::new();
-                if let Some(mut pipe) = child.stdout.take() {
-                    pipe.read_to_end(&mut stdout)
-                        .context("failed to read agy usage stdout")?;
-                }
-                if !status.success() {
-                    anyhow::bail!("agy --print /usage failed with {status}");
-                }
-                return parse_agy_print_usage(&stdout);
+    let Some(pipe) = child.stdout.take() else {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        anyhow::bail!("agy stdout pipe was unavailable");
+    };
+    let completed = tokio::time::timeout_at(deadline, async {
+        // Drain while the child runs: waiting first can block it on a full
+        // pipe. The extra byte detects overflow without unbounded allocation.
+        let capture = async {
+            let mut stdout = Vec::new();
+            pipe.take((AGY_CLI_STDOUT_CAP + 1) as u64)
+                .read_to_end(&mut stdout)
+                .await
+                .context("failed to read agy usage stdout")?;
+            if stdout.len() > AGY_CLI_STDOUT_CAP {
+                anyhow::bail!("agy usage stdout exceeded {AGY_CLI_STDOUT_CAP} bytes");
             }
-            Ok(None) if started.elapsed() >= AGY_CLI_TIMEOUT => {
-                let _ = child.kill();
-                let _ = child.wait();
-                anyhow::bail!("agy --print /usage timed out after {AGY_CLI_TIMEOUT:?}");
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(error) => {
-                let _ = child.kill();
-                return Err(error).context("waiting for agy --print /usage");
-            }
+            Ok::<_, anyhow::Error>(stdout)
+        };
+        tokio::try_join!(
+            async { child.wait().await.context("waiting for agy --print /usage") },
+            capture,
+        )
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("agy --print /usage timed out after {timeout:?}"))
+    .and_then(|completed| completed);
+
+    let (status, stdout) = match completed {
+        Ok(completed) => completed,
+        Err(error) => {
+            // Reap on errors as well as timeout. The deadline also covers EOF
+            // when a descendant inherited stdout after agy itself exited.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(error);
         }
+    };
+    if !status.success() {
+        anyhow::bail!("agy --print /usage failed with {status}");
     }
+    parse_agy_print_usage(&stdout)
 }
 
 /// Run `work` on a dedicated OS thread, off whatever runtime the caller is on.
@@ -767,6 +849,7 @@ mod tests {
     use crate::commands::usage::{usage_providers, Fetch};
     use serial_test::serial;
     use std::sync::{Arc, Mutex};
+    use std::time::Instant;
     use tempfile::TempDir;
 
     /// RAII restore of the process-global home redirect, mirroring the copy in
@@ -1483,13 +1566,162 @@ mod tests {
         assert_eq!(summary.groups.len(), 1);
         assert_eq!(summary.groups[0].display_name, "Gemini Models");
         assert_eq!(summary.groups[0].buckets.len(), 1);
-        assert_eq!(
-            summary.groups[0].buckets[0].remaining_fraction,
-            Some(0.84)
-        );
+        assert_eq!(summary.groups[0].buckets[0].remaining_fraction, Some(0.84));
         let outputs = outputs_from_summary(summary, Some("cli"));
         assert_eq!(outputs[0].credential_source.as_deref(), Some("cli"));
         assert!((outputs[0].metrics[0].remaining_percent - 84.0).abs() < 1e-6);
+    }
+
+    #[cfg(unix)]
+    fn write_agy_fixture(dir: &TempDir, script: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.path().join("agy");
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn agy_availability_requires_an_executable() {
+        let mut env = EnvGuard::capture(&["PATH", "TOKSCALE_AGY_BIN", "GEMINI_CLI_HOME"]);
+        let dir = TempDir::new().unwrap();
+        let agy = write_agy_fixture(&dir, "exit 0", 0o644);
+        std::fs::write(dir.path().join("oauth_creds.json"), "{}").unwrap();
+        env.set("PATH", dir.path());
+        env.set("TOKSCALE_AGY_BIN", &agy);
+        env.set("GEMINI_CLI_HOME", dir.path());
+
+        assert!(
+            !agy_cli_available(),
+            "a non-executable file cannot provide quota"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        // Root may execute any file with an execute bit; other users must be
+        // allowed by the permission class that applies to their identity.
+        if unsafe { libc::geteuid() } != 0 {
+            std::fs::set_permissions(&agy, std::fs::Permissions::from_mode(0o001)).unwrap();
+            assert!(
+                !agy_cli_available(),
+                "others-execute does not grant the owner execution"
+            );
+        }
+        std::fs::set_permissions(&agy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(agy_cli_available());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn agy_drains_stdout_while_child_is_running() {
+        let dir = TempDir::new().unwrap();
+        // More than the pipe capacity, followed by a small valid quota envelope.
+        let json = format!(
+            "{}{{\"command\":{{\"data\":{{\"groups\":[{{\"name\":\"Fixture\",\"buckets\":[]}}]}}}}}}",
+            " ".repeat(128 * 1024)
+        );
+        let agy = write_agy_fixture(&dir, &format!("cat <<'QUOTA'\n{json}\nQUOTA"), 0o755);
+        let summary = fetch_agy_command(&agy, Duration::from_secs(2))
+            .await
+            .expect("stdout must be drained before waiting for the child to exit");
+        assert_eq!(summary.groups[0].display_name, "Fixture");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn agy_stdout_eof_shares_the_watchdog() {
+        let dir = TempDir::new().unwrap();
+        let agy = write_agy_fixture(
+            &dir,
+            "sleep 2 &\nprintf '%s' '{\"command\":{\"data\":{\"groups\":[]}}}'",
+            0o755,
+        );
+        let started = Instant::now();
+        let result = fetch_agy_command(&agy, Duration::from_millis(200)).await;
+        assert!(
+            result.is_err(),
+            "a descendant holding stdout open must time out"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn agy_windows_resolution_honors_pathext_order() {
+        let dir = TempDir::new().unwrap();
+        let command = dir.path().join("agy");
+        std::fs::write(&command, "not an executable").unwrap();
+        assert!(resolve_windows_command(&command, ".CMD;.EXE").is_none());
+        let exe = dir.path().join("agy.EXE");
+        let cmd = dir.path().join("agy.CMD");
+        std::fs::write(&exe, "fixture").unwrap();
+        std::fs::write(&cmd, "fixture").unwrap();
+        assert_eq!(resolve_windows_command(&command, ".CMD;.EXE"), Some(cmd));
+        assert_eq!(
+            resolve_windows_command(&command, ".EXE;.CMD"),
+            Some(exe.clone())
+        );
+        assert_eq!(resolve_windows_command(&exe, ".CMD"), Some(exe));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn agy_caps_stdout_and_reaps_on_read_error() {
+        let dir = TempDir::new().unwrap();
+        let pid_path = dir.path().join("pid");
+        let agy = write_agy_fixture(
+            &dir,
+            &format!(
+                "echo $$ > '{}'\nwhile :; do printf '%s' '{}'; done",
+                pid_path.display(),
+                "x".repeat(4096),
+            ),
+            0o755,
+        );
+        let error = fetch_agy_command(&agy, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("stdout exceeded"), "{error:#}");
+        let pid = std::fs::read_to_string(pid_path).unwrap();
+        let alive = std::process::Command::new("/bin/kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(
+            !alive.success(),
+            "the failed command must be killed and reaped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn agy_timeout_kills_and_reaps_the_child() {
+        let dir = TempDir::new().unwrap();
+        let pid_path = dir.path().join("pid");
+        let agy = write_agy_fixture(
+            &dir,
+            &format!("echo $$ > '{}'\nwhile :; do :; done", pid_path.display()),
+            0o755,
+        );
+        let error = fetch_agy_command(&agy, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        let pid = std::fs::read_to_string(pid_path).unwrap();
+        let alive = std::process::Command::new("/bin/kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(
+            !alive.success(),
+            "the timed out command must be killed and reaped"
+        );
     }
 
     #[test]
