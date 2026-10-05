@@ -45,7 +45,7 @@ struct ParsedPlanTracks {
     reset_at: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct LocalCursorAuth {
     access_token: String,
     refresh_token: Option<String>,
@@ -279,7 +279,9 @@ fn resolve_local_auth() -> Result<LocalCursorAuth> {
     let db_path = crate::cursor::find_cursor_state_vscdb_for_usage(&home);
     let (db_access, db_refresh, db_email) = if let Some(path) = db_path.as_ref() {
         (
-            read_vscdb_value(path, "cursorAuth/accessToken").ok().flatten(),
+            read_vscdb_value(path, "cursorAuth/accessToken")
+                .ok()
+                .flatten(),
             read_vscdb_value(path, "cursorAuth/refreshToken")
                 .ok()
                 .flatten(),
@@ -291,44 +293,61 @@ fn resolve_local_auth() -> Result<LocalCursorAuth> {
         (None, None, None)
     };
 
-    if let Some(access) = db_access
-        .as_deref()
-        .map(str::trim)
-        .filter(|token| access_token_usable(token))
-    {
-        return Ok(LocalCursorAuth {
-            access_token: access.to_string(),
-            refresh_token: nonempty(db_refresh.as_deref()),
-            email: account_label(db_email.as_deref()),
-        });
-    }
-
     #[cfg(target_os = "macos")]
-    if let Ok(access) = super::helpers::read_keychain(ACCESS_SERVICE) {
-        let access = access.trim();
-        if access_token_usable(access) {
-            let refresh = super::helpers::read_keychain(REFRESH_SERVICE).ok();
-            return Ok(LocalCursorAuth {
-                access_token: access.to_string(),
-                refresh_token: nonempty(refresh.as_deref()).or_else(|| nonempty(db_refresh.as_deref())),
-                email: account_label(db_email.as_deref()),
-            });
-        }
-    }
+    let keychain = LocalCursorAuth {
+        access_token: super::helpers::read_keychain(ACCESS_SERVICE).unwrap_or_default(),
+        refresh_token: super::helpers::read_keychain(REFRESH_SERVICE)
+            .ok()
+            .and_then(|token| nonempty(Some(&token))),
+        email: account_label(db_email.as_deref()),
+    };
+    #[cfg(not(target_os = "macos"))]
+    let keychain = LocalCursorAuth::default();
 
-    if let Some(creds) = crate::cursor::load_active_credentials() {
-        if let Some(access) = jwt_from_session_token(&creds.session_token) {
-            return Ok(LocalCursorAuth {
-                access_token: access,
-                refresh_token: None,
-                email: account_label(db_email.as_deref()),
-            });
-        }
+    let db = LocalCursorAuth {
+        access_token: db_access.unwrap_or_default(),
+        refresh_token: nonempty(db_refresh.as_deref()),
+        email: account_label(db_email.as_deref()),
+    };
+    let now_unix = Utc::now().timestamp();
+    if let Some(auth) = select_local_auth(db.clone(), keychain.clone(), None, now_unix) {
+        return Ok(auth);
+    }
+    let session = crate::cursor::load_active_credentials().and_then(|creds| {
+        jwt_from_session_token(&creds.session_token).map(|access| LocalCursorAuth {
+            access_token: access,
+            refresh_token: None,
+            email: account_label(db_email.as_deref()),
+        })
+    });
+    if let Some(auth) = select_local_auth(db, keychain, session, now_unix) {
+        return Ok(auth);
     }
 
     anyhow::bail!(
         "Cursor plan credentials not found. Sign in to the Cursor desktop app, or run 'tokscale cursor login'."
     )
+}
+
+fn select_local_auth(
+    mut db: LocalCursorAuth,
+    mut keychain: LocalCursorAuth,
+    session: Option<LocalCursorAuth>,
+    now_unix: i64,
+) -> Option<LocalCursorAuth> {
+    // Cursor can keep the access JWT in state.vscdb and the refresh token in
+    // Keychain. Merge the two stores before considering an expired JWT.
+    keychain.refresh_token = keychain.refresh_token.or_else(|| db.refresh_token.clone());
+    db.refresh_token = db.refresh_token.or_else(|| keychain.refresh_token.clone());
+    [Some(db), Some(keychain), session]
+        .into_iter()
+        .flatten()
+        .find_map(|mut auth| {
+            auth.access_token = auth.access_token.trim().to_string();
+            (access_token_usable(&auth.access_token)
+                && (!needs_refresh(&auth.access_token, now_unix) || auth.refresh_token.is_some()))
+            .then_some(auth)
+        })
 }
 
 fn nonempty(value: Option<&str>) -> Option<String> {
@@ -683,5 +702,62 @@ mod tests {
         assert!(access_token_usable("a.b.c"));
         assert!(!access_token_usable("ciphertext-or-empty"));
         assert!(!access_token_usable("a.b"));
+    }
+    fn auth_with_expiry(exp: i64, refresh: Option<&str>) -> LocalCursorAuth {
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(json!({"exp": exp}).to_string());
+        LocalCursorAuth {
+            access_token: format!("header.{payload}.signature"),
+            refresh_token: refresh.map(str::to_string),
+            email: None,
+        }
+    }
+
+    #[test]
+    fn db_jwt_keeps_keychain_refresh_even_before_expiry() {
+        for expiry in [900, 2000] {
+            let db = auth_with_expiry(expiry, None);
+            let selected = select_local_auth(
+                db.clone(),
+                LocalCursorAuth {
+                    refresh_token: Some("keychain-refresh".into()),
+                    ..Default::default()
+                },
+                None,
+                1000,
+            )
+            .unwrap();
+            assert_eq!(selected.access_token, db.access_token);
+            assert_eq!(selected.refresh_token.as_deref(), Some("keychain-refresh"));
+        }
+    }
+
+    #[test]
+    fn expired_db_without_refresh_falls_through_to_keychain() {
+        let keychain = auth_with_expiry(2000, None);
+        let selected =
+            select_local_auth(auth_with_expiry(900, None), keychain.clone(), None, 1000).unwrap();
+        assert_eq!(selected.access_token, keychain.access_token);
+    }
+
+    #[test]
+    fn expired_desktop_tokens_without_refresh_fall_through_to_saved_session() {
+        let session = auth_with_expiry(2000, None);
+        let selected = select_local_auth(
+            auth_with_expiry(900, None),
+            auth_with_expiry(800, None),
+            Some(session.clone()),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(selected.access_token, session.access_token);
+        assert!(select_local_auth(
+            auth_with_expiry(900, None),
+            LocalCursorAuth::default(),
+            None,
+            1000
+        )
+        .is_none());
     }
 }
