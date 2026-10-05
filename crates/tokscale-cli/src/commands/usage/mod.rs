@@ -5,6 +5,7 @@ mod antigravity;
 mod claude;
 pub mod codex;
 mod copilot;
+mod cursor;
 mod grok;
 pub mod helpers;
 mod kimi;
@@ -407,6 +408,12 @@ fn usage_providers(codex_fetch: Fetch) -> Vec<UsageProvider> {
             "Copilot",
             copilot::has_credentials,
             Fetch::Single(copilot::fetch),
+        ),
+        (
+            "cursor",
+            "Cursor",
+            cursor::has_credentials,
+            Fetch::Single(cursor::fetch),
         ),
         (
             "grok",
