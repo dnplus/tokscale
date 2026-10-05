@@ -262,27 +262,35 @@ fn clear_cooldown() {
     in_memory_cooldowns().lock().unwrap().clear();
 }
 
-// `~/.claude/.credentials.json` belongs to Claude Code, and this module is a
-// quota viewer: it reads that file and never writes it. Tokscale used to
-// exchange Claude Code's refresh token on 401/403 and write the result back,
-// but the write reconstructed the document from the four fields below, dropping
-// every field tokscale does not model -- `expiresAt` and `scopes` among them --
-// which left Claude Code reporting "Not logged in" (#1001). An expired access
-// token is Claude Code's to refresh on its next run, so a rejected token is
-// reported as unavailable usage instead.
+// `~/.claude/.credentials.json` and the macOS Keychain item
+// `Claude Code-credentials` belong to Claude Code. This module is a quota
+// viewer: it reads them and never writes them. Tokscale used to exchange Claude
+// Code's refresh token on 401/403 and write the result back, but the write
+// reconstructed the document from the few fields below, dropping every field
+// tokscale does not model -- `scopes` among them -- which left Claude Code
+// reporting "Not logged in" (#1001). An expired access token is Claude Code's
+// to refresh on its next run, so a rejected token is reported as unavailable
+// usage instead.
+//
+// On macOS, Claude Code keeps the durable login in Keychain and may leave a
+// stale `~/.claude/.credentials.json` behind. Prefer the store whose
+// `expiresAt` is later so a leftover file cannot shadow a live Keychain login.
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct Credentials {
     #[serde(rename = "claudeAiOauth")]
     claude_ai_oauth: Option<Oauth>,
 }
 
 /// Deliberately does not model `refreshToken`: tokscale has no use for a
-/// credential it must not spend.
-#[derive(Debug, Deserialize)]
+/// credential it must not spend. `expiresAt` is read only to choose between the
+/// file and Keychain copies of the same login.
+#[derive(Debug, Clone, Deserialize)]
 struct Oauth {
     #[serde(rename = "accessToken")]
     access_token: Option<String>,
+    #[serde(rename = "expiresAt")]
+    expires_at: Option<i64>,
     #[serde(rename = "subscriptionType")]
     subscription_type: Option<String>,
     #[serde(rename = "rateLimitTier")]
@@ -388,17 +396,65 @@ pub fn has_credentials() -> bool {
 /// because the Keychain is a real macOS service.
 type CredentialReader = fn() -> Result<Credentials>;
 
-fn read_credentials() -> Result<Credentials> {
-    let path = credentials_path();
-    if path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(creds) = serde_json::from_str::<Credentials>(&content) {
-                return Ok(creds);
-            }
+fn access_token(creds: &Credentials) -> Option<&str> {
+    creds
+        .claude_ai_oauth
+        .as_ref()
+        .and_then(|oauth| oauth.access_token.as_deref())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+}
+
+fn expiry_ms(creds: &Credentials) -> Option<i64> {
+    creds.claude_ai_oauth.as_ref().and_then(|oauth| oauth.expires_at)
+}
+
+/// Choose between the on-disk and Keychain copies of Claude Code's login.
+///
+/// Claude Code's durable store on macOS is Keychain. A leftover
+/// `~/.claude/.credentials.json` must not win when its `expiresAt` is older.
+fn select_claude_credentials(
+    file: Option<Credentials>,
+    keychain: Option<Credentials>,
+) -> Result<Credentials> {
+    let file = file.filter(|creds| access_token(creds).is_some());
+    let keychain = keychain.filter(|creds| access_token(creds).is_some());
+    match (file, keychain) {
+        (Some(file), Some(keychain)) => match (expiry_ms(&file), expiry_ms(&keychain)) {
+            (Some(file_exp), Some(keychain_exp)) if keychain_exp > file_exp => Ok(keychain),
+            (None, Some(_)) => Ok(keychain),
+            _ => Ok(file),
+        },
+        (Some(file), None) => Ok(file),
+        (None, Some(keychain)) => Ok(keychain),
+        (None, None) => {
+            anyhow::bail!("No Claude credentials found. Run 'claude' to log in.")
         }
     }
-    let content = read_keychain()?;
-    Ok(serde_json::from_str(&content)?)
+}
+
+fn parse_credentials_json(content: &str) -> Result<Credentials> {
+    let creds: Credentials = serde_json::from_str(content)?;
+    if access_token(&creds).is_none() {
+        anyhow::bail!("Claude credentials have no access token");
+    }
+    Ok(creds)
+}
+
+fn read_file_credentials() -> Result<Credentials> {
+    let content = std::fs::read_to_string(credentials_path())?;
+    parse_credentials_json(&content)
+}
+
+fn read_keychain_credentials() -> Result<Credentials> {
+    parse_credentials_json(&read_keychain()?)
+}
+
+fn read_credentials() -> Result<Credentials> {
+    select_claude_credentials(
+        read_file_credentials().ok(),
+        read_keychain_credentials().ok(),
+    )
 }
 
 async fn fetch_usage(
@@ -828,12 +884,72 @@ mod tests {
         Ok(serde_json::from_str(FIXTURE)?)
     }
 
+    /// File-only reader for HomeGuard tests. Production [`read_credentials`]
+    /// also consults the real Keychain, which on a developer Mac can outrank
+    /// the fixture by `expiresAt`.
+    fn file_only_credentials() -> Result<Credentials> {
+        read_file_credentials()
+    }
+
+    fn creds_with(access: &str, expires_at: Option<i64>) -> Credentials {
+        Credentials {
+            claude_ai_oauth: Some(Oauth {
+                access_token: Some(access.to_string()),
+                expires_at,
+                subscription_type: None,
+                rate_limit_tier: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn select_credentials_prefers_keychain_when_its_expires_at_is_later() {
+        let file = creds_with("file-token", Some(1_000));
+        let keychain = creds_with("keychain-token", Some(2_000));
+        let selected = select_claude_credentials(Some(file), Some(keychain)).unwrap();
+        assert_eq!(access_token(&selected), Some("keychain-token"));
+    }
+
+    #[test]
+    fn select_credentials_keeps_file_when_it_is_newer_or_tied() {
+        let file = creds_with("file-token", Some(3_000));
+        let keychain = creds_with("keychain-token", Some(2_000));
+        let selected = select_claude_credentials(Some(file), Some(keychain)).unwrap();
+        assert_eq!(access_token(&selected), Some("file-token"));
+
+        let tied = select_claude_credentials(
+            Some(creds_with("file-token", Some(2_000))),
+            Some(creds_with("keychain-token", Some(2_000))),
+        )
+        .unwrap();
+        assert_eq!(access_token(&tied), Some("file-token"));
+    }
+
+    #[test]
+    fn select_credentials_prefers_keychain_when_file_has_no_expiry() {
+        let selected = select_claude_credentials(
+            Some(creds_with("file-token", None)),
+            Some(creds_with("keychain-token", Some(2_000))),
+        )
+        .unwrap();
+        assert_eq!(access_token(&selected), Some("keychain-token"));
+    }
+
+    #[test]
+    fn select_credentials_uses_whichever_side_has_an_access_token() {
+        let from_keychain = select_claude_credentials(None, Some(creds_with("keychain-token", None)))
+            .unwrap();
+        assert_eq!(access_token(&from_keychain), Some("keychain-token"));
+
+        let from_file = select_claude_credentials(Some(creds_with("file-token", None)), None).unwrap();
+        assert_eq!(access_token(&from_file), Some("file-token"));
+    }
+
     /// #1001: a rejected access token must not make tokscale rewrite Claude
     /// Code's credential file. Byte equality is the assertion that matters --
     /// any reconstruction of the document fails it, whatever fields it keeps.
-    /// Entry is through `fetch_blocking` with the real `read_credentials`, so
-    /// the file is genuinely read and re-read across the whole orchestration
-    /// the destructive code used to live in.
+    /// Entry is through `fetch_blocking` with a file-only reader so the HomeGuard
+    /// fixture is the credential under test, not a live Keychain login.
     #[test]
     #[serial_test::serial]
     fn rejected_token_leaves_claude_credentials_untouched() {
@@ -843,7 +959,7 @@ mod tests {
         let before = std::fs::read(home.credentials()).expect("read before");
         let (usage_url, log) = spawn_usage_server(401);
 
-        let result = fetch_blocking(&usage_url, read_credentials);
+        let result = fetch_blocking(&usage_url, file_only_credentials);
 
         let err = result.expect_err("401 must surface as an error, not a refresh");
         assert!(
@@ -870,7 +986,7 @@ mod tests {
         let before = std::fs::read(home.credentials()).expect("read before");
         let (usage_url, log) = spawn_usage_server(403);
 
-        let result = fetch_blocking(&usage_url, read_credentials);
+        let result = fetch_blocking(&usage_url, file_only_credentials);
 
         assert!(result.is_err(), "403 must surface as an error");
         let after = std::fs::read(home.credentials()).expect("credentials must still exist");
@@ -911,8 +1027,8 @@ mod tests {
         let before = std::fs::read(home.credentials()).expect("read before");
         let (usage_url, log) = spawn_usage_server(200);
 
-        let output =
-            fetch_blocking(&usage_url, read_credentials).expect("200 usage response should parse");
+        let output = fetch_blocking(&usage_url, file_only_credentials)
+            .expect("200 usage response should parse");
 
         assert_eq!(output.plan.as_deref(), Some("Max 20x"));
         assert_eq!(output.metrics.len(), 1);
@@ -1384,21 +1500,22 @@ mod tests {
         assert_eq!(metrics[1].remaining_percent, 100.0);
     }
 
-    /// `read_credentials()` is the source of truth for what tokscale parses.
-    /// The refresh token must not survive the round trip: the fix is only real
-    /// if the field is absent from the model, not merely unused by the caller.
+    /// File parsing is the source of truth for what tokscale models. The refresh
+    /// token must not survive the round trip: the fix is only real if the field
+    /// is absent from the model, not merely unused by the caller.
     #[test]
     #[serial_test::serial]
     fn parsed_credentials_do_not_carry_a_refresh_token() {
         let home = HomeGuard::new("parse");
         home.write_fixture();
 
-        let oauth = read_credentials()
+        let oauth = file_only_credentials()
             .expect("fixture credentials parse")
             .claude_ai_oauth
             .expect("fixture has claudeAiOauth");
 
         assert_eq!(oauth.access_token.as_deref(), Some("stale-access-token"));
+        assert_eq!(oauth.expires_at, Some(1_757_000_000_000));
         let debug = format!("{oauth:?}");
         assert!(
             !debug.contains("claude-code-owned-refresh-token"),
