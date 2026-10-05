@@ -1,10 +1,8 @@
 //! Antigravity subscription quota.
 //!
-//! Unlike every other provider here, this one never reaches a cloud API. The
-//! Antigravity CLI (`agy`) and IDE both run a language server that holds the
-//! OAuth token, calls Google Code Assist, caches the answer, and exposes it
-//! over a loopback Connect-RPC endpoint. `/usage` inside the CLI reads exactly
-//! that:
+//! Prefer the running language server. The Antigravity CLI (`agy`) and IDE both
+//! run a language server that holds the OAuth token, calls Google Code Assist,
+//! caches the answer, and exposes it over a loopback Connect-RPC endpoint:
 //!
 //! ```text
 //! POST http://127.0.0.1:<port>/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary
@@ -13,8 +11,13 @@
 //! ```
 //!
 //! No CSRF token is required for this method, and tokscale never has to hold
-//! an Antigravity credential of its own — the token stays inside the language
-//! server and we only read the numbers it already computed.
+//! an Antigravity credential of its own for that path — the token stays inside
+//! the language server and we only read the numbers it already computed.
+//!
+//! When the language server is down or signed out, fall back to
+//! `agy --print /usage --output-format json`. That command uses the CLI's own
+//! login under `~/.gemini/oauth_creds.json` and returns the same group/bucket
+//! shape. Tokscale still does not refresh or rewrite those credentials.
 //!
 //! Calling Google's `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota`
 //! directly was tried first and rejected: authentication succeeds, but a
@@ -32,7 +35,8 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -129,31 +133,28 @@ struct QuotaBucket {
 
 // ── Provider interface ──
 
-/// Whether a reachable language server is serving quota right now.
+/// Whether quota can be read right now.
 ///
-/// This probes rather than checking for a credential file, because Antigravity
-/// keeps its token inside the running process: "is it installed" and "can we
-/// read quota" are different questions, and only the second one should put a
-/// card on screen. The probe is a loopback request against a port read out of
-/// the CLI log, so on a machine that has one it costs a few milliseconds. A
-/// machine with neither a logged port nor an Antigravity process sends no
-/// request at all and builds no HTTP client: what it pays is the log read and
-/// the process scan.
-///
-/// This runs the same [`discover_quota`] the fetch runs, so the two cannot
-/// disagree about whether a server is answering: a summary that clears this
-/// gate is a summary the fetch can also obtain.
+/// Prefer a language server that answers with at least one group. When that
+/// probe finds nothing, admit the CLI fallback when `agy` is on `PATH` and
+/// `~/.gemini/oauth_creds.json` (or `$GEMINI_CLI_HOME/oauth_creds.json`) exists.
+/// The file check is cheap; the CLI itself is only spawned in [`fetch_all`].
 pub fn has_credentials() -> bool {
     off_caller_runtime(|| {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         else {
-            return false;
+            return agy_cli_available();
         };
-        rt.block_on(async { discover_quota().await.is_some() })
+        rt.block_on(async {
+            discover_quota()
+                .await
+                .is_some_and(|summary| !summary.groups.is_empty())
+                || agy_cli_available()
+        })
     })
-    .unwrap_or(false)
+    .unwrap_or_else(|_| agy_cli_available())
 }
 
 pub fn fetch_all() -> Result<Vec<UsageOutput>> {
@@ -163,18 +164,184 @@ pub fn fetch_all() -> Result<Vec<UsageOutput>> {
             .build()?;
 
         rt.block_on(async {
-            let summary = discover_quota()
-                .await
-                .context("Antigravity language server is not running")?;
-
-            if summary.groups.is_empty() {
-                anyhow::bail!("Antigravity is running but not signed in");
+            if let Some(summary) = discover_quota().await {
+                if !summary.groups.is_empty() {
+                    return Ok(outputs_from_summary(summary, Some("language-server")));
+                }
             }
 
-            Ok(summary.groups.into_iter().map(output_for_group).collect())
+            let summary = fetch_via_agy_cli().context(
+                "Antigravity language server has no quota and `agy --print /usage` failed. \
+                 Run `agy` and sign in, then retry.",
+            )?;
+            if summary.groups.is_empty() {
+                anyhow::bail!("Antigravity CLI returned no quota groups");
+            }
+            Ok(outputs_from_summary(summary, Some("cli")))
         })
     })
     .unwrap_or_else(|_| Err(anyhow::anyhow!("Antigravity usage worker thread panicked")))
+}
+
+fn outputs_from_summary(
+    summary: QuotaSummary,
+    credential_source: Option<&str>,
+) -> Vec<UsageOutput> {
+    summary
+        .groups
+        .into_iter()
+        .map(|group| {
+            let mut output = output_for_group(group);
+            output.credential_source = credential_source.map(str::to_string);
+            output
+        })
+        .collect()
+}
+
+const AGY_CLI_TIMEOUT: Duration = Duration::from_secs(35);
+
+fn gemini_home() -> Option<PathBuf> {
+    std::env::var_os("GEMINI_CLI_HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| tokscale_core::paths::home_dir().map(|home| home.join(".gemini")))
+}
+
+fn oauth_creds_path() -> Option<PathBuf> {
+    Some(gemini_home()?.join("oauth_creds.json"))
+}
+
+fn agy_cli_available() -> bool {
+    oauth_creds_path().is_some_and(|path| path.is_file()) && resolve_agy_bin().is_some()
+}
+
+fn resolve_agy_bin() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("TOKSCALE_AGY_BIN") {
+        let path = PathBuf::from(explicit);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join("agy");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        {
+            let exe = dir.join("agy.exe");
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
+    }
+    None
+}
+
+/// `agy --print /usage --output-format json` envelope (snake_case wire fields).
+#[derive(Debug, Deserialize)]
+struct AgyPrintEnvelope {
+    command: Option<AgyPrintCommand>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgyPrintCommand {
+    data: Option<AgyPrintData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgyPrintData {
+    #[serde(default)]
+    groups: Vec<AgyPrintGroup>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgyPrintGroup {
+    name: String,
+    #[serde(default)]
+    buckets: Vec<AgyPrintBucket>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgyPrintBucket {
+    name: Option<String>,
+    window: Option<String>,
+    remaining_fraction: Option<f64>,
+    reset_time: Option<String>,
+}
+
+fn parse_agy_print_usage(stdout: &[u8]) -> Result<QuotaSummary> {
+    let envelope: AgyPrintEnvelope =
+        serde_json::from_slice(stdout).context("Antigravity CLI usage was not JSON")?;
+    let groups = envelope
+        .command
+        .and_then(|command| command.data)
+        .map(|data| data.groups)
+        .unwrap_or_default();
+    Ok(QuotaSummary {
+        groups: groups
+            .into_iter()
+            .map(|group| QuotaGroup {
+                display_name: group.name,
+                buckets: group
+                    .buckets
+                    .into_iter()
+                    .map(|bucket| QuotaBucket {
+                        display_name: bucket.name.unwrap_or_default(),
+                        window: bucket.window,
+                        remaining_fraction: bucket.remaining_fraction,
+                        reset_time: bucket.reset_time,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    })
+}
+
+fn fetch_via_agy_cli() -> Result<QuotaSummary> {
+    let agy = resolve_agy_bin().context("agy was not found on PATH")?;
+    let mut child = Command::new(agy)
+        .args([
+            "--print",
+            "/usage",
+            "--output-format",
+            "json",
+            "--print-timeout",
+            "30s",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn agy --print /usage")?;
+
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                if let Some(mut pipe) = child.stdout.take() {
+                    pipe.read_to_end(&mut stdout)
+                        .context("failed to read agy usage stdout")?;
+                }
+                if !status.success() {
+                    anyhow::bail!("agy --print /usage failed with {status}");
+                }
+                return parse_agy_print_usage(&stdout);
+            }
+            Ok(None) if started.elapsed() >= AGY_CLI_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("agy --print /usage timed out after {AGY_CLI_TIMEOUT:?}");
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(error) => {
+                let _ = child.kill();
+                return Err(error).context("waiting for agy --print /usage");
+            }
+        }
+    }
 }
 
 /// Run `work` on a dedicated OS thread, off whatever runtime the caller is on.
@@ -1287,6 +1454,42 @@ mod tests {
         }
 
         assert_eq!(ports_from_cli_log(), vec![41234, 5001]);
+    }
+
+    #[test]
+    fn parse_agy_print_usage_maps_snake_case_groups() {
+        let stdout = br#"{
+  "status":"SUCCESS",
+  "command":{
+    "name":"usage",
+    "data":{
+      "groups":[
+        {
+          "name":"Gemini Models",
+          "buckets":[
+            {
+              "name":"Weekly Limit Remaining",
+              "window":"weekly",
+              "remaining_fraction":0.84,
+              "reset_time":"2026-10-09T02:36:07Z"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}"#;
+        let summary = parse_agy_print_usage(stdout).expect("CLI usage JSON parses");
+        assert_eq!(summary.groups.len(), 1);
+        assert_eq!(summary.groups[0].display_name, "Gemini Models");
+        assert_eq!(summary.groups[0].buckets.len(), 1);
+        assert_eq!(
+            summary.groups[0].buckets[0].remaining_fraction,
+            Some(0.84)
+        );
+        let outputs = outputs_from_summary(summary, Some("cli"));
+        assert_eq!(outputs[0].credential_source.as_deref(), Some("cli"));
+        assert!((outputs[0].metrics[0].remaining_percent - 84.0).abs() < 1e-6);
     }
 
     #[test]
