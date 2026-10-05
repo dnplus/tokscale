@@ -580,7 +580,6 @@ fn fetch_network_usage(credentials: &Credentials) -> Result<UsageOutput> {
     let mut plan: Option<String> = None;
     let mut metrics = Vec::new();
     let mut errors = Vec::new();
-    let mut provider = "Grok Build".to_string();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -590,49 +589,16 @@ fn fetch_network_usage(credentials: &Credentials) -> Result<UsageOutput> {
             .timeout(Duration::from_secs(12))
             .build()?;
 
-        // Prefer the cli-chat-proxy SuperGrok meters (weekly credits + monthly
-        // allowance). Grok Bot is a different pool on the Cursor account.
-        match fetch_proxy_billing(&client, &credentials.token, GROK_CREDITS_URL).await {
-            Ok(credits) => {
-                if let Some(metric) = parse_proxy_weekly_metric(&credits) {
-                    metrics.push(metric);
-                    provider = "Grok".into();
-                } else {
-                    errors.push("Grok weekly credits response was not recognized".to_string());
-                }
-                if let Some(tier) = credits
-                    .get("subscriptionTiers")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|tier| !tier.is_empty())
-                {
-                    plan = Some(tier.to_string());
-                }
-            }
-            Err(error) => errors.push(format!("Grok weekly credits request failed: {error}")),
-        }
-
-        if metrics.iter().any(|metric| metric.label == "Weekly") {
-            match fetch_proxy_billing(&client, &credentials.token, GROK_MONTHLY_URL).await {
-                Ok(monthly) => {
-                    if let Some(metric) = parse_proxy_monthly_metric(&monthly) {
-                        metrics.push(metric);
-                    }
-                    if plan.is_none() {
-                        if let Some(tier) = monthly
-                            .get("subscriptionTiers")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|tier| !tier.is_empty())
-                        {
-                            plan = Some(tier.to_string());
-                        }
-                    }
-                }
-                Err(error) => errors.push(format!("Grok monthly billing request failed: {error}")),
-            }
-        }
-
+        let proxy = fetch_proxy_usage(
+            &client,
+            &credentials.token,
+            GROK_CREDITS_URL,
+            GROK_MONTHLY_URL,
+        )
+        .await;
+        plan = proxy.plan;
+        metrics.extend(proxy.metrics);
+        errors.extend(proxy.errors);
         if metrics.is_empty() {
             match fetch_billing_grpc(&client, &credentials.token).await {
                 Ok(body) => {
@@ -674,24 +640,74 @@ fn fetch_network_usage(credentials: &Credentials) -> Result<UsageOutput> {
         anyhow::bail!("Grok usage unavailable: {detail}");
     }
 
-    Ok(UsageOutput {
-        provider,
-        account: None,
-        credential_source: None,
-        plan,
-        email: credentials.email.clone(),
-        metrics,
-        reset_credits: None,
-        credit_status: None,
-        spend_control: None,
-    })
+    Ok(usage_output(plan, credentials.email.clone(), metrics))
 }
 
-async fn fetch_proxy_billing(
+#[derive(Default)]
+struct ProxyUsage {
+    plan: Option<String>,
+    metrics: Vec<UsageMetric>,
+    errors: Vec<String>,
+}
+
+async fn fetch_proxy_usage(
     client: &reqwest::Client,
     token: &str,
-    url: &str,
-) -> Result<Value> {
+    weekly_url: &str,
+    monthly_url: &str,
+) -> ProxyUsage {
+    let mut usage = ProxyUsage::default();
+    // Prefer the cli-chat-proxy SuperGrok meters (weekly credits + monthly
+    // allowance). Grok Bot is a different pool on the Cursor account.
+    match fetch_proxy_billing(client, token, weekly_url).await {
+        Ok(credits) => {
+            if let Some(metric) = parse_proxy_weekly_metric(&credits) {
+                usage.metrics.push(metric);
+            } else {
+                usage
+                    .errors
+                    .push("Grok weekly credits response was not recognized".to_string());
+            }
+            if let Some(tier) = credits
+                .get("subscriptionTiers")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|tier| !tier.is_empty())
+            {
+                usage.plan = Some(normalize_subscription_tier(tier));
+            }
+        }
+        Err(error) => usage
+            .errors
+            .push(format!("Grok weekly credits request failed: {error}")),
+    }
+
+    // The monthly allowance remains useful when the weekly endpoint
+    // fails or changes its response shape.
+    match fetch_proxy_billing(client, token, monthly_url).await {
+        Ok(monthly) => {
+            if let Some(metric) = parse_proxy_monthly_metric(&monthly) {
+                usage.metrics.push(metric);
+            }
+            if usage.plan.is_none() {
+                if let Some(tier) = monthly
+                    .get("subscriptionTiers")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|tier| !tier.is_empty())
+                {
+                    usage.plan = Some(normalize_subscription_tier(tier));
+                }
+            }
+        }
+        Err(error) => usage
+            .errors
+            .push(format!("Grok monthly billing request failed: {error}")),
+    }
+    usage
+}
+
+async fn fetch_proxy_billing(client: &reqwest::Client, token: &str, url: &str) -> Result<Value> {
     let resp = client
         .get(url)
         .bearer_auth(token)
@@ -763,7 +779,8 @@ fn proxy_period_end(config: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .or_else(|| {
-            string_at(config, &["billingPeriodEnd"]).or_else(|| epoch_at(config, &["billingPeriodEnd"]))
+            string_at(config, &["billingPeriodEnd"])
+                .or_else(|| epoch_at(config, &["billingPeriodEnd"]))
         })
 }
 
@@ -801,7 +818,7 @@ fn usage_output(
     metrics: Vec<UsageMetric>,
 ) -> UsageOutput {
     UsageOutput {
-        provider: "Grok Build".into(),
+        provider: "Grok".into(),
         account: None,
         credential_source: None,
         plan,
@@ -876,6 +893,88 @@ pub fn fetch() -> Result<UsageOutput> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::usage::test_server::spawn_server;
+
+    #[test]
+    fn fallback_uses_registered_grok_provider() {
+        let output = usage_output(None, None, Vec::new());
+        assert_eq!(output.provider, "Grok");
+    }
+
+    #[test]
+    fn monthly_meter_survives_weekly_failure_or_unrecognized_response() {
+        for weekly_status in [503, 200] {
+            let (base, log) = spawn_server(move |path, _| match path {
+                "/weekly" => (weekly_status, "{}".to_string()),
+                "/monthly" => (
+                    200,
+                    serde_json::json!({
+                        "subscriptionTiers": "super_grok",
+                        "config": {
+                            "monthlyLimit": { "val": 20000 },
+                            "used": { "val": 5000 }
+                        }
+                    })
+                    .to_string(),
+                ),
+                _ => (404, "{}".to_string()),
+            });
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let usage = runtime.block_on(async {
+                let client = reqwest::Client::new();
+                fetch_proxy_usage(
+                    &client,
+                    "test-token",
+                    &format!("{base}/weekly"),
+                    &format!("{base}/monthly"),
+                )
+                .await
+            });
+
+            assert_eq!(usage.metrics.len(), 1, "weekly status {weekly_status}");
+            assert_eq!(usage.metrics[0].label, "Monthly");
+            assert_eq!(usage.metrics[0].remaining_percent, 75.0);
+            assert_eq!(usage.plan.as_deref(), Some("Super Grok"));
+            assert_eq!(log.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn proxy_weekly_subscription_tier_is_normalized() {
+        let (base, _) = spawn_server(move |path, _| match path {
+            "/weekly" => (
+                200,
+                serde_json::json!({
+                    "subscriptionTiers": "super_grok",
+                    "config": { "creditUsagePercent": 25 }
+                })
+                .to_string(),
+            ),
+            "/monthly" => (503, "{}".to_string()),
+            _ => (404, "{}".to_string()),
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let usage = runtime.block_on(async {
+            let client = reqwest::Client::new();
+            fetch_proxy_usage(
+                &client,
+                "test-token",
+                &format!("{base}/weekly"),
+                &format!("{base}/monthly"),
+            )
+            .await
+        });
+        assert_eq!(usage.plan.as_deref(), Some("Super Grok"));
+        assert_eq!(usage.metrics.len(), 1);
+        assert_eq!(usage.metrics[0].label, "Weekly");
+        assert_eq!(usage.metrics[0].remaining_percent, 75.0);
+    }
 
     fn push_varint(mut value: u64, out: &mut Vec<u8>) {
         while value >= 0x80 {

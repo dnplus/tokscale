@@ -5,7 +5,7 @@
 //! saved Tokscale Cursor session cookie. The IDE plan window is
 //! `GetCurrentPeriodUsage` on `api2.cursor.sh`. Grok Bot weekly usage is a
 //! separate Cursor-metered pool from `GetSandUsageStatus` (not the SuperGrok
-//! `cli-chat-proxy` credits used by the Grok / Grok Build card). Refreshed
+//! `cli-chat-proxy` credits used by the Grok card). Refreshed
 //! access tokens stay in memory and are never written back.
 
 use anyhow::{Context, Result};
