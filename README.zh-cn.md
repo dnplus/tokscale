@@ -843,6 +843,9 @@ tokscale usage --light
 | **Z.ai** | API key（环境变量） | Token 限额、Web Searches | 设置 `ZAI_API_KEY` 或 `GLM_API_KEY` |
 | **Amp** | API key（`~/.local/share/amp/secrets.json`） | 免费额度余额、Credits | 运行 `amp` 登录 |
 | **GitHub Copilot** | GitHub token（钥匙串或 `~/.config/gh/hosts.yml`） | Premium interactions、Chat 配额 | 运行 `gh auth login` |
+| **Cursor** | Desktop `state.vscdb` JWT (or macOS Keychain `cursor-access-token`, or JWT inside a saved `tokscale cursor login` session) | Plan period remaining | Sign in to Cursor desktop, or run `tokscale cursor login` |
+| **Antigravity** | Running language server (loopback RPC), or `agy --print /usage` when `~/.gemini/oauth_creds.json` exists | Per model-group weekly / 5-hour remaining | Run `agy` (or the Antigravity IDE) signed in |
+| **Colab** | OAuth (`~/.config/colab-cli/token.json`) | Compute-unit balance, hourly burn rate, active runtimes | Log in with `colab-cli`; override with `TOKSCALE_COLAB_TOKEN_PATH` |
 | **Grok Build** | OAuth（`~/.grok/auth.json`） | Credits、订阅套餐 | 运行 `grok login` |
 | **Kimi** | OAuth（`~/.kimi/credentials/kimi-code.json`） | Session、Weekly 配额 | 运行 `kimi` 登录 |
 | **MiniMax** | API key（环境变量） | 各模型的 Prompt 配额 | 设置 `MINIMAX_API_KEY` 或 `MINIMAX_API_TOKEN` |
@@ -939,7 +942,7 @@ Tokscale 将设置存储在 `~/.config/tokscale/settings.json`：
 | `autoRefreshMs` | number | `60000` | 自动刷新间隔（30000-3600000ms） |
 | `nativeTimeoutMs` | number | `300000` | 原生子进程处理最大时间（5000-3600000ms） |
 | `defaultClients` | string[] | `[]` | 未传递 `--client/-c` 选项时应用的客户端筛选。接受与 `--client` 相同的 ID（例如 `["opencode", "claude", "synthetic"]`）。未知 ID 会被静默丢弃。命令行选项会完全覆盖此列表 — 不会合并。 |
-| `usage.disabledProviders` | string[] | `[]` | 在凭据发现或网络访问之前跳过的订阅 usage 提供商。有效 ID（不区分大小写，忽略首尾空白）：`claude`、`codex`、`zai`、`amp`、`antigravity`、`copilot`、`grok`、`kimi`、`minimax`、`minimax-token-plan`、`warp`、`sakana`、`opencode-go`。未知 ID 会被忽略。被禁用的提供商也会从缓存的 TUI 卡片和诊断中隐藏。更改在下次 `tokscale usage` 运行或 TUI 启动/刷新时生效。 |
+| `usage.disabledProviders` | string[] | `[]` | 在凭据发现或网络访问之前跳过的订阅 usage 提供商。有效 ID（不区分大小写，忽略首尾空白）：`claude`、`codex`、`zai`、`amp`、`antigravity`、`copilot`、`cursor`、`grok`、`kimi`、`minimax`、`minimax-token-plan`、`colab`、`warp`、`sakana`、`opencode-go`。未知 ID 会被忽略。被禁用的提供商也会从缓存的 TUI 卡片和诊断中隐藏。更改在下次 `tokscale usage` 运行或 TUI 启动/刷新时生效。 |
 | `light.writeCache` | boolean | `false` | 为 `true` 时，`tokscale --light` 会在渲染完成后以原子方式覆盖 TUI 缓存。CLI 标志 `--write-cache` / `--no-write-cache` 会按次运行覆盖该设置。 |
 | `minutelyTabEnabled` | boolean | `false` | 在 TUI 中显示按分钟的 Minutely 标签，并在数据加载期间执行分钟级聚合。对大多数用户而言，分钟级粒度是较为小众的诊断视图，而在大数据集上分钟分桶有非平凡的代价，因此默认关闭。 |
 | `scanner.extraScanPaths` | object | `{}` | 针对 Tokscale 默认 home 根位置之外的会话，为各客户端额外指定的扫描根目录 |

@@ -4,6 +4,7 @@ mod amp;
 mod antigravity;
 mod claude;
 pub mod codex;
+mod colab;
 mod copilot;
 mod cursor;
 mod grok;
@@ -383,6 +384,12 @@ fn usage_providers(codex_fetch: Fetch) -> Vec<UsageProvider> {
             Fetch::Single(claude::fetch),
         ),
         ("codex", "Codex", codex::has_credentials, codex_fetch),
+        (
+            "colab",
+            "Colab",
+            colab::has_credentials,
+            Fetch::Single(colab::fetch),
+        ),
         (
             "zai",
             "Z.ai",
@@ -801,6 +808,13 @@ mod tests {
 
         assert_eq!(report.outputs.len(), 1);
         assert_eq!(*counters().lock().unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn colab_registry_and_disabled_cache() {
+        assert_eq!(provider_id_for_label("Colab"), Some("colab"));
+        let disabled = std::collections::HashSet::from(["colab".to_string()]);
+        assert!(filter_disabled_outputs(vec![sample_output("Colab")], &disabled).is_empty());
     }
 
     #[test]

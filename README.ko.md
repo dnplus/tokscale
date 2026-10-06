@@ -841,6 +841,9 @@ TUI에서는 **Usage** 탭으로 이동해 구독 데이터를 확인하세요. 
 | **Z.ai** | API 키 (환경 변수) | 토큰 한도, 웹 검색 | `ZAI_API_KEY` 또는 `GLM_API_KEY` 설정 |
 | **Amp** | API 키 (`~/.local/share/amp/secrets.json`) | 무료 티어 잔액, 크레딧 | `amp`를 실행해 로그인 |
 | **GitHub Copilot** | GitHub 토큰 (keychain 또는 `~/.config/gh/hosts.yml`) | 프리미엄 상호작용, 채팅 할당량 | `gh auth login` 실행 |
+| **Cursor** | Desktop `state.vscdb` JWT (or macOS Keychain `cursor-access-token`, or JWT inside a saved `tokscale cursor login` session) | Plan period remaining | Sign in to Cursor desktop, or run `tokscale cursor login` |
+| **Antigravity** | Running language server (loopback RPC), or `agy --print /usage` when `~/.gemini/oauth_creds.json` exists | Per model-group weekly / 5-hour remaining | Run `agy` (or the Antigravity IDE) signed in |
+| **Colab** | OAuth (`~/.config/colab-cli/token.json`) | Compute-unit balance, hourly burn rate, active runtimes | Log in with `colab-cli`; override with `TOKSCALE_COLAB_TOKEN_PATH` |
 | **Grok Build** | OAuth (`~/.grok/auth.json`) | 크레딧, 구독 플랜 | `grok login` 실행 |
 | **Kimi** | OAuth (`~/.kimi/credentials/kimi-code.json`) | 세션, 주간 할당량 | `kimi`를 실행해 로그인 |
 | **MiniMax** | API 키 (환경 변수) | 모델별 프롬프트 할당량 | `MINIMAX_API_KEY` 또는 `MINIMAX_API_TOKEN` 설정 |
@@ -937,7 +940,7 @@ Tokscale은 설정을 `~/.config/tokscale/settings.json`에 저장합니다:
 | `autoRefreshMs` | number | `60000` | 자동 새로고침 간격 (30000-3600000ms) |
 | `nativeTimeoutMs` | number | `300000` | 네이티브 서브프로세스 처리 최대 시간 (5000-3600000ms) |
 | `defaultClients` | string[] | `[]` | `--client/-c` 플래그를 전달하지 않을 때 적용되는 기본 클라이언트 필터. `--client`와 동일한 ID를 받습니다 (예: `["opencode", "claude", "synthetic"]`). 알 수 없는 ID는 자동으로 무시됩니다. CLI 플래그가 있으면 이 목록은 완전히 무시됩니다 — 병합되지 않습니다. |
-| `usage.disabledProviders` | string[] | `[]` | 자격 증명 탐색이나 네트워크 접근 전에 건너뛸 구독 usage 프로바이더. 유효한 ID(대소문자 무시, 앞뒤 공백 허용): `claude`, `codex`, `zai`, `amp`, `antigravity`, `copilot`, `grok`, `kimi`, `minimax`, `minimax-token-plan`, `warp`, `sakana`, `opencode-go`. 알 수 없는 ID는 무시됩니다. 비활성화된 프로바이더는 캐시된 TUI 카드와 진단에서도 숨겨집니다. 변경 사항은 다음 `tokscale usage` 실행 또는 TUI 시작/새로고침부터 적용됩니다. |
+| `usage.disabledProviders` | string[] | `[]` | 자격 증명 탐색이나 네트워크 접근 전에 건너뛸 구독 usage 프로바이더. 유효한 ID(대소문자 무시, 앞뒤 공백 허용): `claude`, `codex`, `zai`, `amp`, `antigravity`, `copilot`, `cursor`, `grok`, `kimi`, `minimax`, `minimax-token-plan`, `colab`, `warp`, `sakana`, `opencode-go`. 알 수 없는 ID는 무시됩니다. 비활성화된 프로바이더는 캐시된 TUI 카드와 진단에서도 숨겨집니다. 변경 사항은 다음 `tokscale usage` 실행 또는 TUI 시작/새로고침부터 적용됩니다. |
 | `light.writeCache` | boolean | `false` | `true`이면 `tokscale --light`가 렌더링 직후 TUI 캐시를 원자적으로 덮어씁니다. CLI 플래그 `--write-cache` / `--no-write-cache`가 실행별로 우선합니다. |
 | `minutelyTabEnabled` | boolean | `false` | TUI에 분 단위 Minutely 탭을 표시하고 데이터 로딩 중에 분 단위 집계를 수행합니다. 대부분의 사용자에게 분 단위 세분화는 틈새/진단 뷰이며, 대규모 데이터셋에서는 분 단위 버케팅에 무시할 수 없는 비용이 들기 때문에 기본적으로 비활성화되어 있습니다. |
 | `scanner.extraScanPaths` | object | `{}` | Tokscale의 기본 home-root 위치 밖에 있는 세션을 위한 클라이언트별 추가 스캔 루트 |
