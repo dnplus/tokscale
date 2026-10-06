@@ -4,7 +4,9 @@ mod amp;
 mod antigravity;
 mod claude;
 pub mod codex;
+mod colab;
 mod copilot;
+mod cursor;
 mod grok;
 pub mod helpers;
 mod kimi;
@@ -383,6 +385,12 @@ fn usage_providers(codex_fetch: Fetch) -> Vec<UsageProvider> {
         ),
         ("codex", "Codex", codex::has_credentials, codex_fetch),
         (
+            "colab",
+            "Colab",
+            colab::has_credentials,
+            Fetch::Single(colab::fetch),
+        ),
+        (
             "zai",
             "Z.ai",
             zai::has_credentials,
@@ -409,8 +417,22 @@ fn usage_providers(codex_fetch: Fetch) -> Vec<UsageProvider> {
             Fetch::Single(copilot::fetch),
         ),
         (
+            "cursor",
+            "Cursor",
+            cursor::has_credentials,
+            Fetch::Single(cursor::fetch),
+        ),
+        (
+            "grok-bot",
+            "Grok Bot",
+            cursor::has_grok_bot_credentials,
+            // One card per Cursor account signed into Grok Bot.app when the
+            // local sand-secrets store decrypts; otherwise Cursor desktop auth.
+            Fetch::Multi(cursor::fetch_grok_bot_all),
+        ),
+        (
             "grok",
-            "Grok Build",
+            "Grok",
             grok::has_credentials,
             Fetch::Single(grok::fetch),
         ),
@@ -786,6 +808,13 @@ mod tests {
 
         assert_eq!(report.outputs.len(), 1);
         assert_eq!(*counters().lock().unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn colab_registry_and_disabled_cache() {
+        assert_eq!(provider_id_for_label("Colab"), Some("colab"));
+        let disabled = std::collections::HashSet::from(["colab".to_string()]);
+        assert!(filter_disabled_outputs(vec![sample_output("Colab")], &disabled).is_empty());
     }
 
     #[test]
