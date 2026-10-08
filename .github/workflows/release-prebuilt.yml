@@ -1,0 +1,140 @@
+name: Release prebuilt (dnplus)
+
+on:
+  push:
+    tags: ['v*-dnplus.*']
+  # Manual runs build artifacts only; they never create a release.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-prebuilt-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  MACOSX_DEPLOYMENT_TARGET: '10.13'
+
+jobs:
+  build:
+    runs-on: ${{ matrix.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: macos-26
+            target: aarch64-apple-darwin
+          - host: macos-latest
+            target: x86_64-apple-darwin
+          - host: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - host: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Install Rust (rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: prebuilt-${{ matrix.host }}-${{ matrix.target }}-1.98.0-${{ hashFiles('Cargo.lock') }}
+      - uses: mlugg/setup-zig@v2
+        if: runner.os == 'Linux'
+        with:
+          version: 0.13.0
+      - uses: taiki-e/install-action@v2
+        if: runner.os == 'Linux'
+        with:
+          tool: cargo-zigbuild
+      - name: Build tokscale
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            # Vendored OpenSSL avoids a host libssl dependency. Explicitly
+            # target glibc 2.17 instead of the runner's newer libc.
+            cargo zigbuild --release -p tokscale-cli --bin tokscale --locked --target "$TARGET.2.17"
+          else
+            # Default features keep macOS archives self-contained (no FM dylib).
+            cargo build --release -p tokscale-cli --bin tokscale --locked --target "$TARGET"
+          fi
+      - name: Package and checksum
+        env:
+          TARGET: ${{ matrix.target }}
+          REF_TAG: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          tag="$REF_TAG"
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            tag="build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          fi
+          mkdir -p stage dist
+          binary=tokscale
+          if [[ "$RUNNER_OS" == Windows ]]; then binary=tokscale.exe; fi
+          cp "target/$TARGET/release/$binary" stage/
+          cp LICENSE stage/
+          archive="tokscale-$tag-$TARGET.tar.gz"
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            archive="tokscale-$tag-$TARGET.zip"
+            export ARCHIVE_PATH="dist/$archive"
+            # PowerShell expands its own environment variable.
+            # shellcheck disable=SC2016
+            pwsh -NoProfile -Command 'Compress-Archive -Path stage/* -DestinationPath $env:ARCHIVE_PATH'
+          else
+            tar -czf "dist/$archive" -C stage .
+          fi
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" > "$archive.sha256"
+            sha256sum -c "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+            shasum -a 256 -c "$archive.sha256"
+          fi
+      - uses: actions/upload-artifact@v6
+        with:
+          name: prebuilt-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    if: github.event_name == 'push' && github.repository == 'dnplus/tokscale'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: prebuilt-*
+          merge-multiple: true
+          path: dist
+      - name: Verify all assets
+        run: |
+          cd dist
+          cat ./*.sha256 > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          prerelease: false
+          make_latest: true
+          generate_release_notes: true

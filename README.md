@@ -6,6 +6,26 @@
 
 </div>
 
+## Fork 版安裝（dnplus）
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dnplus/tokscale/main/install.sh | sh
+```
+
+預設安裝 dnplus/tokscale 最新 Release 至 `~/.local/bin`，並驗證 SHA256。指定版本與安裝目錄（環境變數需傳給 `sh`）：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dnplus/tokscale/main/install.sh | TOKSCALE_VERSION=v4.18.0-dnplus.1 TOKSCALE_INSTALL_DIR="$HOME/bin" sh
+# 不下載，只顯示平台、URL 與路徑；<latest-tag> 會在實際安裝時解析。
+curl -fsSL https://raw.githubusercontent.com/dnplus/tokscale/main/install.sh | TOKSCALE_DRY_RUN=1 sh
+```
+
+也可至 [dnplus Releases](https://github.com/dnplus/tokscale/releases) 手動下載 `tokscale-<tag>-<target>.tar.gz`（Windows 為 `.zip`）及對應 `.sha256`，在同一目錄執行 `sha256sum -c <archive>.sha256`（macOS 可用 `shasum -a 256 -c <archive>.sha256`），解壓縮後將執行檔放入 PATH。
+
+支援 macOS Apple Silicon／Intel（`aarch64-apple-darwin`、`x86_64-apple-darwin`）、Linux ARM64／x86_64 GNU glibc（`aarch64-unknown-linux-gnu`、`x86_64-unknown-linux-gnu`，建置以 glibc 2.17 為目標）與 Windows x86_64（`x86_64-pc-windows-msvc`，手動下載 ZIP）。Linux musl／Alpine 不適用此安裝腳本。macOS 使用預設功能，不包含可選的 Apple Foundation Models 後端。
+
+推送 `v*-dnplus.*` tag 會建立可由 `releases/latest` 取得的正式 Release；手動執行 **Release prebuilt (dnplus)** 只建置並上傳 Actions artifacts，不發佈 Release。
+
 > A high-performance CLI tool and visualization dashboard for tracking token usage and costs across multiple AI coding agents.
 
 > [!TIP]
