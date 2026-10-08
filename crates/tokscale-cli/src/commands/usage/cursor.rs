@@ -444,13 +444,11 @@ fn metric_from_window(label: &str, window: &ParsedPlanWindow, reset_at: Option<S
 }
 
 fn plan_http_client() -> Result<reqwest::Client> {
-    // Match the Cursor CLI client: cursor.com / api2 sit behind fingerprints
-    // that reject rustls on some networks (#1250).
-    #[allow(clippy::disallowed_methods)]
-    let builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
-    #[cfg(not(target_os = "android"))]
-    let builder = builder.use_native_tls();
-    builder.build().context("Failed to build Cursor plan HTTP client")
+    // Reuse Cursor's TLS selection (#1250), overriding its default 15s timeout.
+    crate::cursor::cursor_http_client_builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("Failed to build Cursor plan HTTP client")
 }
 
 fn access_token_usable(token: &str) -> bool {
@@ -800,6 +798,18 @@ fn millis_or_secs_iso(raw: i64) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_plan_http_client_applies_thirty_second_timeout() {
+        let client = plan_http_client().expect("plan client builds");
+        // reqwest has no public timeout getter. Its Debug output exposes the
+        // built client's total timeout, verifying the shared 15s was overridden.
+        let rendered = format!("{client:?}");
+        assert!(
+            rendered.contains("TotalTimeout: 30s"),
+            "the plan client must retain its 30s timeout, got: {rendered}"
+        );
+    }
 
     #[test]
     fn parse_plan_window_from_total_percent_used() {

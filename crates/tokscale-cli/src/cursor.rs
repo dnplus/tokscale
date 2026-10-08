@@ -38,7 +38,7 @@ pub const CURSOR_AUTO_SYNC_FRESHNESS: Duration = Duration::from_secs(5 * 60);
 /// that asks for the platform's own TLS stack: Security.framework on macOS,
 /// schannel on Windows, OpenSSL on Linux. Every other client stays on rustls
 /// through `tokscale_core::http`.
-fn cursor_http_client_builder() -> reqwest::ClientBuilder {
+pub(crate) fn cursor_http_client_builder() -> reqwest::ClientBuilder {
     #[allow(clippy::disallowed_methods)]
     let builder = reqwest::Client::builder().timeout(CURSOR_HTTP_TIMEOUT);
 
