@@ -2,6 +2,7 @@
 
 mod amp;
 mod antigravity;
+pub mod bots;
 mod claude;
 pub mod codex;
 mod colab;

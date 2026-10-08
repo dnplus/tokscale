@@ -489,6 +489,10 @@ fn jwt_from_session_token(session: &str) -> Option<String> {
     access_token_usable(jwt).then(|| jwt.to_string())
 }
 
+pub(super) fn local_cursor_email() -> Option<String> {
+    resolve_local_auth().ok().and_then(|auth| auth.email)
+}
+
 fn resolve_local_auth() -> Result<LocalCursorAuth> {
     let home = crate::paths::home_dir().context("Could not determine home directory")?;
     let db_path = crate::cursor::find_cursor_state_vscdb_for_usage(&home);
