@@ -28,12 +28,16 @@ const SAND_USAGE_URL: &str =
 const REFRESH_URL: &str = "https://api2.cursor.sh/oauth/token";
 /// Public Cursor Auth0 client id. Not a user secret.
 const CLIENT_ID: &str = "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB";
+#[cfg(target_os = "macos")]
 const ACCESS_SERVICE: &str = "cursor-access-token";
+#[cfg(target_os = "macos")]
 const REFRESH_SERVICE: &str = "cursor-refresh-token";
 const PROVIDER: &str = "Cursor";
 const GROK_BOT_PROVIDER: &str = "Grok Bot";
 /// Chromium / Electron safeStorage KDF salt and iteration count.
+#[cfg(any(target_os = "macos", test))]
 const SAFE_STORAGE_SALT: &[u8] = b"saltysalt";
+#[cfg(any(target_os = "macos", test))]
 const SAFE_STORAGE_ITERATIONS: u32 = 1003;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -325,6 +329,7 @@ fn read_grok_bot_safe_storage_key() -> Result<String> {
 }
 
 /// Decrypt a Chromium / Electron `v10` safeStorage blob (base64).
+#[cfg(any(target_os = "macos", test))]
 fn decrypt_electron_safe_storage(cipher_b64: &str, password: &[u8]) -> Result<String> {
     use aes::Aes128;
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
