@@ -687,11 +687,7 @@ fn fetch_network_usage(credentials: &Credentials) -> Result<UsageOutput> {
     })
 }
 
-async fn fetch_proxy_billing(
-    client: &reqwest::Client,
-    token: &str,
-    url: &str,
-) -> Result<Value> {
+async fn fetch_proxy_billing(client: &reqwest::Client, token: &str, url: &str) -> Result<Value> {
     let resp = client
         .get(url)
         .bearer_auth(token)
@@ -763,7 +759,8 @@ fn proxy_period_end(config: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .or_else(|| {
-            string_at(config, &["billingPeriodEnd"]).or_else(|| epoch_at(config, &["billingPeriodEnd"]))
+            string_at(config, &["billingPeriodEnd"])
+                .or_else(|| epoch_at(config, &["billingPeriodEnd"]))
         })
 }
 
