@@ -340,6 +340,14 @@ enum Commands {
         json: bool,
         #[arg(long, help = "Light terminal output (no TUI)")]
         light: bool,
+        #[arg(long, help = "Break down local Grok Bot usage by bot")]
+        bots: bool,
+        #[arg(
+            long,
+            requires = "bots",
+            help = "Fallback window start (RFC3339), when weekly quota is unavailable"
+        )]
+        since: Option<chrono::DateTime<chrono::FixedOffset>>,
     },
     #[command(about = "Codex account integration commands")]
     Codex {
@@ -926,9 +934,18 @@ fn main() -> Result<()> {
             reject_unsupported_home_override(&cli.home, "antigravity")?;
             run_antigravity_command(subcommand)
         }
-        Some(Commands::Usage { json, light }) => {
+        Some(Commands::Usage {
+            json,
+            light,
+            bots,
+            since,
+        }) => {
             reject_unsupported_home_override(&cli.home, "usage")?;
-            commands::usage::run(json, light, cli.debug)
+            if bots {
+                commands::usage::bots::run(json, since.map(|date| date.with_timezone(&chrono::Utc)))
+            } else {
+                commands::usage::run(json, light, cli.debug)
+            }
         }
         Some(Commands::Codex { subcommand }) => {
             reject_unsupported_home_override(&cli.home, "codex")?;
@@ -7386,6 +7403,55 @@ fn prepare_headless_args(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn usage_bot_flags_are_opt_in() {
+        use clap::Parser;
+        for args in [
+            vec!["tokscale", "usage"],
+            vec!["tokscale", "usage", "--light"],
+            vec!["tokscale", "usage", "--json"],
+        ] {
+            let cli = super::Cli::try_parse_from(args).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(super::Commands::Usage {
+                    bots: false,
+                    since: None,
+                    ..
+                })
+            ));
+        }
+        assert!(super::Cli::try_parse_from([
+            "tokscale",
+            "usage",
+            "--since",
+            "2026-10-01T00:00:00Z"
+        ])
+        .is_err());
+        assert!(
+            super::Cli::try_parse_from(["tokscale", "usage", "--bots", "--since", "invalid"])
+                .is_err()
+        );
+        let cli = super::Cli::try_parse_from([
+            "tokscale",
+            "usage",
+            "--bots",
+            "--json",
+            "--since",
+            "2026-10-01T00:00:00Z",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(super::Commands::Usage {
+                bots: true,
+                json: true,
+                since: Some(_),
+                ..
+            })
+        ));
+    }
+
     use super::*;
     use clap::Parser;
     use reqwest::StatusCode;

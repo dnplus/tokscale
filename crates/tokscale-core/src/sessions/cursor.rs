@@ -94,7 +94,7 @@ fn record_parse_cursor_file_call(path: &Path) {
     }
 }
 
-fn account_id_from_cursor_cache_path(path: &Path) -> String {
+pub fn account_id_from_cursor_cache_path(path: &Path) -> String {
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -336,7 +336,12 @@ pub fn parse_cursor_events_json(path: &Path) -> Vec<UnifiedMessage> {
         Err(_) => return vec![],
     };
 
-    let root: serde_json::Value = match serde_json::from_str(&content) {
+    parse_cursor_events_json_content(&content, &account_id_from_cursor_cache_path(path))
+}
+
+/// Parse cached events without filesystem access, retaining Cursor-reported costs.
+pub fn parse_cursor_events_json_content(content: &str, account_id: &str) -> Vec<UnifiedMessage> {
+    let root: serde_json::Value = match serde_json::from_str(content) {
         Ok(root) => root,
         Err(_) => return vec![],
     };
@@ -347,7 +352,6 @@ pub fn parse_cursor_events_json(path: &Path) -> Vec<UnifiedMessage> {
         .cloned()
         .unwrap_or_default();
 
-    let account_id = account_id_from_cursor_cache_path(path);
     let mut messages = Vec::with_capacity(rows.len());
 
     for row in rows {
