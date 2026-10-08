@@ -861,6 +861,16 @@ tokscale usage --bots --since 2026-10-01T00:00:00Z
 
 `usage --bots` reads existing local Cursor JSON caches without syncing them. Main bots are identified by UUID conversations containing a `grok-bot-*` event; all models in those conversations count toward the bot. Subtasks and schedules appear separately. Costs use Cursor's metered amounts, and shares exclude other Cursor usage. The active cache is matched to the desktop Cursor email; secondary caches remain labeled by account ID because they contain no email. Missing caches and unavailable quotas are reported explicitly.
 
+Token columns in `usage --bots` show known input, output, cache-read and cache-write tokens. An existing `tokenUsage` object with missing fields contributes zero for those fields; events with no `tokenUsage` are counted separately as missing token data. Within Grok Bot events, `automationId` identifies schedules, with `grok-bot-automation` as a fallback when the ID is absent. Cursor cloud automations remain excluded.
+
+Bot attribution uses conversation and subagent identifiers from Cursor's cache; a conversation UUID is not a verified bot identity. To assign your own display labels to conversation UUIDs in `usage --bots`, create `~/.config/tokscale/grok-bot-aliases.json` (or the configured Tokscale config directory) with a UUID-to-name mapping:
+
+```json
+{"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee": "Example bot"}
+```
+
+These labels are user-defined aliases, not automatically discovered bot names. Named rows show the alias and short ID; JSON retains the full ID and adds `name`. Missing aliases fall back to the ID. Aliases affect display only, not grouping, token totals, or submissions.
+
 The weekly window starts seven days before the quota reset. When that reset is unavailable, `--since` supplies the window start (otherwise the last seven days are used). Burn-rate estimates extrapolate the last 24 hours of spending against the weekly used percentage; without a quota or usable costs, no percentage rate or exhaustion estimate is shown. JSON retains full bot IDs; terminal rows show their first eight characters.
 
 In the TUI, navigate to the **Usage** tab to see subscription data. Use `[Refresh]` to refresh subscription quotas. The keyboard refresh shortcut `r` uses the same refresh path.

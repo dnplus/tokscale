@@ -5193,11 +5193,7 @@ fn has_openai_gpt_fast_suffix(model_id: &str) -> bool {
     let tier_normalized = strip_parenthesized_reasoning_tier(&lower);
     let normalized = tier_normalized.unwrap_or(&lower);
     let terminal = normalized.rsplit('/').next().unwrap_or(normalized);
-    let Some(base) = terminal.strip_suffix("-fast") else {
-        return false;
-    };
-
-    base.starts_with("gpt-") && base.len() > "gpt-".len()
+    pricing::lookup::openai_gpt_fast_base(terminal).is_some()
 }
 
 fn uses_normalized_openai_fast_tariff(

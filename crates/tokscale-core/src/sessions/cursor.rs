@@ -162,6 +162,24 @@ struct CursorUsageEvent {
     charged_cents: Option<f64>,
     #[serde(rename = "tokenUsage", default)]
     token_usage: Option<CursorTokenUsage>,
+    #[serde(
+        rename = "automationId",
+        default,
+        deserialize_with = "de_automation_id"
+    )]
+    automation_id: Option<String>,
+}
+
+// Optional metadata must not discard otherwise valid usage events.
+fn de_automation_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_str()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned))
 }
 
 /// The per-event token breakdown. `cacheWriteTokens` is absent on many events.
@@ -359,13 +377,15 @@ fn is_conversation_uuid(id: &str) -> bool {
 /// Classify only explicit bot router conversations and sandbox subagent IDs.
 /// The full cache is examined before time/model filtering so switching models
 /// within an anchored conversation does not change ownership.
-fn classify_grok_bot_messages(messages: &mut [UnifiedMessage], account_id: &str) {
-    let anchored: HashSet<String> = messages
+fn classify_grok_bot_messages(records: &mut [CursorUsageRecord], account_id: &str) {
+    let anchored: HashSet<String> = records
         .iter()
+        .map(|record| &record.message)
         .filter(|m| is_conversation_uuid(&m.session_id) && m.model_id.starts_with("grok-bot-"))
         .map(|m| m.session_id.clone())
         .collect();
-    for message in messages {
+    for record in records {
+        let message = &mut record.message;
         if anchored.contains(&message.session_id)
             || message
                 .session_id
@@ -385,8 +405,25 @@ fn classify_grok_bot_messages(messages: &mut [UnifiedMessage], account_id: &str)
     }
 }
 
+/// Parsed Cursor metadata for local bot accounting. Kept separate from messages
+/// so optional display metadata does not alter cache or submission contracts.
+#[derive(Debug, Clone)]
+pub struct CursorUsageRecord {
+    pub message: UnifiedMessage,
+    pub has_token_usage: bool,
+    pub automation_id: Option<String>,
+}
+
 /// Parse cached events without filesystem access, retaining Cursor-reported costs.
 pub fn parse_cursor_events_json_content(content: &str, account_id: &str) -> Vec<UnifiedMessage> {
+    parse_cursor_usage_records(content, account_id)
+        .into_iter()
+        .map(|record| record.message)
+        .collect()
+}
+
+/// Retain optional accounting metadata and classify only valid parsed events.
+pub fn parse_cursor_usage_records(content: &str, account_id: &str) -> Vec<CursorUsageRecord> {
     let root: serde_json::Value = match serde_json::from_str(content) {
         Ok(root) => root,
         Err(_) => return vec![],
@@ -436,6 +473,7 @@ pub fn parse_cursor_events_json_content(content: &str, account_id: &str) -> Vec<
             ),
         };
 
+        let has_token_usage = event.token_usage.is_some();
         let token_usage = event.token_usage.unwrap_or_default();
 
         // Cursor reports two different amounts. `tokenUsage.totalCents` is the
@@ -469,7 +507,11 @@ pub fn parse_cursor_events_json_content(content: &str, account_id: &str) -> Vec<
         if cost.is_some() {
             message.mark_provider_reported_cost();
         }
-        messages.push(message);
+        messages.push(CursorUsageRecord {
+            message,
+            has_token_usage,
+            automation_id: event.automation_id,
+        });
     }
 
     classify_grok_bot_messages(&mut messages, account_id);
@@ -1362,6 +1404,86 @@ mod grok_bot_tests {
         assert!(messages[5].agent.is_none());
         let other_account = parse_cursor_events_json_content(&content, "personal");
         assert_ne!(messages[0].agent, other_account[0].agent);
+    }
+
+    #[test]
+    fn cursor_records_keep_missing_zero_partial_and_invalid_metadata_distinct() {
+        let bot = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let rows: Vec<_> = [
+            json!({}),
+            json!(null),
+            json!({"inputTokens": 0}),
+            json!({"outputTokens": 12}),
+            json!({}),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, tokens)| {
+            json!({
+                "timestamp": 1791417600000_i64, "conversationId": bot,
+                "model": "grok-bot-default", "tokenUsage": tokens,
+                "automationId": ([json!(42), json!(null), json!("  "), json!(" job "), json!({})][i])
+            })
+        })
+        .collect();
+        let records =
+            parse_cursor_usage_records(&json!({"usageEventsDisplay": rows}).to_string(), "work");
+        assert_eq!(records.len(), 5);
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| r.has_token_usage)
+                .collect::<Vec<_>>(),
+            [true, false, true, true, true]
+        );
+        assert_eq!(records[0].message.tokens, TokenBreakdown::default());
+        assert_eq!(records[2].message.tokens, TokenBreakdown::default());
+        assert_eq!(records[3].message.tokens.output, 12);
+        assert_eq!(records[3].automation_id.as_deref(), Some("job"));
+        assert!(records
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 3)
+            .all(|(_, r)| r.automation_id.is_none()));
+        assert!(records.iter().all(|r| r.message.agent.as_deref()
+            == Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee [work; conversation]")));
+    }
+
+    #[test]
+    fn invalid_router_row_does_not_anchor_ordinary_grok_usage() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let records = parse_cursor_usage_records(&json!({"usageEventsDisplay": [
+            {"timestamp": 0, "conversationId": id, "model": "grok-bot-default"},
+            {"timestamp": 1791417600000_i64, "conversationId": id, "model": "grok-4", "automationId": "cursor-job"}
+        ]}).to_string(), "work");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].message.client, "cursor");
+        assert!(records[0].message.agent.is_none());
+    }
+
+    #[test]
+    fn bot_metadata_preserves_combined_aggregation_totals() {
+        let records = parse_cursor_usage_records(
+            include_str!("../../tests/fixtures/grok_bot_usage.json"),
+            "work",
+        );
+        let split: Vec<_> = records.into_iter().map(|r| r.message).collect();
+        assert_eq!(split.len(), 8);
+        assert_eq!(split.iter().filter(|m| m.client == "grok-bot").count(), 6);
+        let mut before = split.clone();
+        for message in &mut before {
+            message.client = "cursor".into();
+        }
+        let baseline = crate::aggregator::aggregate_by_date(before);
+        let after = crate::aggregator::aggregate_by_date(split);
+        assert_eq!(baseline[0].totals, after[0].totals);
+        assert_eq!(baseline[0].token_breakdown, after[0].token_breakdown);
+        assert_eq!(after[0].totals.messages, 8);
+        assert_eq!(after[0].totals.cost, 6.75);
+        assert_eq!(after[0].token_breakdown.input, 920);
+        assert_eq!(after[0].token_breakdown.output, 92);
+        assert_eq!(after[0].token_breakdown.cache_read, 57);
+        assert_eq!(after[0].token_breakdown.cache_write, 18);
     }
 
     #[test]

@@ -1,0 +1,99 @@
+{
+  "usageEventsDisplay": [
+    {
+      "timestamp": "1791417600000",
+      "conversationId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "model": "grok-bot-default",
+      "chargedCents": 100,
+      "tokenUsage": {
+        "inputTokens": 100,
+        "outputTokens": 10,
+        "totalCents": 100,
+        "cacheReadTokens": 20,
+        "cacheWriteTokens": 5
+      }
+    },
+    {
+      "timestamp": "1791417600000",
+      "conversationId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "model": "claude-synthetic",
+      "chargedCents": 200,
+      "tokenUsage": {
+        "inputTokens": 300,
+        "outputTokens": 30,
+        "totalCents": 200
+      }
+    },
+    {
+      "timestamp": "1791417600000",
+      "conversationId": "sand-subagent-11111111-2222-3333-4444-555555555555",
+      "model": "claude-synthetic",
+      "chargedCents": 150,
+      "tokenUsage": {
+        "inputTokens": 200,
+        "outputTokens": 20,
+        "totalCents": 150,
+        "cacheReadTokens": 30,
+        "cacheWriteTokens": 10
+      },
+      "automationId": "synthetic-schedule"
+    },
+    {
+      "timestamp": "1791417600000",
+      "conversationId": "sand-subagent-11111111-2222-3333-4444-555555555555",
+      "model": "grok-bot-cua",
+      "chargedCents": 25,
+      "tokenUsage": {
+        "inputTokens": 80,
+        "outputTokens": 8,
+        "totalCents": 25,
+        "cacheReadTokens": 4
+      }
+    },
+    {
+      "timestamp": "1791417600000",
+      "conversationId": "sand-subagent-22222222-3333-4444-5555-666666666666",
+      "model": "grok-bot-automation",
+      "chargedCents": 25,
+      "tokenUsage": {
+        "inputTokens": 40,
+        "outputTokens": 4,
+        "totalCents": 25,
+        "cacheReadTokens": 1,
+        "cacheWriteTokens": 2
+      }
+    },
+    {
+      "timestamp": "1791417600000",
+      "conversationId": "bc-synthetic",
+      "model": "default",
+      "chargedCents": 50,
+      "tokenUsage": {
+        "inputTokens": 50,
+        "outputTokens": 5,
+        "totalCents": 50,
+        "cacheReadTokens": 2,
+        "cacheWriteTokens": 1
+      },
+      "automationId": "synthetic-cursor-cloud"
+    },
+    {
+      "timestamp": "1791417600000",
+      "conversationId": "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
+      "model": "default",
+      "chargedCents": 75,
+      "tokenUsage": {
+        "inputTokens": 150,
+        "outputTokens": 15,
+        "totalCents": 75
+      }
+    },
+    {
+      "timestamp": "1791417600000",
+      "conversationId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "model": "grok-bot-default",
+      "chargedCents": 50
+    }
+  ],
+  "totalUsageEventsCount": 8
+}
