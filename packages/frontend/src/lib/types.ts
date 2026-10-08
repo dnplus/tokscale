@@ -31,6 +31,7 @@ export const SUPPORTED_CLIENT_TYPES = [
   "gjc",
   "9router",
   "grok",
+  "grok-bot",
   "jcode",
   "commandcode",
   "micode",

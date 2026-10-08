@@ -954,7 +954,9 @@ impl DataLoader {
 
             if !is_recovery_floor {
                 if let Some(agent) = msg.agent.as_ref() {
-                    let normalized_agent = if msg.client == "opencode" {
+                    let normalized_agent = if msg.client == "grok-bot" {
+                        agent.clone()
+                    } else if msg.client == "opencode" {
                         sessions::normalize_opencode_agent_name(agent)
                     } else if msg.client == "copilot" {
                         sessions::normalize_copilot_agent_name(agent)
@@ -2209,6 +2211,7 @@ mod tests {
         assert_eq!(clients[53], ClientId::MiMoDesktop);
         assert_eq!(clients[54], ClientId::Muse);
         assert_eq!(clients[55], ClientId::AntigravityExtension);
+        assert_eq!(clients[56], ClientId::GrokBot);
     }
 
     #[test]
@@ -2270,6 +2273,7 @@ mod tests {
             "Xiaomi MiMo AI",
             "Muse Code",
             "Antigravity IDE Extension",
+            "Grok Bot",
         ];
 
         assert_eq!(expected.len(), ClientId::COUNT);
@@ -2568,6 +2572,29 @@ mod tests {
             .and_then(|day| day.as_ref())
             .map(|day| day.date);
         assert_eq!(last_day, Some(today));
+    }
+
+    #[test]
+    fn test_aggregate_grok_bot_conversations_keep_identity_across_models() {
+        let content = serde_json::json!({"usageEventsDisplay": [
+            {"conversationId": "11111111-1234-1234-1234-123456789abc", "model": "grok-bot-default",
+             "timestamp": 1770000000000_i64, "tokenUsage": {"inputTokens": 10, "totalCents": 25}},
+            {"conversationId": "11111111-1234-1234-1234-123456789abc", "model": "gpt-5",
+             "timestamp": 1770000001000_i64, "tokenUsage": {"inputTokens": 20, "totalCents": 50}},
+            {"conversationId": "sand-subagent-22222222-1234-1234-1234-123456789abc", "model": "gpt-5",
+             "timestamp": 1770000002000_i64, "tokenUsage": {"inputTokens": 30, "totalCents": 75}}
+        ]}).to_string();
+        let messages = sessions::cursor::parse_cursor_events_json_content(&content, "work-team");
+        let expected = messages[0].agent.clone().unwrap();
+        let usage = DataLoader::new(None)
+            .aggregate_messages(messages, &GroupBy::Model)
+            .unwrap();
+        assert_eq!(usage.agents.len(), 2);
+        let conversation = usage.agents.iter().find(|a| a.agent == expected).unwrap();
+        assert_eq!(conversation.message_count, 2);
+        assert_eq!(conversation.tokens.total(), 30);
+        assert_eq!(conversation.cost, 0.75);
+        assert_eq!(conversation.clients, "grok-bot");
     }
 
     #[test]

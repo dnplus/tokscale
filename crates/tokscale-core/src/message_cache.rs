@@ -1433,7 +1433,9 @@ fn parser_version(client: ClientId) -> u32 {
         // `chargedCents`) so plan-included rows keep Cursor's own figure instead
         // of landing unpriced, and uses a UTC-stable synthetic id for the id-less
         // fallback.
-        ClientId::Cursor => 3,
+        // v3->v4: classify Grok Bot conversations from the complete cache.
+        ClientId::Cursor => 4,
+        ClientId::GrokBot => 1,
         // Initial Reasonix implementation. The fingerprint samples the
         // append-only stats JSONL source so appended records are reparsed.
         // v1->v2: strip a leading BOM and recover records containing
@@ -5707,7 +5709,7 @@ mod tests {
 
     #[test]
     fn test_cursor_parser_version_invalidates_incorrect_token_and_cost_rows() {
-        assert_eq!(parser_version(ClientId::Cursor), 3);
+        assert_eq!(parser_version(ClientId::Cursor), 4);
     }
 
     #[test]

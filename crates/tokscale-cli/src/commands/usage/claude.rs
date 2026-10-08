@@ -406,7 +406,10 @@ fn access_token(creds: &Credentials) -> Option<&str> {
 }
 
 fn expiry_ms(creds: &Credentials) -> Option<i64> {
-    creds.claude_ai_oauth.as_ref().and_then(|oauth| oauth.expires_at)
+    creds
+        .claude_ai_oauth
+        .as_ref()
+        .and_then(|oauth| oauth.expires_at)
 }
 
 /// Choose between the on-disk and Keychain copies of Claude Code's login.
@@ -937,11 +940,12 @@ mod tests {
 
     #[test]
     fn select_credentials_uses_whichever_side_has_an_access_token() {
-        let from_keychain = select_claude_credentials(None, Some(creds_with("keychain-token", None)))
-            .unwrap();
+        let from_keychain =
+            select_claude_credentials(None, Some(creds_with("keychain-token", None))).unwrap();
         assert_eq!(access_token(&from_keychain), Some("keychain-token"));
 
-        let from_file = select_claude_credentials(Some(creds_with("file-token", None)), None).unwrap();
+        let from_file =
+            select_claude_credentials(Some(creds_with("file-token", None)), None).unwrap();
         assert_eq!(access_token(&from_file), Some("file-token"));
     }
 

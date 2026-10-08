@@ -1,5 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use super::widgets::{
     ambient_stable_scrollbar, format_cost, get_client_display_name, total_tokens_cell,
@@ -69,6 +71,31 @@ fn header_widths(is_narrow: bool, is_very_narrow: bool) -> Vec<Constraint> {
     ]
 }
 
+/// Wrap identifiers at grapheme boundaries, including long space-free IDs. The
+/// same lines determine the detail height and its rendering, so resizing cannot
+/// silently reserve fewer lines than the identity needs.
+fn identity_lines(label: &str, width: u16) -> Vec<Line<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    for source_line in label.split('\n') {
+        let mut line = String::new();
+        let mut used = 0;
+        for grapheme in source_line.graphemes(true) {
+            let cells = UnicodeWidthStr::width(grapheme);
+            if used + cells > usize::from(width) && !line.is_empty() {
+                lines.push(Line::from(std::mem::take(&mut line)));
+                used = 0;
+            }
+            line.push_str(grapheme);
+            used += cells;
+        }
+        lines.push(Line::from(line));
+    }
+    lines
+}
+
 pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let lang = app.settings.tui_language;
     let block = Block::default()
@@ -86,8 +113,55 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let visible_height = inner.height.saturating_sub(1) as usize;
+    // Clamp a stale selection before looking up the selected identity.
+    app.set_max_visible_items(inner.height.saturating_sub(1) as usize);
+    let selected_label = app
+        .get_sorted_agents()
+        .get(app.selected_index)
+        .map(|agent| agent.agent.clone());
+    let detail_lines = selected_label
+        .as_deref()
+        .map(|label| identity_lines(label, inner.width))
+        .unwrap_or_default();
+    // Keep a header and at least one data row on short terminals. Detail gets
+    // all remaining space, capped at its measured height plus a separator.
+    let detail_height = if inner.height >= 4 && !detail_lines.is_empty() {
+        (detail_lines.len().saturating_add(1).min(u16::MAX as usize) as u16).min(inner.height - 2)
+    } else {
+        0
+    };
+    let table_area = Rect {
+        height: inner.height - detail_height,
+        ..inner
+    };
+    let detail_area = Rect {
+        y: table_area.bottom(),
+        height: detail_height,
+        ..inner
+    };
+    let visible_height = table_area.height.saturating_sub(1) as usize;
     app.set_max_visible_items(visible_height);
+    // A longer selected identity or a resize can shrink the table without a
+    // navigation event. Keep that row visible in the newly measured viewport.
+    if app.selected_index < app.scroll_offset {
+        app.scroll_offset = app.selected_index;
+    } else if app.selected_index >= app.scroll_offset + visible_height.max(1) {
+        app.scroll_offset = app.selected_index + 1 - visible_height.max(1);
+    }
+    if detail_height > 0 {
+        frame.render_widget(
+            Paragraph::new(detail_lines)
+                .style(Style::default().fg(app.theme.foreground))
+                .block(
+                    Block::default()
+                        .borders(Borders::TOP)
+                        .border_set(AMBIENT_STABLE_BORDER_SET)
+                        .border_style(Style::default().fg(app.theme.border))
+                        .title(tr(lang, MessageKey::ColAgent)),
+                ),
+            detail_area,
+        );
+    }
 
     let is_narrow = app.is_narrow();
     let is_very_narrow = app.is_very_narrow();
@@ -165,13 +239,13 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
 
             let cells: Vec<Cell> = if is_very_narrow {
                 vec![
-                    Cell::from(truncate_text(&agent.agent, 18))
+                    Cell::from(agent.agent.as_str())
                         .style(Style::default().fg(app.theme.foreground)),
                     Cell::from(format_cost(agent.cost)).style(Style::default().fg(Color::Green)),
                 ]
             } else if is_narrow {
                 vec![
-                    Cell::from(truncate_text(&agent.agent, 18))
+                    Cell::from(agent.agent.as_str())
                         .style(Style::default().fg(app.theme.foreground)),
                     total_tokens_cell(agent.tokens.total(), &app.theme),
                     Cell::from(format_cost(agent.cost)).style(Style::default().fg(Color::Green)),
@@ -179,7 +253,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 vec![
                     Cell::from(format!("{}", idx + 1)).style(Style::default().fg(theme_muted)),
-                    Cell::from(truncate_text(&agent.agent, 32)).style(
+                    Cell::from(agent.agent.as_str()).style(
                         Style::default()
                             .fg(app.theme.foreground)
                             .add_modifier(Modifier::BOLD),
@@ -211,7 +285,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         .header(header)
         .row_highlight_style(Style::default().bg(theme_selection));
 
-    frame.render_widget(table, inner);
+    frame.render_widget(table, table_area);
 
     if agents_len > visible_height {
         let scrollbar = ambient_stable_scrollbar();
@@ -221,10 +295,12 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
 
         frame.render_stateful_widget(
             scrollbar,
-            area.inner(Margin {
-                horizontal: 0,
-                vertical: 1,
-            }),
+            Rect {
+                x: area.x,
+                y: table_area.y + 1,
+                width: area.width,
+                height: visible_height as u16,
+            },
             &mut scrollbar_state,
         );
     }
@@ -343,6 +419,115 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn detail_text(body: &str) -> String {
+        body.lines()
+            .skip_while(|line| !line.contains("Agent-"))
+            .skip(1)
+            .take_while(|line| !line.starts_with('+'))
+            .flat_map(|line| {
+                line.chars()
+                    .skip(1)
+                    .take(line.chars().count().saturating_sub(2))
+            })
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    #[test]
+    fn selected_identity_is_complete_at_common_terminal_widths() {
+        for width in [80, 120, 180] {
+            for kind in ["conversation", "subagent"] {
+                let label = format!(
+                    "12345678-1234-1234-1234-123456789abc [a-very-long-stable-account-identifier-0123456789; {kind}]"
+                );
+                let mut app = make_table_app(width);
+                app.data.agents = vec![agent(&label)];
+                let body = render_body(&mut app, width, 12);
+                assert_eq!(detail_text(&body), label.replace(' ', ""), "{body}");
+                let lines = super::identity_lines(&label, width - 2).len();
+                assert_eq!(app.max_visible_items, 12 - 2 - 1 - 1 - lines);
+            }
+        }
+    }
+
+    #[test]
+    fn wide_table_uses_available_identity_width() {
+        let mut app = make_table_app(180);
+        let label = "12345678-1234-1234-1234-123456789abc [work; conversation]";
+        app.data.agents = vec![agent(label)];
+        let body = render_body(&mut app, 180, 12);
+        assert!(body.lines().nth(2).unwrap().contains(label), "{body}");
+    }
+
+    #[test]
+    fn navigation_and_resize_keep_selection_and_details_in_sync() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = make_table_app(80);
+        app.data.agents = (0..24)
+            .map(|i| agent(&format!(
+                "{i:08}-1234-1234-1234-123456789abc [account-with-a-long-stable-identifier-{i:02}; subagent]"
+            )))
+            .collect();
+        for width in [180, 80, 120] {
+            app.handle_resize(width, 10);
+            for _ in 0..30 {
+                app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+                let body = render_body(&mut app, width, 10);
+                let selected = &app.get_sorted_agents()[app.selected_index].agent;
+                assert_eq!(detail_text(&body), selected.replace(' ', ""), "{body}");
+                assert!(app.selected_index >= app.scroll_offset);
+                assert!(app.selected_index < app.scroll_offset + app.max_visible_items);
+                let expected = 10 - 2 - 1 - 1 - super::identity_lines(selected, width - 2).len();
+                assert_eq!(app.max_visible_items, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn longer_selected_identity_reduces_viewport_without_hiding_selection() {
+        let mut app = make_table_app(80);
+        app.data.agents = (0..20).map(|i| agent(&format!("{i:03}"))).collect();
+        app.data.agents[6].agent = format!("006 {} [work; conversation]", "a".repeat(150));
+        app.selected_index = 5;
+        render_body(&mut app, 80, 12);
+        let short_capacity = app.max_visible_items;
+        app.selected_index = 6;
+        let body = render_body(&mut app, 80, 12);
+        let selected = &app.get_sorted_agents()[app.selected_index].agent;
+        assert_eq!(detail_text(&body), selected.replace(' ', ""), "{body}");
+        assert!(app.max_visible_items < short_capacity);
+        assert!(app.selected_index < app.scroll_offset + app.max_visible_items);
+        assert!(body.lines().take(8).any(|line| line.contains("006")));
+    }
+
+    #[test]
+    fn tiny_terminals_preserve_safe_navigation() {
+        let mut app = make_table_app(80);
+        app.data.agents = (0..20)
+            .map(|i| agent(&format!("{i:03} {}", "x".repeat(400))))
+            .collect();
+        app.selected_index = 19;
+        for width in [1, 2, 3, 80, 120, 180] {
+            for height in 1..10 {
+                app.handle_resize(width, height);
+                render_body(&mut app, width, height);
+                assert!(app.max_visible_items >= 1);
+                assert!(app.selected_index >= app.scroll_offset);
+                assert!(app.selected_index < app.scroll_offset + app.max_visible_items);
+            }
+        }
+    }
+
+    #[test]
+    fn identity_wrapping_preserves_unicode_and_long_ids() {
+        use unicode_width::UnicodeWidthStr;
+        let label = "識別帳號👩‍💻-12345678-1234-1234-1234-123456789abc [工作; subagent]";
+        let lines = super::identity_lines(label, 12);
+        let rendered: Vec<_> = lines.iter().map(ToString::to_string).collect();
+        assert_eq!(rendered.concat(), label);
+        assert!(rendered.iter().all(|line| line.width() <= 12));
     }
 
     /// The rendered header row of the Agents table.

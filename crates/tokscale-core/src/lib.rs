@@ -9047,6 +9047,88 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn test_grok_bot_shared_cursor_source_filters_and_cache_parity() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let cursor_dir = source_home.path().join(".config/tokscale/cursor-cache");
+        std::fs::create_dir_all(&cursor_dir).unwrap();
+        let bot = "12345678-1234-1234-1234-123456789abc";
+        let rows: Vec<_> = [
+            (bot, "claude-sonnet-4"),
+            (bot, "grok-bot-default"),
+            (
+                "sand-subagent-22222222-1234-1234-1234-123456789abc",
+                "gpt-5",
+            ),
+            ("33333333-1234-1234-1234-123456789abc", "grok-4"),
+        ]
+        .into_iter()
+        .map(|(id, model)| {
+            serde_json::json!({
+                "conversationId": id, "model": model,
+                "timestamp": if model == "grok-bot-default" { 1769800000000_i64 } else { 1770000000000_i64 },
+                "tokenUsage": {"inputTokens": 10, "outputTokens": 2, "totalCents": 25}
+            })
+        })
+        .collect();
+        std::fs::write(
+            cursor_dir.join("usage.json"),
+            serde_json::json!({"usageEventsDisplay": rows}).to_string(),
+        )
+        .unwrap();
+        // A stale CSV sibling must not cause a second source parse.
+        std::fs::write(cursor_dir.join("usage.csv"), "Date,Model\n").unwrap();
+        let _counter = sessions::cursor::register_parse_cursor_file_counter(source_home.path());
+        let home = source_home.path().to_str().unwrap();
+        let both = vec!["cursor".to_string(), "grok-bot".to_string()];
+        let cold = parse_all_messages_with_pricing(home, &both, None);
+        assert_eq!(cold.len(), 4);
+        assert_eq!(cold.iter().map(|m| m.cost).sum::<f64>(), 1.0);
+        assert_eq!(cold.iter().map(|m| m.tokens.input).sum::<i64>(), 40);
+        assert_eq!(
+            sessions::cursor::parse_cursor_file_call_count(source_home.path()),
+            1
+        );
+        let bot_only = parse_all_messages_with_pricing(home, &["grok-bot".to_string()], None);
+        let cursor_only = parse_all_messages_with_pricing(home, &["cursor".to_string()], None);
+        assert_eq!(bot_only.len(), 3);
+        assert!(bot_only
+            .iter()
+            .all(|m| m.client == "grok-bot" && m.agent.is_some() && m.parent_session_id.is_none()));
+        assert_eq!(cursor_only.len(), 1);
+        assert_eq!(cursor_only[0].model_id, "grok-4");
+        let recent = crate::parse_local_unified_messages_resolved(
+            LocalParseOptions {
+                since: Some(cursor_only[0].date.clone()),
+                ..Default::default()
+            },
+            home,
+            &["grok-bot".to_string()],
+            None,
+            SourceCachePolicy::Persistent,
+        )
+        .unwrap();
+        assert_eq!(recent.len(), 2);
+        assert!(recent.iter().all(|m| m.model_id != "grok-bot-default"));
+        assert!(
+            recent
+                .iter()
+                .any(|m| m.session_id == bot && m.client == "grok-bot"),
+            "a router anchor before the requested window must still classify later models"
+        );
+        assert_eq!(parse_all_messages_with_pricing(home, &both, None), cold);
+        assert_eq!(parse_all_messages_with_pricing(home, &[], None), cold);
+        assert_eq!(bot_only.len() + cursor_only.len(), cold.len());
+        assert_eq!(
+            sessions::cursor::parse_cursor_file_call_count(source_home.path()),
+            1,
+            "all filter variants reuse the one unfiltered physical source cache"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn test_cursor_cached_lane_matches_cold_parse_on_warm_hit() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();

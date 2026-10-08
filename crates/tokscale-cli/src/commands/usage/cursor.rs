@@ -28,12 +28,16 @@ const SAND_USAGE_URL: &str =
 const REFRESH_URL: &str = "https://api2.cursor.sh/oauth/token";
 /// Public Cursor Auth0 client id. Not a user secret.
 const CLIENT_ID: &str = "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB";
+#[cfg(target_os = "macos")]
 const ACCESS_SERVICE: &str = "cursor-access-token";
+#[cfg(target_os = "macos")]
 const REFRESH_SERVICE: &str = "cursor-refresh-token";
 const PROVIDER: &str = "Cursor";
 const GROK_BOT_PROVIDER: &str = "Grok Bot";
 /// Chromium / Electron safeStorage KDF salt and iteration count.
+#[cfg(any(target_os = "macos", test))]
 const SAFE_STORAGE_SALT: &[u8] = b"saltysalt";
+#[cfg(any(target_os = "macos", test))]
 const SAFE_STORAGE_ITERATIONS: u32 = 1003;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -140,10 +144,7 @@ pub fn fetch_grok_bot_all() -> Result<Vec<UsageOutput>> {
                             provider: GROK_BOT_PROVIDER.to_string(),
                             account: Some(UsageAccount {
                                 id: account.id,
-                                label: account
-                                    .name
-                                    .clone()
-                                    .or_else(|| account.email.clone()),
+                                label: account.name.clone().or_else(|| account.email.clone()),
                                 is_active: account.is_active,
                             }),
                             credential_source: Some("grok-bot-app".into()),
@@ -202,10 +203,7 @@ fn fetch_grok_bot_desktop() -> Result<UsageOutput> {
     })
 }
 
-async fn fetch_sand_for_token(
-    client: &reqwest::Client,
-    access: &str,
-) -> Result<ParsedSandUsage> {
+async fn fetch_sand_for_token(client: &reqwest::Client, access: &str) -> Result<ParsedSandUsage> {
     let sand = connect_post(client, SAND_USAGE_URL, access, "GetSandUsageStatus").await?;
     parse_sand_usage(&sand)
 }
@@ -220,9 +218,8 @@ struct GrokBotAppAccount {
 }
 
 fn grok_bot_secrets_path() -> Option<std::path::PathBuf> {
-    crate::paths::home_dir().map(|home| {
-        home.join("Library/Application Support/Grok Bot/sand-secrets.json")
-    })
+    crate::paths::home_dir()
+        .map(|home| home.join("Library/Application Support/Grok Bot/sand-secrets.json"))
 }
 
 /// Decrypt every Cursor account stored by Grok Bot.app (macOS Electron
@@ -246,8 +243,8 @@ fn load_grok_bot_app_accounts() -> Result<Vec<GrokBotAppAccount>> {
             .get("cursor-accounts")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("Grok Bot sand-secrets.json had no cursor-accounts"))?;
-        let doc: Value = serde_json::from_str(accounts_blob)
-            .context("Grok Bot cursor-accounts was not JSON")?;
+        let doc: Value =
+            serde_json::from_str(accounts_blob).context("Grok Bot cursor-accounts was not JSON")?;
         let active = doc
             .get("active")
             .and_then(Value::as_str)
@@ -332,6 +329,7 @@ fn read_grok_bot_safe_storage_key() -> Result<String> {
 }
 
 /// Decrypt a Chromium / Electron `v10` safeStorage blob (base64).
+#[cfg(any(target_os = "macos", test))]
 fn decrypt_electron_safe_storage(cipher_b64: &str, password: &[u8]) -> Result<String> {
     use aes::Aes128;
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -346,7 +344,12 @@ fn decrypt_electron_safe_storage(cipher_b64: &str, password: &[u8]) -> Result<St
         .strip_prefix(b"v10")
         .ok_or_else(|| anyhow::anyhow!("Grok Bot safeStorage blob was not a v10 envelope"))?;
     let mut key = [0u8; 16];
-    pbkdf2_hmac::<Sha1>(password, SAFE_STORAGE_SALT, SAFE_STORAGE_ITERATIONS, &mut key);
+    pbkdf2_hmac::<Sha1>(
+        password,
+        SAFE_STORAGE_SALT,
+        SAFE_STORAGE_ITERATIONS,
+        &mut key,
+    );
     let iv = [b' '; 16];
     type Aes128CbcDec = cbc::Decryptor<Aes128>;
     let mut buffer = payload.to_vec();
@@ -372,7 +375,11 @@ fn parse_sand_usage(value: &Value) -> Result<ParsedSandUsage> {
     {
         anyhow::bail!("Grok Bot uses a pooled enterprise allowance with no personal share");
     }
-    if value.get("hasNonZeroIncludedLimit").and_then(Value::as_bool) == Some(false) {
+    if value
+        .get("hasNonZeroIncludedLimit")
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
         anyhow::bail!("Grok Bot has no included weekly allowance on this Cursor account");
     }
     let used = value
@@ -433,7 +440,11 @@ fn metrics_from_tracks(tracks: &ParsedPlanTracks) -> Vec<UsageMetric> {
     metrics
 }
 
-fn metric_from_window(label: &str, window: &ParsedPlanWindow, reset_at: Option<String>) -> UsageMetric {
+fn metric_from_window(
+    label: &str,
+    window: &ParsedPlanWindow,
+    reset_at: Option<String>,
+) -> UsageMetric {
     UsageMetric {
         label: label.into(),
         used_percent: window.used_percent,
@@ -498,7 +509,9 @@ fn resolve_local_auth() -> Result<LocalCursorAuth> {
     let db_path = crate::cursor::find_cursor_state_vscdb_for_usage(&home);
     let (db_access, db_refresh, db_email) = if let Some(path) = db_path.as_ref() {
         (
-            read_vscdb_value(path, "cursorAuth/accessToken").ok().flatten(),
+            read_vscdb_value(path, "cursorAuth/accessToken")
+                .ok()
+                .flatten(),
             read_vscdb_value(path, "cursorAuth/refreshToken")
                 .ok()
                 .flatten(),
@@ -529,7 +542,8 @@ fn resolve_local_auth() -> Result<LocalCursorAuth> {
             let refresh = super::helpers::read_keychain(REFRESH_SERVICE).ok();
             return Ok(LocalCursorAuth {
                 access_token: access.to_string(),
-                refresh_token: nonempty(refresh.as_deref()).or_else(|| nonempty(db_refresh.as_deref())),
+                refresh_token: nonempty(refresh.as_deref())
+                    .or_else(|| nonempty(db_refresh.as_deref())),
                 email: account_label(db_email.as_deref()),
             });
         }
@@ -574,15 +588,14 @@ fn read_vscdb_value(db_path: &std::path::Path, key: &str) -> Result<Option<Strin
     )
     .with_context(|| format!("Failed to open Cursor state DB at {}", db_path.display()))?;
 
-    let value: Option<String> = match conn.query_row(
-        "SELECT value FROM ItemTable WHERE key = ?1",
-        [key],
-        |row| row.get(0),
-    ) {
-        Ok(value) => Some(value),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(err) => return Err(err.into()),
-    };
+    let value: Option<String> =
+        match conn.query_row("SELECT value FROM ItemTable WHERE key = ?1", [key], |row| {
+            row.get(0)
+        }) {
+            Ok(value) => Some(value),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(err) => return Err(err.into()),
+        };
     Ok(value
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty()))
@@ -619,8 +632,7 @@ async fn refresh_access_token(refresh_token: &str) -> Result<String> {
     if !status.is_success() {
         anyhow::bail!("Cursor token refresh returned HTTP {status}");
     }
-    let value: Value =
-        serde_json::from_str(&body).context("Cursor token refresh was not JSON")?;
+    let value: Value = serde_json::from_str(&body).context("Cursor token refresh was not JSON")?;
     if value
         .get("shouldLogout")
         .and_then(Value::as_bool)
@@ -671,20 +683,18 @@ fn parse_plan_tracks(usage: &Value, plan: Option<&Value>) -> Result<ParsedPlanTr
     let reset_at = billing_reset_iso(usage.get("billingCycleEnd")).or_else(|| {
         billing_reset_iso(plan.and_then(|value| value.pointer("/planInfo/billingCycleEnd")))
     });
-    let auto = percent_field(plan_usage, "autoPercentUsed").map(|(used, remaining)| {
-        ParsedPlanWindow {
+    let auto =
+        percent_field(plan_usage, "autoPercentUsed").map(|(used, remaining)| ParsedPlanWindow {
             used_percent: used,
             remaining_percent: remaining,
             reset_at: reset_at.clone(),
-        }
-    });
-    let api = percent_field(plan_usage, "apiPercentUsed").map(|(used, remaining)| {
-        ParsedPlanWindow {
+        });
+    let api =
+        percent_field(plan_usage, "apiPercentUsed").map(|(used, remaining)| ParsedPlanWindow {
             used_percent: used,
             remaining_percent: remaining,
             reset_at: reset_at.clone(),
-        }
-    });
+        });
     let total = plan_percents(plan_usage)
         .ok()
         .map(|(used_percent, remaining_percent)| ParsedPlanWindow {
@@ -824,10 +834,7 @@ mod tests {
         let window = parse_plan_window(&usage, None).unwrap();
         assert!((window.used_percent - 37.5).abs() < f64::EPSILON);
         assert!((window.remaining_percent - 62.5).abs() < f64::EPSILON);
-        assert_eq!(
-            window.reset_at.as_deref(),
-            Some("2026-01-01T00:00:00.000Z")
-        );
+        assert_eq!(window.reset_at.as_deref(), Some("2026-01-01T00:00:00.000Z"));
     }
 
     #[test]
@@ -898,7 +905,12 @@ mod tests {
 
         let password = b"unit-test-password";
         let mut key = [0u8; 16];
-        pbkdf2_hmac::<Sha1>(password, SAFE_STORAGE_SALT, SAFE_STORAGE_ITERATIONS, &mut key);
+        pbkdf2_hmac::<Sha1>(
+            password,
+            SAFE_STORAGE_SALT,
+            SAFE_STORAGE_ITERATIONS,
+            &mut key,
+        );
         let iv = [b' '; 16];
         let plaintext = b"{\"email\":\"dnplus@example.com\"}";
         let mut buffer = vec![0u8; plaintext.len() + 16];
@@ -926,7 +938,11 @@ mod tests {
         let window = parse_plan_window(&usage, Some(&plan)).unwrap();
         assert!((window.used_percent - 75.0).abs() < f64::EPSILON);
         assert!((window.remaining_percent - 25.0).abs() < f64::EPSILON);
-        assert!(window.reset_at.as_deref().unwrap().starts_with("2026-02-01"));
+        assert!(window
+            .reset_at
+            .as_deref()
+            .unwrap()
+            .starts_with("2026-02-01"));
     }
 
     #[test]

@@ -61,6 +61,7 @@ export const SOURCE_DISPLAY_NAMES: Record<ClientType, string> = {
   gjc: "Gajae Code",
   "9router": "9Router",
   grok: "Grok Build",
+  "grok-bot": "Grok Bot",
   jcode: "Jcode",
   commandcode: "Command Code",
   micode: "MiMo Code",
@@ -126,6 +127,7 @@ export const SOURCE_LOGOS: Record<ClientType, string> = {
   // until 9Router ships a dedicated asset.
   "9router": "https://github.com/user-attachments/assets/7246e920-f3f8-4b6e-847e-030ae04e86c2",
   grok: "https://github.com/xai-org.png",
+  "grok-bot": "https://github.com/xai-org.png",
   jcode: `${GITHUB_CDN_BASE}/client-jcode.png`,
   commandcode:
     "https://raw.githubusercontent.com/CommandCodeAI/command-code/main/.github/commandcode/logo/command-code-logo-black-bg.png",
@@ -191,6 +193,7 @@ export const SOURCE_COLORS: Record<ClientType, string> = {
   gjc: "#FF6B6B",
   "9router": "#0EA5E9",
   grok: "#171717",
+  "grok-bot": "#525252",
   jcode: "#F59E0B",
   commandcode: "#A855F7",
   micode: "#FF6900",

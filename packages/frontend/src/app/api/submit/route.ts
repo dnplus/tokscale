@@ -44,6 +44,7 @@ import {
   type ParserHighWaterPlan,
 } from "@/lib/db/parserHighWater";
 import { MICODE_FAMILY, planMiCodeTransition } from "@/lib/db/micodeTransition";
+import { CURSOR_GROK_BOT_FAMILY, CURSOR_GROK_BOT_PARSER_VERSIONS, planGrokBotTransition } from "@/lib/db/grokBotTransition";
 import {
   ANTIGRAVITY_FAMILY,
   planAntigravityTransition,
@@ -475,6 +476,15 @@ async function recordRatchetCensus(params: {
  *
  * Body: TokenContributionData JSON
  */
+/** Public protocol metadata only. Never cache a capability across deployments. */
+export async function GET() {
+  return NextResponse.json({
+    capabilities: {
+      cursorGrokBot: { parserVersions: CURSOR_GROK_BOT_PARSER_VERSIONS },
+    },
+  }, { headers: { "Cache-Control": "no-store" } });
+}
+
 export async function POST(request: Request) {
   try {
     // ========================================
@@ -909,6 +919,24 @@ export async function POST(request: Request) {
         }
         if (micodePlan.warning) warnings.push(micodePlan.warning);
       }
+      // Shared Cursor credit must move to Grok Bot atomically, never be added twice.
+      const grokBotPlan = planGrokBotTransition({
+        submittedClients,
+        incomingVersions: data.scanScope?.parserVersions,
+        persistedVersions: submittedDevice.parserVersions ?? undefined,
+        fullHistory: data.scanScope?.fullHistory === true,
+        isBackfill,
+        contributions: data.contributions,
+        existingDays: existingDeviceDays,
+      });
+      if (grokBotPlan.mode !== "status-quo") {
+        for (const client of CURSOR_GROK_BOT_FAMILY) {
+          parserPlans.set(client, grokBotPlan.mode === "replace"
+            ? { mode: "replace", increments: {}, layoutDays: grokBotPlan.layouts![client] }
+            : { mode: "freeze", increments: {} });
+        }
+        if (grokBotPlan.warning) warnings.push(grokBotPlan.warning);
+      }
       const antigravityPlan = planAntigravityTransition({
         submittedClients,
         incomingVersions: data.scanScope?.parserVersions,
@@ -1230,6 +1258,7 @@ export async function POST(request: Request) {
       if (
         advancedParserStates.length > 0 ||
         micodePlan.parserVersions ||
+        grokBotPlan.parserVersions ||
         antigravityPlan.parserVersions
       ) {
         const parserStatesForUpdate = Object.fromEntries(
@@ -1245,6 +1274,7 @@ export async function POST(request: Request) {
             parserVersions: {
               ...(submittedDevice.parserVersions ?? {}),
               ...micodePlan.parserVersions,
+              ...grokBotPlan.parserVersions,
               ...antigravityPlan.parserVersions,
               ...Object.fromEntries(
                 advancedParserStates.map(([client, state]) => [

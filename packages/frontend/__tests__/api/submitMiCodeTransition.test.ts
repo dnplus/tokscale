@@ -7,6 +7,7 @@ import * as schema from "../../src/lib/db/schema";
 import type { SubmissionData } from "../../src/lib/validation/submission";
 import type { ClientBreakdownData } from "../../src/lib/db/helpers";
 import { MICODE_FAMILY, MICODE_SUBMISSION_PARSER_VERSION } from "../../src/lib/db/micodeTransition";
+import { CURSOR_GROK_BOT_PARSER_VERSIONS } from "../../src/lib/db/grokBotTransition";
 import { LEGACY_DEVICE_KEY } from "../../src/lib/devices/shared";
 import { DEVICE_CLIENT_TOTALS_WRITE_FLAG, type DeviceClientBucketTotal } from "../../src/lib/db/deviceClientTotals";
 
@@ -699,5 +700,187 @@ describe("submission transaction transport", () => {
     expect(highwater.size).toBe(2);
     expect(totals().tokens).toBe(1500);
     expect(errorLog).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Reuse the strict SQL transport above so this family is tested through the
+// actual route, regression guard, validator and transactional device ledger.
+describe("GET submission capabilities", () => {
+  it("advertises the exact atomic family contract without authentication or writes", async () => {
+    mocks.auth.mockClear();
+    const { GET } = await import("../../src/app/api/submit/route");
+    const response = await GET();
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.json()).toEqual({ capabilities: { cursorGrokBot: { parserVersions: CURSOR_GROK_BOT_PARSER_VERSIONS } } });
+    expect(mocks.auth).not.toHaveBeenCalled();
+    expect(mocks.db.transaction).not.toHaveBeenCalled();
+    expect(mocks.db.execute).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST Cursor/Grok Bot shared-source transition", () => {
+  const versions = CURSOR_GROK_BOT_PARSER_VERSIONS;
+  const botSplit: Cell[] = [
+    { client: "cursor", input: 70, model: "grok-code" },
+    { client: "grok-bot", input: 30, model: "grok-code" },
+  ];
+  const botPayload = (cells = botSplit, options: Parameters<typeof payload>[1] = {}) =>
+    payload(cells, { versions, ...options });
+  const seedCursor = () => submit(botPayload([
+    { client: "cursor", input: 100, messages: 2, model: "grok-code" },
+  ], { versions: { cursor: 3 } }));
+
+  it("matches both generation declarations in the CLI wire contract", () => {
+    const sender = readFileSync(resolve(__dirname, "../../../../crates/tokscale-cli/src/main.rs"), "utf8");
+    expect(sender).toContain(`const CURSOR_SUBMISSION_PARSER_VERSION: u32 = ${versions.cursor};`);
+    expect(sender).toContain(`const GROK_BOT_SUBMISSION_PARSER_VERSION: u32 = ${versions["grok-bot"]};`);
+  });
+
+  it("moves cursor 100 to cursor 70 + bot 30, repeats identically, and preserves Grok Build", async () => {
+    await seedCursor();
+    await submit(payload([{ client: "grok", input: 10 }], { versions: null }));
+    const result = await submit(botPayload());
+    expect(result.metrics.totalTokens).toBe(110);
+    expect(cell("cursor")!.tokens).toBe(70);
+    expect(cell("grok-bot")!.tokens).toBe(30);
+    expect(cell("grok")!.tokens).toBe(10);
+    expect(devices.get("one")!.parserVersions).toEqual(versions);
+    const snapshot = structuredClone(days);
+    await submit(botPayload());
+    expect(days).toEqual(snapshot);
+  });
+
+  it("keeps legacy Cursor submissions on the existing guard until split evidence exists", async () => {
+    await seedCursor();
+    devices.get("one")!.parserVersions.cursor = 3;
+    await submit(botPayload([{ client: "cursor", input: 120, messages: 3, model: "grok-code" }], { versions: { cursor: 3 } }));
+    expect(cell("cursor")!.tokens).toBe(120);
+    await submit(botPayload([{ client: "cursor", input: 80, messages: 2, model: "grok-code" }], { versions: { cursor: 3 } }));
+    expect(cell("cursor")!.tokens).toBe(120);
+    expect(cell("grok-bot")).toBeUndefined();
+  });
+
+  it("credits covered family growth once while preserving unrelated parser state", async () => {
+    await seedCursor();
+    const device = devices.get("one")!;
+    device.parserVersions.other = 7;
+    device.parserStates.other = { kept: true };
+    const grown = botPayload([...botSplit, { client: "grok-bot", input: 50, date: "2026-08-02", model: "grok-code" }]);
+    await submit(grown);
+    await submit(grown);
+    expect(totals().tokens).toBe(150);
+    expect(device.parserVersions.other).toBe(7);
+    expect(device.parserStates.other).toEqual({ kept: true });
+  });
+
+  it("replaces an entirely bot history without leaving the old cursor credit", async () => {
+    await seedCursor();
+    await submit(botPayload([{ client: "grok-bot", input: 100, messages: 2, model: "grok-code" }]));
+    expect(cell("cursor")).toBeUndefined();
+    expect(cell("grok-bot")!.tokens).toBe(100);
+    expect(totals().tokens).toBe(100);
+  });
+
+  it.each([
+    ["bot-only scope", { versions: { "grok-bot": 1 } }],
+    ["cursor-only scope", { versions: { cursor: 4 } }],
+    ["filtered dates", { fullHistory: false }],
+    ["unversioned", { versions: null }],
+    ["old Cursor parser", { versions: { cursor: 3, "grok-bot": 1 } }],
+    ["future parser", { versions: { cursor: 5, "grok-bot": 1 } }],
+    ["incomplete pricing", { incomplete: true }],
+    ["backfill", { backfill: true }],
+  ] as const)("freezes %s atomically and blocks old-client downgrade", async (_label, options) => {
+    await seedCursor();
+    const before = structuredClone(days);
+    const result = await submit(botPayload(botSplit, options));
+    expect(days).toEqual(before);
+    expect(result.warnings.join(" ")).toContain("No Cursor/Grok Bot token or cost changes");
+    expect(devices.get("one")!.parserVersions).toEqual(versions);
+    await submit(botPayload([{ client: "cursor", input: 200, messages: 3, model: "grok-code" }], { versions: { cursor: 3 } }));
+    expect(days).toEqual(before);
+    await submit(botPayload());
+    expect(totals().tokens).toBe(100);
+    expect(cell("grok-bot")!.tokens).toBe(30);
+  });
+
+  it("freezes partial family changes while unrelated usage advances", async () => {
+    await seedCursor();
+    await submit(botPayload([...botSplit, { client: "claude", input: 40 }], { versions: { "grok-bot": 1 } }));
+    expect(cell("cursor")!.tokens).toBe(100);
+    expect(cell("grok-bot")).toBeUndefined();
+    expect(cell("claude")!.tokens).toBe(40);
+    expect(totals().tokens).toBe(140);
+  });
+
+  it.each([
+    ["different model", { model: "other-model", input: 100, messages: 2 }],
+    ["different day", { date: "2026-08-02", model: "grok-code", input: 100, messages: 2 }],
+    ["different bucket", { model: "grok-code", input: 0, cacheRead: 100, messages: 2 }],
+    ["missing messages", { model: "grok-code", input: 100, messages: 1 }],
+  ] as const)("preserves the baseline on %s mismatch", async (_label, replacement) => {
+    await seedCursor();
+    const before = structuredClone(days);
+    await submit(botPayload([{ client: "grok-bot", ...replacement }]));
+    expect(days).toEqual(before);
+  });
+
+  it("does not use unrelated growth to cover missing credited family history", async () => {
+    await seedCursor();
+    await submit(botPayload([
+      { client: "grok-bot", input: 30, model: "grok-code" },
+      { client: "cursor", input: 1000, date: "2026-08-02", model: "new-model" },
+    ]));
+    expect(totals().tokens).toBe(100);
+    expect(cell("grok-bot")).toBeUndefined();
+  });
+
+  it("accepts current full-history Cursor with an explicitly scanned empty bot sibling", async () => {
+    hasSubmission = false;
+    await submit(botPayload([{ client: "cursor", input: 100, messages: 2, model: "grok-code" }]));
+    expect(cell("cursor")!.tokens).toBe(100);
+    expect(cell("grok-bot")).toBeUndefined();
+    expect(devices.get("one")!.parserVersions).toEqual(versions);
+  });
+
+  it("freezes a fresh unversioned Bot payload instead of independently crediting it", async () => {
+    hasSubmission = false;
+    const result = await submit(botPayload([botSplit[1]], { versions: null }));
+    expect(totals().tokens).toBe(0);
+    expect(cell("grok-bot")).toBeUndefined();
+    expect(result.warnings.join(" ")).toContain("both surfaces");
+    expect(devices.get("one")!.parserVersions).toEqual(versions);
+  });
+
+  it("requires the pair even for a new-device single-surface scan", async () => {
+    hasSubmission = false;
+    await submit(botPayload([botSplit[1]], { versions: { "grok-bot": 1 } }));
+    expect(totals().tokens).toBe(0);
+    await submit(botPayload());
+    expect(totals().tokens).toBe(100);
+  });
+
+  it("freezes older clients even if only stored bot rows establish transition evidence", async () => {
+    await submit(botPayload());
+    devices.get("one")!.parserVersions = {};
+    const before = structuredClone(days);
+    await submit(botPayload([{ client: "cursor", input: 100, messages: 2, model: "grok-code" }], { versions: null }));
+    expect(days).toEqual(before);
+  });
+
+  it("does not downgrade future stored parser generations or modify other devices", async () => {
+    await submit(botPayload());
+    const device = devices.get("one")!;
+    device.parserVersions.cursor = 5;
+    device.parserStates.cursor = { future: true };
+    const before = structuredClone(days);
+    await submit(botPayload([{ client: "grok-bot", input: 200, messages: 3, model: "grok-code" }]));
+    expect(days).toEqual(before);
+    expect(device.parserVersions.cursor).toBe(5);
+    expect(device.parserStates.cursor).toEqual({ future: true });
+    await submit(botPayload(botSplit, { device: "two" }));
+    expect(days.filter((day) => day.deviceId === "device-one")).toEqual(before);
+    expect(totals().tokens).toBe(200);
   });
 });

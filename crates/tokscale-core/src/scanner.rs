@@ -1909,7 +1909,7 @@ fn scan_all_clients_with_env_strategy_inner(
     let include_all = clients.is_empty();
     let include_synthetic = include_all || clients.iter().any(|s| s == "synthetic");
 
-    let enabled: HashSet<ClientId> = if include_all || include_synthetic {
+    let mut enabled: HashSet<ClientId> = if include_all || include_synthetic {
         ClientId::iter().collect()
     } else {
         clients
@@ -1928,6 +1928,12 @@ fn scan_all_clients_with_env_strategy_inner(
             })
             .collect()
     };
+
+    // Grok Bot is classified from Cursor events. Discover and parse this
+    // physical source once, even when both output clients are selected.
+    if enabled.remove(&ClientId::GrokBot) {
+        enabled.insert(ClientId::Cursor);
+    }
 
     // Desktop ACP filenames need Devin CLI database titles to recover their
     // session/model/workspace metadata. Treat configured CLI roots as lookup
