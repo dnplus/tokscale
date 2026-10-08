@@ -1811,6 +1811,21 @@ mod tests {
         ]);
     }
 
+    /// The clock-derived microsecond fixture used by the SQLite turn test
+    /// produced these bytes in CI. Both byte orders are plausible in the same
+    /// unit, so refusing to infer a turn is correct, even before the BE date.
+    #[test]
+    fn competing_microsecond_readings_remain_ambiguous() {
+        assert_one_verdict_at_every_clock(&[EndiannessCase {
+            raw: 1_791_474_464_000_000_u64.to_le_bytes(),
+            anchor: 1_781_502_653_000,
+            turn_ms: 1_791_474_464_000,
+            le: Some((EpochUnit::Micros, 1_791_474_464_000)),
+            be: Some((EpochUnit::Micros, 2_266_262_417_507)),
+            verdict: None,
+        }]);
+    }
+
     /// A big-endian reading in a *finer* unit than the little-endian one is the
     /// byte-reversal shadow of that reading, not a rival to it, and must never
     /// cost the row its date.
@@ -2252,12 +2267,23 @@ mod tests {
         let path = dir.path().join("session-1118.db");
 
         let session_created_ms = 1_781_502_653_000_i64; // build_trajectory_meta
-        let two_days_ago = recent_epoch_seconds() - 2 * 24 * 60 * 60;
-        let now_ish = recent_epoch_seconds();
+
+        // Pin two turns two days apart, both after the session started. Raw
+        // micros derived from the clock can have a plausible same-unit BE
+        // mirror and are then correctly rejected as ambiguous. This positive
+        // fixture must use unambiguous bytes, just like the field-10 unit test.
+        let first_turn = session_created_ms / 1_000 + 24 * 60 * 60;
+        let last_turn = first_turn + 2 * 24 * 60 * 60;
 
         let row = |seconds: i64, id: &str| {
+            let raw = ((seconds * 1_000_000) as u64).to_le_bytes();
+            assert_eq!(
+                epoch_scalar_with_unit(u64::from_be_bytes(raw)),
+                None,
+                "positive turn fixtures must not have a plausible BE mirror"
+            );
             let mut gen9 = enc_varint(2, u64::MAX); // the unset sentinel
-            gen9.extend(enc_len(10, &((seconds * 1_000_000) as u64).to_le_bytes()));
+            gen9.extend(enc_len(10, &raw));
             build_row_with_gen9(&gen9, id)
         };
 
@@ -2268,7 +2294,7 @@ mod tests {
                  CREATE TABLE trajectory_metadata_blob (id text, data blob);",
             )
             .unwrap();
-            for (idx, blob) in [row(two_days_ago, "turn-1"), row(now_ish, "turn-2")]
+            for (idx, blob) in [row(first_turn, "turn-1"), row(last_turn, "turn-2")]
                 .iter()
                 .enumerate()
             {
@@ -2287,8 +2313,8 @@ mod tests {
 
         let messages = parse_antigravity_cli_file(&path);
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].timestamp, two_days_ago * 1_000);
-        assert_eq!(messages[1].timestamp, now_ish * 1_000);
+        assert_eq!(messages[0].timestamp, first_turn * 1_000);
+        assert_eq!(messages[1].timestamp, last_turn * 1_000);
         assert!(
             messages.iter().all(|m| m.timestamp != session_created_ms),
             "no row may keep the session-created stamp once #9.#10 decodes"
