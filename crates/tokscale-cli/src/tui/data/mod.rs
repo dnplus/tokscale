@@ -2270,6 +2270,7 @@ mod tests {
             "Xiaomi MiMo AI",
             "Muse Code",
             "Antigravity IDE Extension",
+            "Grok Bot",
         ];
 
         assert_eq!(expected.len(), ClientId::COUNT);

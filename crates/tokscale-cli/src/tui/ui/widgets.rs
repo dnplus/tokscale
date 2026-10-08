@@ -858,6 +858,7 @@ pub fn get_client_color(client: &str) -> Color {
         "opencode" => Color::Rgb(34, 197, 94),     // #22c55e
         "claude" => Color::Rgb(218, 119, 86),      // #DA7756 Claude brand coral
         "codex" => Color::Rgb(59, 130, 246),       // #3b82f6
+        "grok-bot" => Color::Rgb(20, 184, 166),
         "cursor" => Color::Rgb(168, 85, 247),      // #a855f7
         "gemini" => Color::Rgb(6, 182, 212),       // #06b6d4
         "amp" => Color::Rgb(236, 72, 153),         // #EC4899
@@ -942,6 +943,7 @@ fn map_single_provider(provider: &str, config: &TokscaleConfig) -> String {
         "anthropic" => return "Anthropic".to_string(),
         "google" => return "Google".to_string(),
         "cursor" => return "Cursor".to_string(),
+        "grok-bot" => return "Grok Bot".to_string(),
         "deepseek" => return "DeepSeek".to_string(),
         "xai" => return "xAI".to_string(),
         "meta" => return "Meta".to_string(),

@@ -1553,6 +1553,11 @@ fn push_unique_scan_task(
     client_id: ClientId,
     raw_path: impl Into<PathBuf>,
 ) {
+    let client_id = if client_id == ClientId::GrokBot {
+        ClientId::Cursor
+    } else {
+        client_id
+    };
     let raw_path = raw_path.into();
     let pattern = if matches!(client_id, ClientId::MiMoCode | ClientId::MiMoDesktop) {
         // Reject invalid explicit aliases before canonical-root dedup, or an
@@ -1909,7 +1914,7 @@ fn scan_all_clients_with_env_strategy_inner(
     let include_all = clients.is_empty();
     let include_synthetic = include_all || clients.iter().any(|s| s == "synthetic");
 
-    let enabled: HashSet<ClientId> = if include_all || include_synthetic {
+    let mut enabled: HashSet<ClientId> = if include_all || include_synthetic {
         ClientId::iter().collect()
     } else {
         clients
@@ -1928,6 +1933,11 @@ fn scan_all_clients_with_env_strategy_inner(
             })
             .collect()
     };
+
+    // Grok Bot is a classification of Cursor JSON, not a second source.
+    if enabled.contains(&ClientId::GrokBot) {
+        enabled.insert(ClientId::Cursor);
+    }
 
     // Desktop ACP filenames need Devin CLI database titles to recover their
     // session/model/workspace metadata. Treat configured CLI roots as lookup
@@ -1970,7 +1980,8 @@ fn scan_all_clients_with_env_strategy_inner(
     for client_id in &enabled {
         if matches!(
             client_id,
-            ClientId::OpenCode
+            ClientId::GrokBot
+                | ClientId::OpenCode
                 | ClientId::Codex
                 | ClientId::Mcode
                 | ClientId::OpenClaw

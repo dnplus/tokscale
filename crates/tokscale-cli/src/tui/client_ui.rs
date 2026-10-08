@@ -76,6 +76,7 @@ pub const CLIENT_UI: [ClientUi; ClientId::COUNT] = [
     // Antigravity IDE Extensions: uppercase `I` keeps the extension distinct
     // from the existing lowercase `i` hotkey for Kiro.
     ClientUi { hotkey: 'I' },
+    ClientUi { hotkey: 'V' }, // Grok Bot: separate from Grok Build.
 ];
 
 pub fn display_name(client: ClientId) -> &'static str {

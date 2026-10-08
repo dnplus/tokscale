@@ -4546,6 +4546,13 @@ async fn generate_graph_with_loaded_pricing(
     sink.finish(start, &bucket_timezone)
 }
 
+// Only the submission sink uses this mapping. Local JSON and graph retain IDs.
+fn map_submission_client(message: &mut UnifiedMessage) {
+    if message.client == "grok-bot" {
+        message.client = "cursor".to_string();
+    }
+}
+
 /// Messages buffered before a batch is folded away.
 ///
 /// Batching lets the sink reuse `prepare_submission_pricing` and
@@ -4640,11 +4647,14 @@ impl<'a> GraphSink<'a> {
             }
         };
 
-        for message in &batch {
-            self.daily.add(message);
+        for mut message in batch {
+            if matches!(self.requirement, GraphPricingRequirement::Submission) {
+                map_submission_client(&mut message);
+            }
+            self.daily.add(&message);
             if message.timestamp > 0 {
                 self.spans.push(sessionize::SessionSpan::from_message(
-                    message,
+                    &message,
                     &mut self.interner,
                 ));
             }
@@ -19933,3 +19943,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod grok_bot_tests;

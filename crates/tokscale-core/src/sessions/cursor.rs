@@ -158,6 +158,16 @@ struct CursorUsageEvent {
     charged_cents: Option<f64>,
     #[serde(rename = "tokenUsage", default)]
     token_usage: Option<CursorTokenUsage>,
+    #[serde(rename = "automationId", default, deserialize_with = "de_automation_id")]
+    automation_id: Option<String>,
+}
+
+// Metadata must not make an otherwise valid usage row disappear.
+fn de_automation_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_str().map(str::to_owned))
 }
 
 /// The per-event token breakdown. `cacheWriteTokens` is absent on many events.
@@ -339,8 +349,35 @@ pub fn parse_cursor_events_json(path: &Path) -> Vec<UnifiedMessage> {
     parse_cursor_events_json_content(&content, &account_id_from_cursor_cache_path(path))
 }
 
+/// Parsed Cursor event metadata for bot accounting, independent of report totals.
+#[derive(Debug, Clone)]
+pub struct CursorUsageRecord {
+    pub message: UnifiedMessage,
+    pub has_token_usage: bool,
+    pub automation_id: Option<String>,
+}
+
+pub fn is_bot_uuid(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
 /// Parse cached events without filesystem access, retaining Cursor-reported costs.
 pub fn parse_cursor_events_json_content(content: &str, account_id: &str) -> Vec<UnifiedMessage> {
+    parse_cursor_usage_records(content, account_id)
+        .into_iter()
+        .map(|record| record.message)
+        .collect()
+}
+
+/// Read the entire cache before classifying: other models can belong to a bot.
+pub fn parse_cursor_usage_records(content: &str, account_id: &str) -> Vec<CursorUsageRecord> {
     let root: serde_json::Value = match serde_json::from_str(content) {
         Ok(root) => root,
         Err(_) => return vec![],
@@ -352,13 +389,21 @@ pub fn parse_cursor_events_json_content(content: &str, account_id: &str) -> Vec<
         .cloned()
         .unwrap_or_default();
 
+    let bot_ids: std::collections::HashSet<&str> = rows
+        .iter()
+        .filter_map(|row| {
+            let id = row.get("conversationId")?.as_str()?.trim();
+            let model = row.get("model")?.as_str()?.trim();
+            (is_bot_uuid(id) && model.starts_with("grok-bot-")).then_some(id)
+        })
+        .collect();
     let mut messages = Vec::with_capacity(rows.len());
 
-    for row in rows {
+    for row in &rows {
         // Deserialize each row on its own so one malformed entry (an unexpected
         // type in a single field) skips just that row instead of discarding the
         // entire cache.
-        let event: CursorUsageEvent = match serde_json::from_value(row) {
+        let event: CursorUsageEvent = match serde_json::from_value(row.clone()) {
             Ok(event) => event,
             Err(_) => continue,
         };
@@ -390,6 +435,11 @@ pub fn parse_cursor_events_json_content(content: &str, account_id: &str) -> Vec<
             ),
         };
 
+        let has_token_usage = event.token_usage.is_some();
+        let is_bot = session_id
+            .strip_prefix("sand-subagent-")
+            .is_some_and(is_bot_uuid)
+            || bot_ids.contains(session_id.as_str());
         let token_usage = event.token_usage.unwrap_or_default();
 
         // Cursor reports two different amounts. `tokenUsage.totalCents` is the
@@ -405,7 +455,7 @@ pub fn parse_cursor_events_json_content(content: &str, account_id: &str) -> Vec<
         let cost = metered_cents.map(|cents| cents / 100.0);
 
         let mut message = UnifiedMessage::new(
-            "cursor",
+            if is_bot { "grok-bot" } else { "cursor" },
             model,
             infer_provider(model),
             session_id,
@@ -423,7 +473,11 @@ pub fn parse_cursor_events_json_content(content: &str, account_id: &str) -> Vec<
         if cost.is_some() {
             message.mark_provider_reported_cost();
         }
-        messages.push(message);
+        messages.push(CursorUsageRecord {
+            message,
+            has_token_usage,
+            automation_id: event.automation_id,
+        });
     }
 
     messages

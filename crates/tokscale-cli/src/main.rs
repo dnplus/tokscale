@@ -1164,6 +1164,8 @@ pub enum ClientFilter {
     Muse,
     #[value(name = "antigravity-extension")]
     AntigravityExtension,
+    #[value(name = "grok-bot")]
+    GrokBot,
     Synthetic,
 }
 
@@ -1177,6 +1179,7 @@ impl ClientFilter {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Cursor => "cursor",
+            Self::GrokBot => "grok-bot",
             Self::Gemini => "gemini",
             Self::Amp => "amp",
             Self::Droid => "droid",
@@ -1246,6 +1249,7 @@ impl ClientFilter {
             Self::Claude => Some(ClientId::Claude),
             Self::Codex => Some(ClientId::Codex),
             Self::Cursor => Some(ClientId::Cursor),
+            Self::GrokBot => Some(ClientId::GrokBot),
             Self::Gemini => Some(ClientId::Gemini),
             Self::Amp => Some(ClientId::Amp),
             Self::Droid => Some(ClientId::Droid),
@@ -1312,6 +1316,7 @@ impl ClientFilter {
             ClientId::Claude => Self::Claude,
             ClientId::Codex => Self::Codex,
             ClientId::Cursor => Self::Cursor,
+            ClientId::GrokBot => Self::GrokBot,
             ClientId::Gemini => Self::Gemini,
             ClientId::Amp => Self::Amp,
             ClientId::Droid => Self::Droid,
@@ -1512,7 +1517,7 @@ fn build_client_filter_with_defaults(
 fn client_filter_includes_cursor(clients: &Option<Vec<String>>) -> bool {
     clients
         .as_ref()
-        .is_none_or(|sources| sources.iter().any(|source| source == "cursor"))
+        .is_none_or(|sources| sources.iter().any(|source| source == "cursor" || source == "grok-bot"))
 }
 
 fn client_filter_explicitly_requests_cursor(clients: &Option<Vec<String>>) -> bool {
@@ -4545,6 +4550,7 @@ fn run_clients_command(json: bool, home_dir: Option<String>) -> Result<()> {
                     ClientId::Copilot => "Copilot CLI",
                     ClientId::Gemini => "Gemini CLI",
                     ClientId::Cursor => "Cursor IDE",
+                    ClientId::GrokBot => "Grok Bot",
                     ClientId::Kimi => "Kimi CLI",
                     ClientId::AntigravityCli => "Antigravity CLI",
                     ClientId::AntigravityExtension => "Antigravity IDE Extension",
@@ -7403,6 +7409,25 @@ fn prepare_headless_args(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn grok_bot_filter_is_separate_from_cursor() {
+        for (flag, expected) in [("--client", "grok-bot"), ("-c", "cursor")] {
+            let args = vec!["tokscale", "models", flag, expected];
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Some(Commands::Models { clients, .. }) = cli.command else {
+                panic!("models command");
+            };
+            assert_eq!(
+                build_client_filter_with_defaults(clients, &[]),
+                Some(vec![expected.to_string()])
+            );
+        }
+        assert_eq!(
+            ClientFilter::GrokBot.to_client_id(),
+            Some(tokscale_core::ClientId::GrokBot)
+        );
+    }
+
     #[test]
     fn usage_bot_flags_are_opt_in() {
         use clap::Parser;
