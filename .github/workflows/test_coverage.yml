@@ -161,6 +161,59 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-features --no-fail-fast
 
+  coverage-pr:
+    name: Coverage Tests (PR)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: coverage-pr-${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            coverage-pr-${{ runner.os }}-cargo-
+
+      - name: Install cargo-tarpaulin
+        uses: taiki-e/install-action@cargo-tarpaulin
+
+      # Run the same instrumented tests and threshold before merging. Unlike
+      # the main-only report job below, this job never writes a badge or commit.
+      - name: Verify coverage
+        run: |
+          cargo tarpaulin \
+            --workspace \
+            --all-features \
+            --out Xml Json \
+            --output-dir ./coverage \
+            --timeout 300 \
+            --fail-under 45 \
+            --verbose
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v6
+        if: "!cancelled()"
+        with:
+          name: coverage-report-pr
+          path: ./coverage/
+          retention-days: 7
+          if-no-files-found: warn
+
   coverage:
     name: Coverage Report
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
