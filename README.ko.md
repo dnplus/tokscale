@@ -842,7 +842,7 @@ TUI에서는 **Usage** 탭으로 이동해 구독 데이터를 확인하세요. 
 | **Amp** | API 키 (`~/.local/share/amp/secrets.json`) | 무료 티어 잔액, 크레딧 | `amp`를 실행해 로그인 |
 | **GitHub Copilot** | GitHub 토큰 (keychain 또는 `~/.config/gh/hosts.yml`) | 프리미엄 상호작용, 채팅 할당량 | `gh auth login` 실행 |
 | **Cursor** | Desktop `state.vscdb` JWT (or macOS Keychain `cursor-access-token`, or JWT inside a saved `tokscale cursor login` session) | Plan period remaining | Sign in to Cursor desktop, or run `tokscale cursor login` |
-| **Antigravity** | Running language server (loopback RPC), or `agy --print /usage` when `~/.gemini/oauth_creds.json` exists | Per model-group weekly / 5-hour remaining | Run `agy` (or the Antigravity IDE) signed in |
+| **Antigravity** | Running language server (loopback RPC), or `agy --print /usage` with `~/.gemini/antigravity-cli/antigravity-oauth-token` (Linux/macOS) or legacy `~/.gemini/oauth_creds.json`; `GEMINI_CLI_HOME` overrides `~/.gemini` | Per model-group weekly / 5-hour remaining | Run `agy` (or the Antigravity IDE) signed in |
 | **Colab** | OAuth (`~/.config/colab-cli/token.json`) | Compute-unit balance, hourly burn rate, active runtimes | Log in with `colab-cli`; override with `TOKSCALE_COLAB_TOKEN_PATH` |
 | **Grok Build** | OAuth (`~/.grok/auth.json`) | 크레딧, 구독 플랜 | `grok login` 실행 |
 | **Kimi** | OAuth (`~/.kimi/credentials/kimi-code.json`) | 세션, 주간 할당량 | `kimi`를 실행해 로그인 |

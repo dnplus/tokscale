@@ -847,7 +847,7 @@ In the TUI, navigate to the **Usage** tab to see subscription data. Use `[Refres
 | **Amp** | API key (`~/.local/share/amp/secrets.json`) | Free tier balance, Credits | Run `amp` to log in |
 | **GitHub Copilot** | GitHub token (keychain or `~/.config/gh/hosts.yml`) | Premium interactions, Chat quotas | Run `gh auth login` |
 | **Cursor** | Desktop `state.vscdb` JWT (or macOS Keychain `cursor-access-token`, or JWT inside a saved `tokscale cursor login` session) | Plan period remaining | Sign in to Cursor desktop, or run `tokscale cursor login` |
-| **Antigravity** | Running language server (loopback RPC), or `agy --print /usage` when `~/.gemini/oauth_creds.json` exists | Per model-group weekly / 5-hour remaining | Run `agy` (or the Antigravity IDE) signed in |
+| **Antigravity** | Running language server (loopback RPC), or `agy --print /usage` with `~/.gemini/antigravity-cli/antigravity-oauth-token` (Linux/macOS) or legacy `~/.gemini/oauth_creds.json`; `GEMINI_CLI_HOME` overrides `~/.gemini` | Per model-group weekly / 5-hour remaining | Run `agy` (or the Antigravity IDE) signed in |
 | **Colab** | OAuth (`~/.config/colab-cli/token.json`) | Compute-unit balance, hourly burn rate, active runtimes | Log in with `colab-cli`; override with `TOKSCALE_COLAB_TOKEN_PATH` |
 | **Grok Build** | OAuth (`~/.grok/auth.json`) | Credits, subscription plan | Run `grok login` |
 | **Kimi** | OAuth (`~/.kimi/credentials/kimi-code.json`) | Session, Weekly quotas | Run `kimi` to log in |
