@@ -7,6 +7,9 @@
 //! JSON (preferred) comes from the dashboard `get-filtered-usage-events`
 //! endpoint. Each event carries a real `conversationId`, so sessions are keyed
 //! by the Cursor session UUID instead of a synthetic timestamp bucket.
+//! Grok Bot attribution shares this source: UUID conversations anchored by a
+//! `grok-bot-*` router event and `sand-subagent-<UUID>` conversations emit the
+//! distinct `grok-bot` client. A Grok model by itself is not evidence of origin.
 //!
 //! CSV (legacy) formats, still parsed for caches written before the JSON switch:
 //! - v1 (old): Date,Model,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost,Cost to you
@@ -16,6 +19,7 @@
 use super::{timestamp_to_date_with_timezone, UnifiedMessage};
 use crate::{provider_identity, TokenBreakdown};
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::path::Path;
 
 #[cfg(test)]
@@ -339,6 +343,48 @@ pub fn parse_cursor_events_json(path: &Path) -> Vec<UnifiedMessage> {
     parse_cursor_events_json_content(&content, &account_id_from_cursor_cache_path(path))
 }
 
+/// A canonical UUID-shaped conversation identifier, without accepting arbitrary
+/// model names or synthetic Cursor session IDs as evidence of bot ownership.
+fn is_conversation_uuid(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
+}
+
+/// Classify only explicit bot router conversations and sandbox subagent IDs.
+/// The full cache is examined before time/model filtering so switching models
+/// within an anchored conversation does not change ownership.
+fn classify_grok_bot_messages(messages: &mut [UnifiedMessage], account_id: &str) {
+    let anchored: HashSet<String> = messages
+        .iter()
+        .filter(|m| is_conversation_uuid(&m.session_id) && m.model_id.starts_with("grok-bot-"))
+        .map(|m| m.session_id.clone())
+        .collect();
+    for message in messages {
+        if anchored.contains(&message.session_id)
+            || message
+                .session_id
+                .strip_prefix("sand-subagent-")
+                .is_some_and(is_conversation_uuid)
+        {
+            message.client = "grok-bot".to_string();
+            // This is a local conversation identity, not a verified bot name or
+            // parent relationship. Include the account to avoid cross-account
+            // aggregation. Keep the entire ID so no two conversations merge.
+            let (id, kind) = match message.session_id.strip_prefix("sand-subagent-") {
+                Some(id) => (id, "subagent"),
+                None => (message.session_id.as_str(), "conversation"),
+            };
+            message.agent = Some(format!("{id} [{account_id}; {kind}]"));
+        }
+    }
+}
+
 /// Parse cached events without filesystem access, retaining Cursor-reported costs.
 pub fn parse_cursor_events_json_content(content: &str, account_id: &str) -> Vec<UnifiedMessage> {
     let root: serde_json::Value = match serde_json::from_str(content) {
@@ -426,6 +472,7 @@ pub fn parse_cursor_events_json_content(content: &str, account_id: &str) -> Vec<
         messages.push(message);
     }
 
+    classify_grok_bot_messages(&mut messages, account_id);
     messages
 }
 
@@ -1253,5 +1300,82 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert!(messages[0].timestamp > 0);
         assert_eq!(messages[0].timestamp, messages[1].timestamp);
+    }
+}
+
+#[cfg(test)]
+mod grok_bot_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn grok_bot_attribution_is_conversation_scoped_and_conservative() {
+        let bot = "12345678-1234-1234-1234-123456789abc";
+        let ordinary = "22222222-1234-1234-1234-123456789abc";
+        let subagent = "sand-subagent-33333333-1234-1234-1234-123456789abc";
+        // Put the router anchor last to verify classification is order-independent.
+        let pairs = [
+            (bot, "claude-sonnet-4"),
+            (bot, "gpt-5"),
+            (ordinary, "grok-4"),
+            (subagent, "gpt-5"),
+            ("not-a-uuid", "grok-bot-default"),
+            ("sand-subagent-invalid", "grok-bot-automation"),
+            (bot, "grok-bot-default"),
+        ];
+        let rows: Vec<_> = pairs
+            .iter()
+            .map(|(id, model)| {
+                json!({
+                    "conversationId": id, "model": model, "timestamp": 1770000000000_i64,
+                    "tokenUsage": {"inputTokens": 10, "outputTokens": 2,
+                        "cacheReadTokens": 3, "cacheWriteTokens": 4, "totalCents": 25}
+                })
+            })
+            .collect();
+        let content = json!({"usageEventsDisplay": rows}).to_string();
+        let messages = parse_cursor_events_json_content(&content, "work");
+        assert_eq!(messages.len(), pairs.len());
+        assert_eq!(
+            messages.iter().filter(|m| m.client == "grok-bot").count(),
+            4
+        );
+        assert_eq!(messages.iter().map(|m| m.cost).sum::<f64>(), 1.75);
+        assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 70);
+        for (message, (_, model)) in messages.iter().zip(pairs) {
+            assert_eq!(message.model_id, model);
+            assert!(message.has_authoritative_cost());
+        }
+        assert_eq!(
+            messages[0].agent.as_deref(),
+            Some("12345678-1234-1234-1234-123456789abc [work; conversation]")
+        );
+        assert_eq!(
+            messages[3].agent.as_deref(),
+            Some("33333333-1234-1234-1234-123456789abc [work; subagent]")
+        );
+        assert_eq!(messages[0].agent, messages[1].agent);
+        assert_eq!(messages[0].agent, messages[6].agent);
+        assert_ne!(messages[0].agent, messages[3].agent);
+        assert!(messages[2].agent.is_none());
+        assert!(messages[4].agent.is_none());
+        assert!(messages[5].agent.is_none());
+        let other_account = parse_cursor_events_json_content(&content, "personal");
+        assert_ne!(messages[0].agent, other_account[0].agent);
+    }
+
+    #[test]
+    fn legacy_csv_never_guesses_bot_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.csv");
+        std::fs::write(&path, concat!(
+            "Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost\n",
+            "2026-03-04T12:00:00.000Z,Included,grok-bot-default,No,4,10,3,2,19,0.25\n"
+        )).unwrap();
+        let messages = parse_cursor_file(&path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].client, "cursor");
+        assert!(messages[0].agent.is_none());
+        assert_eq!(messages[0].cost, 0.25);
     }
 }

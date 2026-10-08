@@ -1102,6 +1102,18 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    // Attribution surface sharing Cursor's cache, not a second physical source.
+    GrokBot = 56 => {
+        id: "grok-bot",
+        display: "Grok Bot",
+        logo: None,
+        root: PathRoot::Home,
+        relative: ".config/tokscale/cursor-cache",
+        pattern: "usage*.json|usage*.csv",
+        headless: false,
+        parse_local: false,
+        submit_default: true
     }
 );
 
@@ -1217,7 +1229,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 56);
+        assert_eq!(ClientId::COUNT, 57);
     }
 
     #[test]

@@ -735,10 +735,12 @@ fn normalize_cached_agents(agents: Vec<CachedAgentUsage>) -> Vec<AgentUsage> {
 
 fn normalize_cached_agent_name(agent: &str, clients: &str) -> String {
     // Mirror the per-client normalization in `tui::data` (see the `msg.agent`
-    // branch there): copilot and opencode agent ids use bespoke normalizers,
-    // everything else falls back to the generic one. Keep these two in sync.
+    // branch there): Grok Bot conversation IDs remain exact; copilot and
+    // opencode use bespoke normalizers. Keep these two paths in sync.
     let has_client = |name: &str| clients.split(", ").any(|client| client == name);
-    if has_client("opencode") {
+    if has_client("grok-bot") {
+        agent.to_string()
+    } else if has_client("opencode") {
         sessions::normalize_opencode_agent_name(agent)
     } else if has_client("copilot") {
         sessions::normalize_copilot_agent_name(agent)
@@ -1119,6 +1121,19 @@ mod tests {
             cost: total_seed as f64,
             message_count: 1,
         }
+    }
+
+    #[test]
+    fn test_grok_bot_conversation_agent_labels_preserve_identity() {
+        let first = "12345678-1234-1234-1234-123456789abc [work-team; conversation]";
+        let second = "12345678-1234-1234-1234-123456789abc [work team; conversation]";
+        let agents = normalize_cached_agents(vec![
+            cached_agent(first, "grok-bot", 10),
+            cached_agent(second, "grok-bot", 20),
+        ]);
+        assert_eq!(agents.len(), 2);
+        assert!(agents.iter().any(|agent| agent.agent == first));
+        assert!(agents.iter().any(|agent| agent.agent == second));
     }
 
     #[test]

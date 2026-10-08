@@ -7,6 +7,7 @@ mod device;
 mod hindsight;
 mod paths;
 mod process_liveness;
+mod submit_compat;
 mod trae;
 mod tui;
 mod warp;
@@ -1164,6 +1165,8 @@ pub enum ClientFilter {
     Muse,
     #[value(name = "antigravity-extension")]
     AntigravityExtension,
+    #[value(name = "grok-bot")]
+    GrokBot,
     Synthetic,
 }
 
@@ -1202,6 +1205,7 @@ impl ClientFilter {
             Self::Gjc => "gjc",
             Self::NineRouter => "9router",
             Self::Grok => "grok",
+            Self::GrokBot => "grok-bot",
             Self::Jcode => "jcode",
             Self::Commandcode => "commandcode",
             Self::Micode => "micode",
@@ -1271,6 +1275,7 @@ impl ClientFilter {
             Self::Gjc => Some(ClientId::Gjc),
             Self::NineRouter => Some(ClientId::Gjc),
             Self::Grok => Some(ClientId::Grok),
+            Self::GrokBot => Some(ClientId::GrokBot),
             Self::Jcode => Some(ClientId::Jcode),
             Self::Commandcode => Some(ClientId::CommandCode),
             Self::Micode => Some(ClientId::MiMoCode),
@@ -1336,6 +1341,7 @@ impl ClientFilter {
             ClientId::Cline => Self::Cline,
             ClientId::Gjc => Self::Gjc,
             ClientId::Grok => Self::Grok,
+            ClientId::GrokBot => Self::GrokBot,
             ClientId::Jcode => Self::Jcode,
             ClientId::CommandCode => Self::Commandcode,
             ClientId::MiMoCode => Self::Micode,
@@ -1510,15 +1516,19 @@ fn build_client_filter_with_defaults(
 }
 
 fn client_filter_includes_cursor(clients: &Option<Vec<String>>) -> bool {
-    clients
-        .as_ref()
-        .is_none_or(|sources| sources.iter().any(|source| source == "cursor"))
+    clients.as_ref().is_none_or(|sources| {
+        sources
+            .iter()
+            .any(|source| matches!(source.as_str(), "cursor" | "grok-bot"))
+    })
 }
 
 fn client_filter_explicitly_requests_cursor(clients: &Option<Vec<String>>) -> bool {
-    clients
-        .as_ref()
-        .is_some_and(|sources| sources.iter().any(|source| source == "cursor"))
+    clients.as_ref().is_some_and(|sources| {
+        sources
+            .iter()
+            .any(|source| matches!(source.as_str(), "cursor" | "grok-bot"))
+    })
 }
 
 fn client_filter_explicitly_requests_warp(clients: &Option<Vec<String>>) -> bool {
@@ -4785,7 +4795,7 @@ fn format_number(n: i32) -> String {
     }
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsTokenBreakdown {
     input: i64,
@@ -4795,7 +4805,7 @@ struct TsTokenBreakdown {
     reasoning: i64,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsSourceContribution {
     client: String,
@@ -4807,7 +4817,7 @@ struct TsSourceContribution {
     messages: i32,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsDailyTotals {
     tokens: i64,
@@ -4819,7 +4829,7 @@ struct TsDailyTotals {
     cost_is_complete: Option<bool>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsDailyContribution {
     date: String,
@@ -4831,13 +4841,13 @@ struct TsDailyContribution {
     active_time_ms: Option<i64>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 struct DateRange {
     start: String,
     end: String,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsYearSummary {
     year: String,
@@ -4846,7 +4856,7 @@ struct TsYearSummary {
     range: DateRange,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsDataSummary {
     total_tokens: i64,
@@ -4859,7 +4869,7 @@ struct TsDataSummary {
     models: Vec<String>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsExportMeta {
     generated_at: String,
@@ -4867,7 +4877,7 @@ struct TsExportMeta {
     date_range: DateRange,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsSubmitDevice {
     id: String,
@@ -4875,7 +4885,7 @@ struct TsSubmitDevice {
     name: Option<String>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsTimeMetrics {
     total_active_time_ms: i64,
@@ -4885,13 +4895,16 @@ struct TsTimeMetrics {
 }
 
 const SUBMISSION_PARSER_VERSION: u32 = 1;
+// Atomic Cursor/Grok Bot family reclassification; synchronized with the server.
+const CURSOR_SUBMISSION_PARSER_VERSION: u32 = 4;
+const GROK_BOT_SUBMISSION_PARSER_VERSION: u32 = 1;
 const COPILOT_SUBMISSION_PARSER_VERSION: u32 = 2;
 // The receiver admits the MiMo CLI/desktop split atomically only when both
 // selected surfaces declare this generation and cover the credited history.
 // This is a submission contract, independent of the on-disk parser cache version.
 const MICODE_SUBMISSION_PARSER_VERSION: u32 = 2;
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsScanScope {
     parser_versions: std::collections::BTreeMap<String, u32>,
@@ -4902,14 +4915,14 @@ struct TsScanScope {
 /// export rather than scanned from local session files. The server stamps it
 /// on every client row it writes and flags the profile as including imported
 /// history.
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsSubmissionProvenance {
     origin: &'static str,
     importer: String,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsTokenContributionData {
     meta: TsExportMeta,
@@ -5043,6 +5056,8 @@ fn submit_scan_scope(clients: Option<&[String]>, full_history: bool) -> Option<T
         .iter()
         .map(|client| {
             let version = match client.as_str() {
+                "cursor" => CURSOR_SUBMISSION_PARSER_VERSION,
+                "grok-bot" => GROK_BOT_SUBMISSION_PARSER_VERSION,
                 "copilot" => COPILOT_SUBMISSION_PARSER_VERSION,
                 "micode" | "micode-desktop" => MICODE_SUBMISSION_PARSER_VERSION,
                 _ => SUBMISSION_PARSER_VERSION,
@@ -6611,13 +6626,17 @@ fn post_submission(
     use colored::Colorize;
 
     let api_url = auth::get_api_base_url();
+    // Negotiate before serializing/uploading any family data. A receiver can
+    // reject an unknown generation key even when there are no Bot rows.
+    let submit_payload =
+        rt.block_on(submit_compat::prepare_submission(&api_url, submit_payload))?;
 
     let response = rt.block_on(async {
         tokscale_core::http::client()
             .post(format!("{}/api/submit", api_url))
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {}", auth_token.token))
-            .json(submit_payload)
+            .json(&*submit_payload)
             .send()
             .await
     });
@@ -9436,6 +9455,27 @@ mod tests {
             scope.parser_versions,
             std::collections::BTreeMap::from([("codex".to_string(), SUBMISSION_PARSER_VERSION)])
         );
+    }
+
+    #[test]
+    fn submit_scan_scope_declares_cursor_bot_family_without_expanding_selection() {
+        let clients = vec!["cursor".to_string(), "grok-bot".to_string()];
+        for full_history in [true, false] {
+            let scope = submit_scan_scope(Some(&clients), full_history).unwrap();
+            assert_eq!(scope.parser_versions.get("cursor"), Some(&4));
+            assert_eq!(scope.parser_versions.get("grok-bot"), Some(&1));
+            assert_eq!(scope.full_history, full_history);
+            assert_eq!(scope.parser_versions.len(), 2);
+        }
+        for selected in ["cursor", "grok-bot"] {
+            let scope = submit_scan_scope(Some(&[selected.to_string()]), true).unwrap();
+            assert_eq!(scope.parser_versions.len(), 1);
+            assert!(scope.parser_versions.contains_key(selected));
+        }
+        let bot = Some(vec!["grok-bot".to_string()]);
+        assert!(client_filter_includes_cursor(&bot));
+        assert!(client_filter_explicitly_requests_cursor(&bot));
+        assert_eq!(ClientFilter::GrokBot.as_filter_str(), "grok-bot");
     }
 
     #[test]

@@ -83,6 +83,14 @@ function payloadForClient(client: string) {
 }
 
 describe("frontend client registry", () => {
+  it("keeps Grok Bot separate from Grok Build", () => {
+    expect(validateSubmission(payloadForClient("grok-bot")).valid).toBe(true);
+    expect(SOURCE_DISPLAY_NAMES["grok-bot"]).toBe("Grok Bot");
+    expect(SOURCE_DISPLAY_NAMES.grok).toBe("Grok Build");
+    expect(SOURCE_LOGOS["grok-bot"]).toBe(SOURCE_LOGOS.grok);
+    expect(SOURCE_COLORS["grok-bot"]).toBeTruthy();
+  });
+
   it("accepts trae submissions", () => {
     const result = validateSubmission(payloadForClient("trae"));
 
