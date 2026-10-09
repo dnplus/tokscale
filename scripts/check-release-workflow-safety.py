@@ -513,13 +513,13 @@ def main() -> None:
             [
                 "      - name: Setup Android cross toolchain",
                 "        if: ${{ matrix.settings.target == 'aarch64-linux-android' }}",
-                "        uses: taiki-e/setup-cross-toolchain-action@v1",
+                "        uses: taiki-e/setup-cross-toolchain-action@12b7ad4acfa95a1476779d6c06699b96ec1691f8",
                 "        with:",
                 "          target: aarch64-linux-android",
                 "          runner: qemu-user",
             ]
         )
-        if android_runner not in "\n".join(native_build_uncommented):
+        if android_runner not in "\n".join(strip_yaml_comment(line) for line in native_build_uncommented):
             errors.append("build-native workflow must configure the Android QEMU runner")
         android_smoke = "\n".join(
             [
