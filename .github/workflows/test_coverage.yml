@@ -30,13 +30,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@16c20dfc2b8bc5cd72c3bf5072a9453664776e70 # 1.98.0
         with:
           components: clippy, rustfmt
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/bin/
@@ -57,11 +57,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@16c20dfc2b8bc5cd72c3bf5072a9453664776e70 # 1.98.0
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/bin/
@@ -135,13 +135,13 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@16c20dfc2b8bc5cd72c3bf5072a9453664776e70 # 1.98.0
 
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/bin/
@@ -170,15 +170,15 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@16c20dfc2b8bc5cd72c3bf5072a9453664776e70 # 1.98.0
 
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -190,7 +190,7 @@ jobs:
             coverage-pr-${{ runner.os }}-cargo-
 
       - name: Install cargo-tarpaulin
-        uses: taiki-e/install-action@cargo-tarpaulin
+        uses: taiki-e/install-action@e606355ced87f1f9c9b60169648cda04a1340276 # cargo-tarpaulin
 
       # Run the same instrumented tests and threshold before merging. Unlike
       # the main-only report job below, this job never writes a badge or commit.
@@ -206,7 +206,7 @@ jobs:
             --verbose
 
       - name: Upload coverage artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         if: "!cancelled()"
         with:
           name: coverage-report-pr
@@ -223,13 +223,13 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.98.0
+        uses: dtolnay/rust-toolchain@16c20dfc2b8bc5cd72c3bf5072a9453664776e70 # 1.98.0
 
       - name: Cache cargo registry
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/bin/
@@ -242,7 +242,7 @@ jobs:
             coverage-${{ runner.os }}-cargo-
 
       - name: Install cargo-tarpaulin
-        uses: taiki-e/install-action@cargo-tarpaulin
+        uses: taiki-e/install-action@e606355ced87f1f9c9b60169648cda04a1340276 # cargo-tarpaulin
 
       - name: Generate coverage report
         run: |
@@ -288,7 +288,7 @@ jobs:
         run: mkdir -p .github/badges
 
       - name: Generate coverage badge
-        uses: emibcn/badge-action@v2.0.4
+        uses: emibcn/badge-action@f9150fde070fcca0c4e832437611b44838fcd325 # v2.0.4
         with:
           label: 'coverage'
           status: ${{ steps.coverage.outputs.percentage_int }}%
@@ -309,7 +309,7 @@ jobs:
           git push
 
       - name: Upload coverage artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         if: "!cancelled()"
         with:
           name: coverage-report
