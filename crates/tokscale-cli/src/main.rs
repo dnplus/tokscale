@@ -463,10 +463,19 @@ enum ConfigSubcommand {
 
 #[derive(Subcommand)]
 enum CursorSubcommand {
-    #[command(about = "Login to Cursor (auto-detect desktop session, or paste browser token)")]
+    #[command(
+        about = "Login to Cursor (shows the detected account and asks before saving; or paste a browser token)"
+    )]
     Login {
         #[arg(long, help = "Label for this Cursor account (e.g., work, personal)")]
         name: Option<String>,
+        #[arg(
+            long,
+            help = "Paste a browser WorkosCursorSessionToken instead of using the desktop login"
+        )]
+        paste: bool,
+        #[arg(long, short = 'y', help = "Do not ask for confirmation")]
+        yes: bool,
     },
     #[command(about = "Logout from a Cursor account")]
     Logout {
@@ -477,15 +486,20 @@ enum CursorSubcommand {
         #[arg(long, help = "Also delete cached Cursor usage")]
         purge_cache: bool,
     },
-    #[command(about = "Check Cursor authentication status")]
+    #[command(about = "Check every saved Cursor account (email, user id, plan, active, expired)")]
     Status {
         #[arg(long, help = "Account label or id")]
         name: Option<String>,
     },
-    #[command(about = "List saved Cursor accounts")]
+    #[command(
+        about = "List saved Cursor accounts with email, plan and session state",
+        visible_alias = "list"
+    )]
     Accounts {
         #[arg(long, help = "Output as JSON")]
         json: bool,
+        #[arg(long, help = "Do not re-check sessions; show the last known state")]
+        offline: bool,
     },
     #[command(about = "Sync Cursor API usage into cursor-cache/usage*.csv")]
     Sync {
@@ -6919,14 +6933,14 @@ fn run_warm_tui_cache() -> Result<()> {
 
 fn run_cursor_command(subcommand: CursorSubcommand) -> Result<()> {
     match subcommand {
-        CursorSubcommand::Login { name } => cursor::run_cursor_login(name),
+        CursorSubcommand::Login { name, paste, yes } => cursor::run_cursor_login(name, paste, yes),
         CursorSubcommand::Logout {
             name,
             all,
             purge_cache,
         } => cursor::run_cursor_logout(name, all, purge_cache),
         CursorSubcommand::Status { name } => cursor::run_cursor_status(name),
-        CursorSubcommand::Accounts { json } => cursor::run_cursor_accounts(json),
+        CursorSubcommand::Accounts { json, offline } => cursor::run_cursor_accounts(json, offline),
         CursorSubcommand::Sync { json } => cursor::run_cursor_sync(json),
         CursorSubcommand::Switch { name } => cursor::run_cursor_switch(&name),
     }
