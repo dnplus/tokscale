@@ -83,6 +83,7 @@ fn old_cursor_cache_dir(home_dir: &Path) -> PathBuf {
 const USAGE_EVENTS_JSON_ENDPOINT: &str =
     "https://cursor.com/api/dashboard/get-filtered-usage-events";
 const USAGE_SUMMARY_ENDPOINT: &str = "https://cursor.com/api/usage-summary";
+const AUTH_ME_ENDPOINT: &str = "https://cursor.com/api/auth/me";
 
 /// Number of usage events requested per page from the JSON endpoint. The
 /// endpoint paginates, so the fetcher walks pages until it has collected
@@ -116,7 +117,7 @@ const CURSOR_SYNC_ATTEMPT_MARKER: &str = "usage.last-sync-attempt";
 /// current format, CSV is the legacy export still read for pre-switch caches.
 const CURSOR_CACHE_EXTENSIONS: [&str; 2] = ["json", "csv"];
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CursorCredentials {
     #[serde(rename = "sessionToken")]
     pub session_token: String,
@@ -128,6 +129,25 @@ pub struct CursorCredentials {
     pub expires_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Account email reported by Cursor (or the desktop cache) at login/check time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// Cursor plan (`membershipType`, e.g. `pro`, `ultra`) seen at the last check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membership: Option<String>,
+    /// Result of the last session check: `valid`, `expired` or `error`.
+    #[serde(
+        rename = "lastStatus",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_status: Option<String>,
+    #[serde(
+        rename = "lastCheckedAt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_checked_at: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -149,6 +169,28 @@ pub struct AccountInfo {
     pub created_at: String,
     #[serde(rename = "isActive")]
     pub is_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub membership: Option<String>,
+    #[serde(rename = "lastStatus", skip_serializing_if = "Option::is_none")]
+    pub last_status: Option<String>,
+    #[serde(rename = "lastCheckedAt", skip_serializing_if = "Option::is_none")]
+    pub last_checked_at: Option<String>,
+}
+
+fn account_info(id: &str, acct: &CursorCredentials, active_id: &str) -> AccountInfo {
+    AccountInfo {
+        id: id.to_string(),
+        label: acct.label.clone(),
+        user_id: acct.user_id.clone(),
+        created_at: acct.created_at.clone(),
+        is_active: id == active_id,
+        email: acct.email.clone(),
+        membership: acct.membership.clone(),
+        last_status: acct.last_status.clone(),
+        last_checked_at: acct.last_checked_at.clone(),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -470,7 +512,21 @@ pub fn read_local_cursor_session_token() -> Result<String> {
 
 /// Save credentials while preserving an existing account label / created_at when
 /// the caller does not supply a new label (used by local desktop refresh).
-fn upsert_credentials(token: &str, label: Option<&str>) -> Result<String> {
+/// Identity details captured alongside a token so `status`/`accounts` can show
+/// who an account is without another network round-trip.
+#[derive(Debug, Default, Clone)]
+pub struct CursorProfile {
+    pub email: Option<String>,
+    pub membership: Option<String>,
+    pub last_status: Option<String>,
+}
+
+fn upsert_credentials_with(
+    token: &str,
+    label: Option<&str>,
+    profile: CursorProfile,
+    activate: bool,
+) -> Result<String> {
     let account_id = derive_account_id(token);
     let user_id = extract_user_id_from_session_token(token);
 
@@ -510,6 +566,19 @@ fn upsert_credentials(token: &str, label: Option<&str>) -> Result<String> {
         created_at,
         expires_at: None,
         label: resolved_label,
+        email: profile
+            .email
+            .or_else(|| existing.and_then(|c| c.email.clone())),
+        membership: profile
+            .membership
+            .or_else(|| existing.and_then(|c| c.membership.clone())),
+        last_checked_at: if profile.last_status.is_some() {
+            Some(chrono::Utc::now().to_rfc3339())
+        } else {
+            existing.and_then(|c| c.last_checked_at.clone())
+        },
+        // A new token for an account invalidates an old "expired" verdict.
+        last_status: profile.last_status,
     };
 
     store.accounts.insert(account_id.clone(), credentials);
@@ -522,6 +591,10 @@ fn upsert_credentials(token: &str, label: Option<&str>) -> Result<String> {
     // reconciliation would treat the previous account's `usage.json` as the new
     // active account's and could drop the new account's only cache.
     let old_active_id = store.active_account_id.clone();
+    if !activate && store.accounts.len() > 1 {
+        save_credentials_store(&store)?;
+        return Ok(account_id);
+    }
     let reconciled = if old_active_id != account_id {
         reconcile_cache_files(&old_active_id, &account_id)
     } else {
@@ -544,11 +617,52 @@ fn upsert_credentials(token: &str, label: Option<&str>) -> Result<String> {
 ///
 /// Used before sync so tokscale picks up tokens refreshed by the Cursor app
 /// without requiring a manual cookie paste.
+/// A desktop session for an account that is not saved yet is added as a
+/// secondary account (so its usage is still synced) but never silently made
+/// active; `cursor login` is the only path that changes the active account.
 fn ensure_credentials_from_local_cursor() -> Result<Option<String>> {
-    match read_local_cursor_session_token() {
-        Ok(token) => Ok(Some(upsert_credentials(&token, None)?)),
-        Err(_) => Ok(None),
+    let Ok(token) = read_local_cursor_session_token() else {
+        return Ok(None);
+    };
+    let account_id = derive_account_id(&token);
+    let known = load_credentials_store()
+        .map(|store| store.accounts.contains_key(&account_id))
+        .unwrap_or(false);
+    let profile = CursorProfile {
+        email: read_local_cursor_email(),
+        ..CursorProfile::default()
+    };
+    let id = upsert_credentials_with(&token, None, profile, false)?;
+    if !known && load_credentials_store().is_some_and(|s| s.active_account_id != id) {
+        eprintln!(
+            "  Note: Cursor desktop is signed in as {} ({}), which was not saved; added it as a non-active account. Use 'tokscale cursor switch {}' to make it active.",
+            read_local_cursor_email().unwrap_or_else(|| "unknown email".to_string()),
+            id,
+            id
+        );
     }
+    Ok(Some(id))
+}
+
+/// Email cached by the Cursor desktop app for its signed-in account.
+pub fn read_local_cursor_email() -> Option<String> {
+    use rusqlite::{Connection, OpenFlags};
+    let home = home_dir().ok()?;
+    let db_path = find_cursor_state_vscdb(&home)?;
+    let uri = format!("file:{}?mode=ro", db_path.display());
+    let conn = Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .ok()?;
+    conn.query_row(
+        "SELECT value FROM ItemTable WHERE key = 'cursorAuth/cachedEmail'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .map(|v| v.trim().trim_matches('"').to_string())
+    .filter(|v| !v.is_empty())
 }
 
 fn derive_account_id(session_token: &str) -> String {
@@ -695,13 +809,7 @@ pub fn list_accounts() -> Vec<AccountInfo> {
     let mut accounts: Vec<AccountInfo> = store
         .accounts
         .iter()
-        .map(|(id, acct)| AccountInfo {
-            id: id.clone(),
-            label: acct.label.clone(),
-            user_id: acct.user_id.clone(),
-            created_at: acct.created_at.clone(),
-            is_active: id == &store.active_account_id,
-        })
+        .map(|(id, acct)| account_info(id, acct, &store.active_account_id))
         .collect();
 
     accounts.sort_by(|a, b| {
@@ -725,17 +833,7 @@ pub fn find_account(name_or_id: &str) -> Option<AccountInfo> {
     let resolved = resolve_account_id(&store, name_or_id)?;
     let acct = store.accounts.get(&resolved)?;
 
-    Some(AccountInfo {
-        id: resolved.clone(),
-        label: acct.label.clone(),
-        user_id: acct.user_id.clone(),
-        created_at: acct.created_at.clone(),
-        is_active: resolved == store.active_account_id,
-    })
-}
-
-pub fn save_credentials(token: &str, label: Option<&str>) -> Result<String> {
-    upsert_credentials(token, label)
+    Some(account_info(&resolved, acct, &store.active_account_id))
 }
 
 pub fn remove_account(name_or_id: &str, purge_cache: bool) -> Result<()> {
@@ -1078,15 +1176,12 @@ pub fn is_cursor_logged_in() -> bool {
     load_active_credentials().is_some()
 }
 
-pub fn load_credentials_for(name_or_id: &str) -> Option<CursorCredentials> {
-    let store = load_credentials_store()?;
-    let resolved = resolve_account_id(&store, name_or_id)?;
-    store.accounts.get(&resolved).cloned()
-}
-
 #[derive(Debug)]
 pub struct ValidateSessionResult {
     pub valid: bool,
+    /// True only when Cursor rejected the token (401/403), as opposed to a
+    /// network or format error.
+    pub expired: bool,
     pub membership_type: Option<String>,
     pub error: Option<String>,
 }
@@ -1097,6 +1192,7 @@ pub async fn validate_cursor_session(token: &str) -> ValidateSessionResult {
         Err(e) => {
             return ValidateSessionResult {
                 valid: false,
+                expired: false,
                 membership_type: None,
                 error: Some(format!("Failed to build HTTP client: {}", e)),
             };
@@ -1112,6 +1208,7 @@ pub async fn validate_cursor_session(token: &str) -> ValidateSessionResult {
         Err(e) => {
             return ValidateSessionResult {
                 valid: false,
+                expired: false,
                 membership_type: None,
                 error: Some(format!("Failed to connect: {}", e)),
             };
@@ -1123,6 +1220,7 @@ pub async fn validate_cursor_session(token: &str) -> ValidateSessionResult {
     {
         return ValidateSessionResult {
             valid: false,
+            expired: true,
             membership_type: None,
             error: Some("Session token expired or invalid".to_string()),
         };
@@ -1131,6 +1229,7 @@ pub async fn validate_cursor_session(token: &str) -> ValidateSessionResult {
     if !response.status().is_success() {
         return ValidateSessionResult {
             valid: false,
+            expired: false,
             membership_type: None,
             error: Some(format!("API returned status {}", response.status())),
         };
@@ -1141,6 +1240,7 @@ pub async fn validate_cursor_session(token: &str) -> ValidateSessionResult {
         Err(e) => {
             return ValidateSessionResult {
                 valid: false,
+                expired: false,
                 membership_type: None,
                 error: Some(format!("Failed to parse response: {}", e)),
             };
@@ -1163,16 +1263,67 @@ pub async fn validate_cursor_session(token: &str) -> ValidateSessionResult {
             .map(|s| s.to_string());
         ValidateSessionResult {
             valid: true,
+            expired: false,
             membership_type,
             error: None,
         }
     } else {
         ValidateSessionResult {
             valid: false,
+            expired: false,
             membership_type: None,
             error: Some("Invalid response format".to_string()),
         }
     }
+}
+
+/// Best-effort lookup of the account email for a session token.
+pub async fn fetch_cursor_email(token: &str) -> Option<String> {
+    let client = build_cursor_http_client().ok()?;
+    let response = client
+        .get(AUTH_ME_ENDPOINT)
+        .headers(build_cursor_headers(token))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = response.json().await.ok()?;
+    data.get("email")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn status_word(result: &ValidateSessionResult) -> &'static str {
+    if result.valid {
+        "valid"
+    } else if result.expired {
+        "expired"
+    } else {
+        "error"
+    }
+}
+
+/// Record the outcome of a session check on a saved account.
+fn record_account_check(account_id: &str, result: &ValidateSessionResult, email: Option<String>) {
+    let Some(mut store) = load_credentials_store() else {
+        return;
+    };
+    let Some(acct) = store.accounts.get_mut(account_id) else {
+        return;
+    };
+    acct.last_status = Some(status_word(result).to_string());
+    acct.last_checked_at = Some(chrono::Utc::now().to_rfc3339());
+    if result.membership_type.is_some() {
+        acct.membership = result.membership_type.clone();
+    }
+    if email.is_some() {
+        acct.email = email;
+    }
+    let _ = save_credentials_store(&store);
 }
 
 pub async fn fetch_cursor_usage_events_json(
@@ -1617,7 +1768,37 @@ fn archive_cache_file_in_dir(
     Ok(())
 }
 
-pub fn run_cursor_login(name: Option<String>) -> Result<()> {
+fn short_status(status: Option<&str>) -> String {
+    use colored::Colorize;
+    match status {
+        Some("valid") => "valid".green().to_string(),
+        Some("expired") => "EXPIRED".red().bold().to_string(),
+        Some("error") => "check failed".yellow().to_string(),
+        _ => "unchecked".bright_black().to_string(),
+    }
+}
+
+fn print_identity(email: Option<&str>, user_id: &str, plan: Option<&str>) {
+    use colored::Colorize;
+    println!("    Email:   {}", email.unwrap_or("(unknown)").bold());
+    println!("    User ID: {}", user_id);
+    println!("    Plan:    {}", plan.unwrap_or("(unknown)"));
+}
+
+fn confirm(prompt: &str) -> Result<bool> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return Ok(true);
+    }
+    print!("  {prompt} [Y/n] ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let answer = line.trim().to_lowercase();
+    Ok(answer.is_empty() || answer == "y" || answer == "yes")
+}
+
+pub fn run_cursor_login(name: Option<String>, paste: bool, yes: bool) -> Result<()> {
     use colored::Colorize;
     use tokio::runtime::Runtime;
 
@@ -1630,7 +1811,7 @@ pub fn run_cursor_login(name: Option<String>) -> Result<()> {
             println!(
                 "  {}",
                 format!(
-                    "Account '{}' already exists. Use 'bunx tokscale@latest cursor logout --name {}' first.",
+                    "Account '{}' already exists. Use 'tokscale cursor logout --name {}' first.",
                     label, label
                 )
                 .yellow()
@@ -1640,45 +1821,47 @@ pub fn run_cursor_login(name: Option<String>) -> Result<()> {
         }
     }
 
-    // Prefer the local Cursor desktop accessToken (state.vscdb) when present.
-    println!(
-        "{}",
-        "  Checking local Cursor desktop login...".bright_black()
-    );
-    let token = match read_local_cursor_session_token() {
-        Ok(token) => {
-            if let Some(user_id) = extract_user_id_from_session_token(&token) {
-                println!(
-                    "{}",
-                    format!("  Found local Cursor session ({user_id}).").bright_black()
-                );
-            } else {
-                println!("{}", "  Found local Cursor session.".bright_black());
-            }
-            token
-        }
-        Err(local_err) => {
-            println!(
-                "{}",
-                format!("  Local desktop login unavailable: {local_err}").bright_black()
-            );
-            print!("  Enter Cursor WorkosCursorSessionToken value: ");
-            std::io::stdout().flush()?;
-            let pasted = rpassword::read_password().context("Failed to read session token")?;
-            let pasted = pasted.trim().to_string();
-            if pasted.is_empty() {
+    let read_pasted = || -> Result<Option<String>> {
+        print!("  Enter Cursor WorkosCursorSessionToken value: ");
+        std::io::stdout().flush()?;
+        let pasted = rpassword::read_password().context("Failed to read session token")?;
+        let pasted = pasted.trim().to_string();
+        Ok((!pasted.is_empty()).then_some(pasted))
+    };
+
+    let (token, from_desktop) = if paste {
+        match read_pasted()? {
+            Some(t) => (t, false),
+            None => {
                 println!("\n  {}\n", "No token provided.".yellow());
                 return Ok(());
             }
-            pasted
+        }
+    } else {
+        println!(
+            "{}",
+            "  Checking local Cursor desktop login...".bright_black()
+        );
+        match read_local_cursor_session_token() {
+            Ok(token) => (token, true),
+            Err(local_err) => {
+                println!(
+                    "{}",
+                    format!("  Local desktop login unavailable: {local_err}").bright_black()
+                );
+                match read_pasted()? {
+                    Some(t) => (t, false),
+                    None => {
+                        println!("\n  {}\n", "No token provided.".yellow());
+                        return Ok(());
+                    }
+                }
+            }
         }
     };
 
-    println!();
     println!("{}", "  Validating session token...".bright_black());
-
     let result = rt.block_on(async { validate_cursor_session(&token).await });
-
     if !result.valid {
         let msg = result
             .error
@@ -1690,18 +1873,77 @@ pub fn run_cursor_login(name: Option<String>) -> Result<()> {
         std::process::exit(1);
     }
 
-    let account_id = save_credentials(&token, name.as_deref())?;
+    let account_id = derive_account_id(&token);
+    let email = rt
+        .block_on(async { fetch_cursor_email(&token).await })
+        .or_else(|| from_desktop.then(read_local_cursor_email).flatten());
 
-    let display_name = name.as_deref().unwrap_or(&account_id);
+    let source = if from_desktop {
+        "the Cursor desktop app (currently signed-in account)"
+    } else {
+        "the pasted browser token"
+    };
+    println!("\n  Found this Cursor account from {source}:");
+    print_identity(
+        email.as_deref(),
+        &account_id,
+        result.membership_type.as_deref(),
+    );
+
+    let store = load_credentials_store();
+    let already_saved = store
+        .as_ref()
+        .and_then(|s| s.accounts.get(&account_id))
+        .map(|a| a.label.clone().unwrap_or_else(|| account_id.clone()));
+    let previous_active = store.as_ref().and_then(|s| {
+        (s.active_account_id != account_id).then(|| {
+            let acct = s.accounts.get(&s.active_account_id);
+            let who = acct
+                .and_then(|a| a.email.clone().or_else(|| a.label.clone()))
+                .unwrap_or_else(|| s.active_account_id.clone());
+            format!("{who} ({})", s.active_account_id)
+        })
+    });
+    match &already_saved {
+        Some(saved) => println!("    Saved:   yes, as '{saved}' (token will be refreshed)"),
+        None => println!("    Saved:   no, this is a new account"),
+    }
+    if let Some(prev) = &previous_active {
+        println!(
+            "{}",
+            format!("    Active account will change from {prev}").yellow()
+        );
+    }
+    if from_desktop {
+        println!(
+            "{}",
+            "    (Not the account you meant? Re-run with --paste to use a browser token.)"
+                .bright_black()
+        );
+    }
+    println!();
+
+    if !yes && !confirm("Save and make this the active Cursor account?")? {
+        println!("\n  {}\n", "Login cancelled; nothing was saved.".yellow());
+        return Ok(());
+    }
+
+    let profile = CursorProfile {
+        email: email.clone(),
+        membership: result.membership_type.clone(),
+        last_status: Some("valid".to_string()),
+    };
+    let account_id = upsert_credentials_with(&token, name.as_deref(), profile, true)?;
+
+    let display = email.as_deref().unwrap_or(&account_id);
     println!(
         "\n  {}",
-        format!(
-            "Successfully logged in to Cursor as {}",
-            display_name.bold()
-        )
-        .green()
+        format!("Logged in to Cursor as {}", display.bold()).green()
     );
-    println!("{}", format!("  Account ID: {}", account_id).bright_black());
+    if let Some(label) = name.as_deref() {
+        println!("{}", format!("  Label: {}", label).bright_black());
+    }
+    println!("{}", format!("  User ID: {}", account_id).bright_black());
     println!();
 
     Ok(())
@@ -1751,68 +1993,135 @@ pub fn run_cursor_logout(name: Option<String>, all: bool, purge_cache: bool) -> 
     Ok(())
 }
 
+/// Validate one saved account, persist the verdict, and return it.
+fn check_account(
+    rt: &tokio::runtime::Runtime,
+    account_id: &str,
+    creds: &CursorCredentials,
+) -> (ValidateSessionResult, Option<String>) {
+    let result = rt.block_on(validate_cursor_session(&creds.session_token));
+    let email = if result.valid && creds.email.is_none() {
+        rt.block_on(fetch_cursor_email(&creds.session_token))
+    } else {
+        None
+    };
+    record_account_check(account_id, &result, email.clone());
+    (result, email.or_else(|| creds.email.clone()))
+}
+
+fn print_desktop_hint(store: Option<&CursorCredentialsStore>) {
+    use colored::Colorize;
+    let Ok(token) = read_local_cursor_session_token() else {
+        return;
+    };
+    let id = derive_account_id(&token);
+    let email = read_local_cursor_email().unwrap_or_else(|| "unknown email".to_string());
+    let saved = store.is_some_and(|s| s.accounts.contains_key(&id));
+    let active = store.is_some_and(|s| s.active_account_id == id);
+    let note = if active {
+        "active in tokscale".green().to_string()
+    } else if saved {
+        "saved, not active".yellow().to_string()
+    } else {
+        "NOT saved in tokscale; its usage is not tracked until you run 'tokscale cursor login'"
+            .red()
+            .to_string()
+    };
+    println!("  Cursor desktop is signed in as {email} ({id}): {note}");
+}
+
 pub fn run_cursor_status(name: Option<String>) -> Result<()> {
     use colored::Colorize;
-    use tokio::runtime::Runtime;
 
-    let rt = Runtime::new()?;
-
-    let credentials = if let Some(ref account_name) = name {
-        load_credentials_for(account_name)
-    } else {
-        load_active_credentials()
+    let rt = tokio::runtime::Runtime::new()?;
+    let Some(store) = load_credentials_store() else {
+        println!("\n  {}", "No saved Cursor accounts.".yellow());
+        print_desktop_hint(None);
+        println!(
+            "{}",
+            "  Run 'tokscale cursor login' to authenticate.\n".bright_black()
+        );
+        return Ok(());
     };
 
-    let credentials = match credentials {
-        Some(c) => c,
-        None => {
-            if let Some(ref account_name) = name {
-                println!(
-                    "\n  {}\n",
-                    format!("Account not found: {}", account_name).red()
-                );
-            } else {
-                println!("\n  {}", "No saved Cursor accounts.".yellow());
-                println!(
-                    "{}",
-                    "  Run 'bunx tokscale@latest cursor login' to authenticate.\n".bright_black()
-                );
+    let ids: Vec<String> = match &name {
+        Some(n) => match resolve_account_id(&store, n) {
+            Some(id) => vec![id],
+            None => {
+                println!("\n  {}\n", format!("Account not found: {}", n).red());
+                return Ok(());
             }
-            return Ok(());
-        }
+        },
+        None => list_accounts().into_iter().map(|a| a.id).collect(),
     };
 
     println!("\n  {}\n", "Cursor IDE - Status".cyan());
-
-    let display_name = credentials.label.as_deref().unwrap_or("(no label)");
-    println!("{}", format!("  Account: {}", display_name).white());
-    if let Some(ref uid) = credentials.user_id {
-        println!("{}", format!("  User ID: {}", uid).bright_black());
+    for id in &ids {
+        let Some(creds) = store.accounts.get(id) else {
+            continue;
+        };
+        let (result, email) = check_account(&rt, id, creds);
+        let active = id == &store.active_account_id;
+        let head = match &creds.label {
+            Some(l) => l.to_string(),
+            None => email.clone().unwrap_or_else(|| id.clone()),
+        };
+        println!(
+            "  {} {}{}",
+            if active {
+                "*".green().to_string()
+            } else {
+                "-".bright_black().to_string()
+            },
+            head.bold(),
+            if active {
+                "  (active)".green().to_string()
+            } else {
+                String::new()
+            }
+        );
+        print_identity(
+            email.as_deref(),
+            id,
+            result
+                .membership_type
+                .as_deref()
+                .or(creds.membership.as_deref()),
+        );
+        let session = if result.valid {
+            "Valid".green().to_string()
+        } else if result.expired {
+            "EXPIRED - run 'tokscale cursor login' while signed in to this account"
+                .red()
+                .to_string()
+        } else {
+            format!(
+                "check failed: {}",
+                result.error.unwrap_or_else(|| "unknown error".to_string())
+            )
+            .yellow()
+            .to_string()
+        };
+        println!("    Session: {session}");
+        println!();
     }
-
-    println!("{}", "  Validating session...".bright_black());
-
-    let result = rt.block_on(async { validate_cursor_session(&credentials.session_token).await });
-
-    if result.valid {
-        println!("  {}", "Session: Valid".green());
-        if let Some(membership) = result.membership_type {
-            println!("{}", format!("  Membership: {}", membership).bright_black());
-        }
-    } else {
-        let msg = result
-            .error
-            .unwrap_or_else(|| "Invalid / Expired".to_string());
-        println!("  {}", format!("Session: {}", msg).red());
-    }
+    print_desktop_hint(Some(&store));
     println!();
 
     Ok(())
 }
 
-pub fn run_cursor_accounts(json: bool) -> Result<()> {
+pub fn run_cursor_accounts(json: bool, offline: bool) -> Result<()> {
     use colored::Colorize;
 
+    if !offline {
+        if let Some(store) = load_credentials_store() {
+            let rt = tokio::runtime::Runtime::new()?;
+            for (id, creds) in &store.accounts {
+                let _ = check_account(&rt, id, creds);
+            }
+        }
+    }
     let accounts = list_accounts();
 
     if json {
@@ -1827,24 +2136,42 @@ pub fn run_cursor_accounts(json: bool) -> Result<()> {
 
     if accounts.is_empty() {
         println!("\n  {}\n", "No saved Cursor accounts.".yellow());
+        print_desktop_hint(None);
         return Ok(());
     }
 
     println!("{}", "\n  Cursor IDE - Accounts\n".cyan());
+    println!(
+        "{}",
+        format!(
+            "    {:<12} {:<30} {:<30} {:<10} {}",
+            "LABEL", "EMAIL", "USER ID", "PLAN", "SESSION"
+        )
+        .bright_black()
+    );
     for acct in &accounts {
-        let name = if let Some(ref label) = acct.label {
-            format!("{} ({})", label, acct.id)
+        let marker = if acct.is_active {
+            "*".green().to_string()
         } else {
-            acct.id.clone()
+            "-".bright_black().to_string()
         };
-        let marker = if acct.is_active { "*" } else { "-" };
-        let marker_colored = if acct.is_active {
-            marker.green().to_string()
-        } else {
-            marker.bright_black().to_string()
-        };
-        println!("  {} {}", marker_colored, name);
+        println!(
+            "  {} {:<12} {:<30} {:<30} {:<10} {}{}",
+            marker,
+            acct.label.as_deref().unwrap_or("-"),
+            acct.email.as_deref().unwrap_or("(unknown)"),
+            acct.id,
+            acct.membership.as_deref().unwrap_or("-"),
+            short_status(acct.last_status.as_deref()),
+            if acct.is_active {
+                "  (active)".green().to_string()
+            } else {
+                String::new()
+            }
+        );
     }
+    println!();
+    print_desktop_hint(load_credentials_store().as_ref());
     println!();
 
     Ok(())
@@ -2569,6 +2896,7 @@ mod tests {
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 expires_at: None,
                 label: Some("work".to_string()),
+                ..Default::default()
             },
         );
         accounts.insert(
@@ -2579,6 +2907,7 @@ mod tests {
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 expires_at: None,
                 label: Some("personal".to_string()),
+                ..Default::default()
             },
         );
         save_credentials_store_in_home(
@@ -2620,6 +2949,7 @@ mod tests {
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 expires_at: None,
                 label: Some("active".to_string()),
+                ..Default::default()
             },
         );
         accounts.insert(
@@ -2630,6 +2960,7 @@ mod tests {
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 expires_at: None,
                 label: Some("team-a".to_string()),
+                ..Default::default()
             },
         );
         accounts.insert(
@@ -2640,6 +2971,7 @@ mod tests {
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 expires_at: None,
                 label: Some("team-b".to_string()),
+                ..Default::default()
             },
         );
         save_credentials_store_in_home(
@@ -2674,6 +3006,7 @@ mod tests {
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 expires_at: None,
                 label: Some("work".to_string()),
+                ..Default::default()
             },
         );
         accounts.insert(
@@ -2684,6 +3017,7 @@ mod tests {
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 expires_at: None,
                 label: Some("personal".to_string()),
+                ..Default::default()
             },
         );
         save_credentials_store_in_home(
@@ -2770,6 +3104,7 @@ mod tests {
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 expires_at: None,
                 label: Some("work".to_string()),
+                ..Default::default()
             },
         );
         save_credentials_store_in_home(
@@ -2818,6 +3153,7 @@ mod tests {
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 expires_at: None,
                 label: Some("work".to_string()),
+                ..Default::default()
             },
         );
         save_credentials_store_in_home(
@@ -3031,6 +3367,7 @@ mod tests {
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 expires_at: None,
                 label: Some("work".to_string()),
+                ..Default::default()
             },
         );
         accounts.insert(
@@ -3041,6 +3378,7 @@ mod tests {
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 expires_at: None,
                 label: Some("personal".to_string()),
+                ..Default::default()
             },
         );
         save_credentials_store_in_home(
