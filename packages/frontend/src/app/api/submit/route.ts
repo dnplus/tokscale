@@ -39,6 +39,7 @@ import {
   addClientBreakdownIncrement,
   foldParserClientSnapshot,
   planParserHighWaterSubmission,
+  scanScopeCoversFullHistory,
   SUPPORTED_VERSIONED_PARSERS,
   type DeviceParserStates,
   type ParserHighWaterPlan,
@@ -856,7 +857,7 @@ export async function POST(request: Request) {
                   | undefined,
                 client
               ),
-          fullHistory: data.scanScope?.fullHistory === true,
+          fullHistory: scanScopeCoversFullHistory(data.scanScope, [client]),
           retentionFloor: isBackfill
             ? undefined
             : ownValue(
@@ -906,7 +907,7 @@ export async function POST(request: Request) {
         submittedClients,
         incomingVersions: data.scanScope?.parserVersions,
         persistedVersions: submittedDevice.parserVersions ?? undefined,
-        fullHistory: data.scanScope?.fullHistory === true,
+        fullHistory: scanScopeCoversFullHistory(data.scanScope, MICODE_FAMILY),
         isBackfill,
         contributions: data.contributions,
         existingDays: existingDeviceDays,
@@ -942,7 +943,7 @@ export async function POST(request: Request) {
         incomingVersions: data.scanScope?.parserVersions,
         persistedVersions: submittedDevice.parserVersions ?? undefined,
         parserStates: deviceParserStates,
-        fullHistory: data.scanScope?.fullHistory === true,
+        fullHistory: scanScopeCoversFullHistory(data.scanScope, ANTIGRAVITY_FAMILY),
         isBackfill,
         contributions: data.contributions,
         existingDays: existingDeviceDays,
