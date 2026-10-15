@@ -114,6 +114,11 @@ fn prepare_for_capability(
     let mut filtered = payload.clone();
     if let Some(scope) = &mut filtered.scan_scope {
         scope.parser_versions.retain(|client, _| !is_family(client));
+        // `full_history` stays valid: it already requires every scanned client
+        // to be complete, and the family is dropped from both lists alike.
+        scope
+            .full_history_clients
+            .retain(|client| !is_family(client));
     }
     let mut removed_usage = false;
     for day in &mut filtered.contributions {
@@ -248,6 +253,7 @@ mod tests {
             scan_scope: crate::submit_scan_scope(
                 Some(&clients.iter().map(|c| c.to_string()).collect::<Vec<_>>()),
                 true,
+                true,
             ),
             summary: TsDataSummary {
                 total_tokens: 0,
@@ -335,6 +341,11 @@ mod tests {
             json["scanScope"]["parserVersions"],
             serde_json::json!({"claude": 1})
         );
+        assert_eq!(
+            json["scanScope"]["fullHistoryClients"],
+            serde_json::json!(["claude"])
+        );
+        assert_eq!(json["scanScope"]["fullHistory"], true);
         assert_eq!(
             json["contributions"][0]["clients"][0],
             before["contributions"][2]["clients"][0]
