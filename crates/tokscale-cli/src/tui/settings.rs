@@ -248,6 +248,14 @@ pub struct AutosubmitSettings {
     pub last_run_at_ms: Option<i64>,
     #[serde(default)]
     pub last_error: Option<String>,
+    /// Upload `tokscale usage --json` to `<api-url>/api/quota` after each
+    /// successful scheduled submit.
+    #[serde(default)]
+    pub with_quota: bool,
+    #[serde(default)]
+    pub last_quota_at_ms: Option<i64>,
+    #[serde(default)]
+    pub last_quota_error: Option<String>,
 }
 
 impl Default for AutosubmitSettings {
@@ -268,6 +276,9 @@ impl Default for AutosubmitSettings {
             managed_executable_version: None,
             last_run_at_ms: None,
             last_error: None,
+            with_quota: false,
+            last_quota_at_ms: None,
+            last_quota_error: None,
         }
     }
 }

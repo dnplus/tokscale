@@ -675,6 +675,13 @@ fn render_light(output: &UsageOutput) {
     println!("╰{}╯", "─".repeat(CARD_WIDTH));
 }
 
+/// The document `tokscale usage --json` prints. `autosubmit --with-quota`
+/// uploads exactly this, so the two cannot drift apart.
+pub fn usage_json() -> Result<String> {
+    let report = fetch_all_report_with_intent(UsageFetchIntent::CliReadOnly);
+    Ok(serde_json::to_string_pretty(&report.outputs)?)
+}
+
 pub fn run(json: bool, _light: bool, debug: bool) -> Result<()> {
     if debug {
         // Log to stderr so `--json` stdout stays pure JSON for downstream
@@ -684,25 +691,25 @@ pub fn run(json: bool, _light: bool, debug: bool) -> Result<()> {
             .with_writer(std::io::stderr)
             .try_init();
     }
-    let report = fetch_all_report_with_intent(UsageFetchIntent::CliReadOnly);
     if json {
         // Keep stdout pure JSON: do NOT emit provider warnings here, since they
         // would corrupt downstream `--json` consumers that read stderr too.
-        println!("{}", serde_json::to_string_pretty(&report.outputs)?);
-    } else {
-        for o in &report.outputs {
-            render_light(o);
-        }
-        // Surface active-but-failed providers (e.g. an expired session cookie)
-        // so they don't silently vanish from the output. One concise line per
-        // failing provider, on stderr to keep stdout clean.
-        for diagnostic in &report.diagnostics {
-            eprintln!(
-                "{}: {} — skipped",
-                diagnostic.display_name(),
-                diagnostic.message
-            );
-        }
+        println!("{}", usage_json()?);
+        return Ok(());
+    }
+    let report = fetch_all_report_with_intent(UsageFetchIntent::CliReadOnly);
+    for o in &report.outputs {
+        render_light(o);
+    }
+    // Surface active-but-failed providers (e.g. an expired session cookie)
+    // so they don't silently vanish from the output. One concise line per
+    // failing provider, on stderr to keep stdout clean.
+    for diagnostic in &report.diagnostics {
+        eprintln!(
+            "{}: {} — skipped",
+            diagnostic.display_name(),
+            diagnostic.message
+        );
     }
     Ok(())
 }

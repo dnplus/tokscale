@@ -1252,12 +1252,16 @@ fn write_fireworks_pricing_cache(base: &Path) {
     );
 }
 
+/// Saved login bound to the dead loopback server `cmd_with_home` pins
+/// `TOKSCALE_API_URL` to. A saved token is only ever sent to the origin it was
+/// saved with, so a credential without `apiUrl` (read as https://tokscale.ai)
+/// would be refused before the submit reached the code under test.
 fn write_fake_credentials(base: &Path) {
     let creds_dir = base.join(".config/tokscale");
     fs::create_dir_all(&creds_dir).unwrap();
     fs::write(
         creds_dir.join("credentials.json"),
-        r#"{"token":"fake","username":"testuser","createdAt":"2024-01-01T00:00:00Z"}"#,
+        r#"{"token":"fake","username":"testuser","createdAt":"2024-01-01T00:00:00Z","apiUrl":"http://127.0.0.1:9"}"#,
     )
     .unwrap();
 }
@@ -6087,6 +6091,39 @@ fn test_submit_orders_unpriced_warning_rows_by_token_impact() {
 /// pricing service loads empty and covers nothing. Zeroing on that basis would
 /// make every local cost ungrounded; the day floor prevents a server-side
 /// decrease, but the CLI must still report the total pricing outage as failure.
+#[test]
+fn test_submit_refuses_to_send_a_saved_token_to_another_origin() {
+    let tmp = create_temp_fixture_dir_without_pricing_cache();
+    let creds_dir = tmp.path().join(".config/tokscale");
+    fs::create_dir_all(&creds_dir).unwrap();
+    // Saved for PA Cafe, while `cmd_with_home` points TOKSCALE_API_URL at a
+    // loopback server: the token must not be sent there.
+    fs::write(
+        creds_dir.join("credentials.json"),
+        r#"{"token":"tt_saved","username":"testuser","createdAt":"2024-01-01T00:00:00Z","apiUrl":"https://pa.example.com"}"#,
+    )
+    .unwrap();
+
+    let output = offline_cmd_with_home(tmp.path())
+        .args(["--no-spinner", "submit", "--client", "opencode"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Refusing to send the saved Tokscale token to http://127.0.0.1:9")
+            && stderr.contains("https://pa.example.com"),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    // Refused before scanning, so nothing about the submission was printed.
+    assert!(!stdout.contains("Data to submit"), "stdout: {stdout}");
+}
+
 #[test]
 fn test_submit_offline_without_pricing_cache_fails() {
     let tmp = create_temp_fixture_dir_without_pricing_cache();

@@ -26,6 +26,23 @@ curl -fsSL https://raw.githubusercontent.com/dnplus/tokscale/main/install.sh | T
 
 推送 `v*-dnplus.*` tag 會建立可由 `releases/latest` 取得的正式 Release；手動執行 **Release prebuilt (dnplus)** 只建置並上傳 Actions artifacts，不發佈 Release。
 
+### 搭配 PA Cafe 自動上傳
+
+安裝後，用 PA Cafe 設定頁產生的 `tt_` token 登入，並以 `--api-url` 指定 PA Cafe 網址（只填 origin，例如 `https://pa-cafe.example.com`）。URL 會和憑證一起存在 `~/.config/tokscale/credentials.json`，排程執行不需要任何環境變數：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dnplus/tokscale/main/install.sh | sh
+tokscale login --token tt_xxx --api-url https://pa-cafe.example.com --device-name "Work laptop"
+tokscale autosubmit enable --interval 1h --with-quota
+tokscale autosubmit status
+```
+
+- `--device-name` 可省略；未指定時若有設定 `TOKSCALE_DEVICE_NAME` 會沿用其值，並寫入 `~/.config/tokscale/device.json` 供排程使用。
+- `--with-quota`：每次 submit 成功後，把 `tokscale usage --json` 的輸出以 `Authorization: Bearer <token>` POST 到 `<api-url>/api/quota`。quota 上傳失敗不會讓該次 submit 被記為失敗；最近一次 quota 成功時間與錯誤會顯示在 `tokscale autosubmit status`。`1h` 對應 PA Cafe quota 讀數的新鮮度時窗。
+- 伺服器 URL 的解析順序為 `TOKSCALE_API_URL` → 登入時儲存的 URL → `https://tokscale.ai`。URL 必須是 `https`（`localhost`／`127.0.0.1` 可用 `http`）。
+- 儲存的 token 只會送往登入時的 origin：若 `TOKSCALE_API_URL` 指向其他主機，tokscale 會直接拒絕而不送出 token。要換伺服器請重新執行 `tokscale login --token … --api-url <url>`。
+- 舊版存下、沒有 URL 的憑證視為屬於 `https://tokscale.ai`；若當初是用 `TOKSCALE_API_URL` 登入 PA Cafe，請以上面的指令重新登入。
+
 > A high-performance CLI tool and visualization dashboard for tracking token usage and costs across multiple AI coding agents.
 
 > [!TIP]
