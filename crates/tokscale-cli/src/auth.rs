@@ -6,6 +6,8 @@ use std::io::Write;
 use std::path::PathBuf;
 
 const API_TOKEN_ENV_VAR: &str = "TOKSCALE_API_TOKEN";
+const API_URL_ENV_VAR: &str = "TOKSCALE_API_URL";
+pub const DEFAULT_API_URL: &str = "https://tokscale.ai";
 
 fn home_dir() -> Result<PathBuf> {
     crate::paths::home_dir().context("Could not determine home directory")
@@ -19,6 +21,12 @@ pub struct Credentials {
     pub avatar_url: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
+    /// Server the token was issued by. Scheduled runs carry no environment, so
+    /// this is how they know where to submit, and it is the only origin the
+    /// token is ever sent to. `None` on credentials saved before this field
+    /// existed, which are treated as belonging to [`DEFAULT_API_URL`].
+    #[serde(rename = "apiUrl", default, skip_serializing_if = "Option::is_none")]
+    pub api_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +40,8 @@ pub struct ApiTokenAuth {
     pub token: String,
     pub username: Option<String>,
     pub source: ApiTokenSource,
+    /// For stored credentials, the server the token was saved with.
+    pub api_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,6 +133,7 @@ pub fn resolve_api_token() -> Option<ApiTokenAuth> {
             token,
             username: None,
             source: ApiTokenSource::Environment,
+            api_url: None,
         });
     }
 
@@ -130,6 +141,7 @@ pub fn resolve_api_token() -> Option<ApiTokenAuth> {
         token: credentials.token,
         username: Some(credentials.username),
         source: ApiTokenSource::StoredCredentials,
+        api_url: credentials.api_url,
     })
 }
 
@@ -143,8 +155,103 @@ pub fn clear_credentials() -> Result<bool> {
     }
 }
 
-pub fn get_api_base_url() -> String {
-    std::env::var("TOKSCALE_API_URL").unwrap_or_else(|_| "https://tokscale.ai".to_string())
+/// Validate and canonicalize a Tokscale server URL: `https` only (plain `http`
+/// is accepted for `localhost`, `127.0.0.1` and `[::1]`), no credentials,
+/// query or fragment, and no trailing slash.
+pub fn normalize_api_url(input: &str) -> Result<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("API URL cannot be empty.");
+    }
+    let url =
+        reqwest::Url::parse(trimmed).with_context(|| format!("Invalid API URL `{trimmed}`"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("API URL `{trimmed}` has no host"))?;
+    match url.scheme() {
+        "https" => {}
+        "http" if matches!(host, "localhost" | "127.0.0.1" | "[::1]") => {}
+        _ => anyhow::bail!(
+            "API URL `{trimmed}` must use https (http is only allowed for localhost)."
+        ),
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("API URL `{trimmed}` must not contain credentials.");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        anyhow::bail!("API URL `{trimmed}` must not contain a query or fragment.");
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+/// `scheme://host[:port]` of an already-normalized API URL.
+fn api_origin(url: &str) -> Result<String> {
+    Ok(reqwest::Url::parse(url)
+        .with_context(|| format!("Invalid API URL `{url}`"))?
+        .origin()
+        .ascii_serialization())
+}
+
+fn api_url_from_env() -> Option<String> {
+    std::env::var(API_URL_ENV_VAR)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// Effective server URL: `TOKSCALE_API_URL`, then the URL saved with the
+/// credentials, then [`DEFAULT_API_URL`].
+fn resolve_api_base_url_from(env: Option<&str>, stored: Option<&str>) -> Result<String> {
+    match (env, stored) {
+        (Some(env), _) => normalize_api_url(env)
+            .with_context(|| format!("{API_URL_ENV_VAR} is not a valid Tokscale server URL")),
+        (None, Some(stored)) => normalize_api_url(stored),
+        (None, None) => Ok(DEFAULT_API_URL.to_string()),
+    }
+}
+
+/// Effective server URL. Requests that send a token use [`api_url_for`]
+/// instead, which also checks the token's origin.
+pub fn get_api_base_url() -> Result<String> {
+    let stored = load_credentials().and_then(|credentials| credentials.api_url);
+    resolve_api_base_url_from(api_url_from_env().as_deref(), stored.as_deref())
+}
+
+/// Refuse to pair a stored token with a server other than the one it was saved
+/// with. An environment token is supplied together with its URL by whoever set
+/// the environment, so it is not checked.
+fn ensure_token_origin(auth: &ApiTokenAuth, effective_url: &str) -> Result<()> {
+    if auth.source != ApiTokenSource::StoredCredentials {
+        return Ok(());
+    }
+    let saved_url = auth.api_url.as_deref().unwrap_or(DEFAULT_API_URL);
+    let saved_origin = api_origin(&normalize_api_url(saved_url)?)?;
+    let effective_origin = api_origin(effective_url)?;
+    if saved_origin != effective_origin {
+        anyhow::bail!(
+            "Refusing to send the saved Tokscale token to {effective_origin}: it was saved for {saved_origin}. \
+             Unset {API_URL_ENV_VAR}, or run `tokscale login --token <token> --api-url {effective_url}` \
+             to save a token for that server."
+        );
+    }
+    Ok(())
+}
+
+/// Server URL to send `auth`'s token to, after checking that a stored token is
+/// not leaving the origin it was saved with.
+pub fn api_url_for(auth: &ApiTokenAuth) -> Result<String> {
+    let url = get_api_base_url()?;
+    ensure_token_origin(auth, &url)?;
+    Ok(url)
+}
+
+/// URL for a new login: an explicit `--api-url`, then `TOKSCALE_API_URL`,
+/// then [`DEFAULT_API_URL`]. A previously saved URL is deliberately ignored so
+/// that logging in never silently reuses another server.
+fn login_api_url(explicit: Option<&str>) -> Result<String> {
+    match explicit {
+        Some(url) => normalize_api_url(url),
+        None => resolve_api_base_url_from(api_url_from_env().as_deref(), None),
+    }
 }
 
 fn get_device_name() -> String {
@@ -200,7 +307,43 @@ fn open_browser(url: &str) -> bool {
     false
 }
 
-pub async fn login() -> Result<()> {
+/// Validate a `--device-name` (or `TOKSCALE_DEVICE_NAME`) before any network
+/// call, so a bad value fails the login up front instead of after it.
+fn validated_device_name(device_name: Option<&str>) -> Result<Option<String>> {
+    device_name
+        .map(crate::device::validate_device_name)
+        .transpose()
+}
+
+/// Persist what a successful login established, then report it.
+fn finish_login(credentials: &Credentials, device_name: Option<&str>) -> Result<()> {
+    use colored::Colorize;
+
+    save_credentials(credentials)?;
+    if let Some(name) = device_name {
+        crate::device::store_device_name(name)?;
+    }
+
+    println!(
+        "\n  {}",
+        format!("Success! Logged in as {}", credentials.username.bold()).green()
+    );
+    if let Some(api_url) = credentials.api_url.as_deref() {
+        if api_url != DEFAULT_API_URL {
+            println!("{}", format!("  Server: {api_url}").bright_black());
+        }
+    }
+    if let Some(name) = device_name {
+        println!("{}", format!("  Device name: {name}").bright_black());
+    }
+    println!(
+        "{}",
+        "  You can now use 'bunx tokscale@latest submit' to share your usage.\n".bright_black()
+    );
+    Ok(())
+}
+
+pub async fn login(api_url: Option<&str>, device_name: Option<&str>) -> Result<()> {
     use colored::Colorize;
 
     if let Some(creds) = load_credentials() {
@@ -215,7 +358,8 @@ pub async fn login() -> Result<()> {
         return Ok(());
     }
 
-    let base_url = get_api_base_url();
+    let base_url = login_api_url(api_url)?;
+    let device_name = validated_device_name(device_name)?;
 
     println!("\n  {}\n", "Tokscale - Login".cyan());
     println!("{}", "  Requesting authorization code...".bright_black());
@@ -286,23 +430,12 @@ pub async fn login() -> Result<()> {
                         if let (Some(token), Some(user)) = (data.token, data.user) {
                             let credentials = Credentials {
                                 token,
-                                username: user.username.clone(),
+                                username: user.username,
                                 avatar_url: user.avatar_url,
                                 created_at: chrono::Utc::now().to_rfc3339(),
+                                api_url: Some(base_url.clone()),
                             };
-
-                            save_credentials(&credentials)?;
-
-                            println!(
-                                "\n  {}",
-                                format!("Success! Logged in as {}", user.username.bold()).green()
-                            );
-                            println!(
-                                "{}",
-                                "  You can now use 'bunx tokscale@latest submit' to share your usage.\n"
-                                    .bright_black()
-                            );
-                            return Ok(());
+                            return finish_login(&credentials, device_name.as_deref());
                         }
                     }
 
@@ -330,9 +463,11 @@ pub async fn login() -> Result<()> {
     Ok(())
 }
 
-pub async fn login_with_token(token: &str) -> Result<()> {
-    use colored::Colorize;
-
+pub async fn login_with_token(
+    token: &str,
+    api_url: Option<&str>,
+    device_name: Option<&str>,
+) -> Result<()> {
     let token = token.trim();
     if token.is_empty() {
         anyhow::bail!("API token cannot be empty.");
@@ -341,7 +476,8 @@ pub async fn login_with_token(token: &str) -> Result<()> {
         anyhow::bail!("Tokscale API tokens must start with `tt_`.");
     }
 
-    let base_url = get_api_base_url();
+    let base_url = login_api_url(api_url)?;
+    let device_name = validated_device_name(device_name)?;
     let client = tokscale_core::http::client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
@@ -365,22 +501,12 @@ pub async fn login_with_token(token: &str) -> Result<()> {
     let data: TokenValidationResponse = response.json().await?;
     let credentials = Credentials {
         token: token.to_string(),
-        username: data.user.username.clone(),
+        username: data.user.username,
         avatar_url: data.user.avatar_url,
         created_at: chrono::Utc::now().to_rfc3339(),
+        api_url: Some(base_url),
     };
-    save_credentials(&credentials)?;
-
-    println!(
-        "\n  {}",
-        format!("Success! Logged in as {}", credentials.username.bold()).green()
-    );
-    println!(
-        "{}",
-        "  You can now use 'bunx tokscale@latest submit' to share your usage.\n".bright_black()
-    );
-
-    Ok(())
+    finish_login(&credentials, device_name.as_deref())
 }
 
 pub fn logout() -> Result<()> {
@@ -424,6 +550,15 @@ pub fn whoami() -> Result<()> {
     println!(
         "{}",
         format!("  Username:  {}", creds.username.bold()).white()
+    );
+
+    println!(
+        "{}",
+        format!(
+            "  Server:    {}",
+            creds.api_url.as_deref().unwrap_or(DEFAULT_API_URL)
+        )
+        .white()
     );
 
     if let Ok(created) = chrono::DateTime::parse_from_rfc3339(&creds.created_at) {
@@ -594,25 +729,228 @@ mod tests {
         }
     }
 
+    fn stored_auth(api_url: Option<&str>) -> ApiTokenAuth {
+        ApiTokenAuth {
+            token: "tt_saved".to_string(),
+            username: Some("saved-user".to_string()),
+            source: ApiTokenSource::StoredCredentials,
+            api_url: api_url.map(str::to_string),
+        }
+    }
+
+    fn credentials_for(api_url: Option<&str>) -> Credentials {
+        Credentials {
+            token: "tt_saved".to_string(),
+            username: "saved-user".to_string(),
+            avatar_url: None,
+            created_at: "2026-10-15T00:00:00Z".to_string(),
+            api_url: api_url.map(str::to_string),
+        }
+    }
+
     #[test]
     #[serial]
     fn test_get_api_base_url_default() {
-        unsafe {
-            env::remove_var("TOKSCALE_API_URL");
-        }
-        assert_eq!(get_api_base_url(), "https://tokscale.ai");
+        let temp_dir = TempDir::new().unwrap();
+        let _home = TestEnvGuard::set("HOME", temp_dir.path());
+        let _url = TestEnvGuard::set("TOKSCALE_API_URL", "");
+        assert_eq!(get_api_base_url().unwrap(), "https://tokscale.ai");
     }
 
     #[test]
     #[serial]
     fn test_get_api_base_url_custom() {
-        unsafe {
-            env::set_var("TOKSCALE_API_URL", "https://custom.api.url");
+        let temp_dir = TempDir::new().unwrap();
+        let _home = TestEnvGuard::set("HOME", temp_dir.path());
+        let _url = TestEnvGuard::set("TOKSCALE_API_URL", "https://custom.api.url/");
+        assert_eq!(get_api_base_url().unwrap(), "https://custom.api.url");
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_api_base_url_uses_saved_url_without_env() {
+        let temp_dir = TempDir::new().unwrap();
+        let _home = TestEnvGuard::set("HOME", temp_dir.path());
+        let _url = TestEnvGuard::set("TOKSCALE_API_URL", "");
+        save_credentials(&credentials_for(Some("https://pa.example.com"))).unwrap();
+        assert_eq!(get_api_base_url().unwrap(), "https://pa.example.com");
+    }
+
+    #[test]
+    fn api_url_resolution_prefers_env_then_saved_then_default() {
+        assert_eq!(
+            resolve_api_base_url_from(
+                Some("https://env.example.com"),
+                Some("https://saved.example.com")
+            )
+            .unwrap(),
+            "https://env.example.com"
+        );
+        assert_eq!(
+            resolve_api_base_url_from(None, Some("https://saved.example.com/")).unwrap(),
+            "https://saved.example.com"
+        );
+        assert_eq!(
+            resolve_api_base_url_from(None, None).unwrap(),
+            DEFAULT_API_URL
+        );
+        assert!(resolve_api_base_url_from(Some("http://env.example.com"), None).is_err());
+    }
+
+    #[test]
+    fn normalize_api_url_strips_trailing_slashes_and_lowercases_host() {
+        assert_eq!(
+            normalize_api_url("  https://PA.Example.com//  ").unwrap(),
+            "https://pa.example.com"
+        );
+        assert_eq!(
+            normalize_api_url("https://example.com/tokscale/").unwrap(),
+            "https://example.com/tokscale"
+        );
+        assert_eq!(
+            normalize_api_url("https://example.com:8443").unwrap(),
+            "https://example.com:8443"
+        );
+    }
+
+    #[test]
+    fn normalize_api_url_requires_https_except_for_localhost() {
+        assert_eq!(
+            normalize_api_url("http://localhost:3000/").unwrap(),
+            "http://localhost:3000"
+        );
+        assert_eq!(
+            normalize_api_url("http://127.0.0.1:3000").unwrap(),
+            "http://127.0.0.1:3000"
+        );
+        assert_eq!(
+            normalize_api_url("http://[::1]:3000").unwrap(),
+            "http://[::1]:3000"
+        );
+        for rejected in [
+            "",
+            "pa.example.com",
+            "http://pa.example.com",
+            "http://localhost.example.com",
+            "ftp://pa.example.com",
+            "https://user:pass@pa.example.com",
+            "https://pa.example.com/?next=1",
+            "https://pa.example.com/#top",
+        ] {
+            assert!(
+                normalize_api_url(rejected).is_err(),
+                "{rejected:?} should be rejected"
+            );
         }
-        assert_eq!(get_api_base_url(), "https://custom.api.url");
-        unsafe {
-            env::remove_var("TOKSCALE_API_URL");
+    }
+
+    #[test]
+    fn origin_guard_allows_the_saved_origin() {
+        let auth = stored_auth(Some("https://pa.example.com"));
+        assert!(ensure_token_origin(&auth, "https://pa.example.com").is_ok());
+        // Path differences stay on the same origin.
+        assert!(ensure_token_origin(&auth, "https://pa.example.com/api-prefix").is_ok());
+    }
+
+    #[test]
+    fn origin_guard_refuses_a_different_origin_for_a_saved_token() {
+        let auth = stored_auth(Some("https://pa.example.com"));
+        for other in [
+            "https://tokscale.ai",
+            "https://evil.example.com",
+            "https://pa.example.com:8443",
+            "http://localhost:3000",
+        ] {
+            let err = ensure_token_origin(&auth, other).unwrap_err().to_string();
+            assert!(
+                err.contains("Refusing to send the saved Tokscale token"),
+                "{err}"
+            );
+            assert!(err.contains("https://pa.example.com"), "{err}");
         }
+    }
+
+    #[test]
+    fn origin_guard_treats_legacy_credentials_as_the_default_server() {
+        let auth = stored_auth(None);
+        assert!(ensure_token_origin(&auth, DEFAULT_API_URL).is_ok());
+        assert!(ensure_token_origin(&auth, "https://pa.example.com").is_err());
+    }
+
+    #[test]
+    fn origin_guard_does_not_apply_to_env_tokens() {
+        let auth = ApiTokenAuth {
+            token: "tt_env".to_string(),
+            username: None,
+            source: ApiTokenSource::Environment,
+            api_url: None,
+        };
+        assert!(ensure_token_origin(&auth, "https://pa.example.com").is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn api_url_for_refuses_env_url_that_moves_a_saved_token() {
+        let temp_dir = TempDir::new().unwrap();
+        let _home = TestEnvGuard::set("HOME", temp_dir.path());
+        let _token = TestEnvGuard::set("TOKSCALE_API_TOKEN", "");
+        save_credentials(&credentials_for(Some("https://pa.example.com"))).unwrap();
+        let auth = resolve_api_token().unwrap();
+
+        {
+            let _url = TestEnvGuard::set("TOKSCALE_API_URL", "");
+            assert_eq!(api_url_for(&auth).unwrap(), "https://pa.example.com");
+        }
+        {
+            let _url = TestEnvGuard::set("TOKSCALE_API_URL", "https://tokscale.ai");
+            assert!(api_url_for(&auth).is_err());
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn login_api_url_prefers_flag_then_env_and_ignores_saved_url() {
+        let temp_dir = TempDir::new().unwrap();
+        let _home = TestEnvGuard::set("HOME", temp_dir.path());
+        save_credentials(&credentials_for(Some("https://saved.example.com"))).unwrap();
+        let _url = TestEnvGuard::set("TOKSCALE_API_URL", "https://env.example.com");
+
+        assert_eq!(
+            login_api_url(Some("https://flag.example.com/")).unwrap(),
+            "https://flag.example.com"
+        );
+        assert_eq!(login_api_url(None).unwrap(), "https://env.example.com");
+        assert!(login_api_url(Some("http://flag.example.com")).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn saved_api_url_round_trips_and_reaches_resolved_token() {
+        let temp_dir = TempDir::new().unwrap();
+        let _home = TestEnvGuard::set("HOME", temp_dir.path());
+        let _token = TestEnvGuard::set("TOKSCALE_API_TOKEN", "");
+        save_credentials(&credentials_for(Some("https://pa.example.com"))).unwrap();
+
+        let raw = fs::read_to_string(get_credentials_path().unwrap()).unwrap();
+        assert!(
+            raw.contains("\"apiUrl\": \"https://pa.example.com\""),
+            "{raw}"
+        );
+        assert_eq!(
+            load_credentials().unwrap().api_url.as_deref(),
+            Some("https://pa.example.com")
+        );
+        let auth = resolve_api_token().unwrap();
+        assert_eq!(auth.source, ApiTokenSource::StoredCredentials);
+        assert_eq!(auth.api_url.as_deref(), Some("https://pa.example.com"));
+    }
+
+    #[test]
+    fn credentials_without_api_url_still_load() {
+        let legacy = r#"{"token":"tt_old","username":"old","createdAt":"2024-01-01T00:00:00Z"}"#;
+        let creds: Credentials = serde_json::from_str(legacy).unwrap();
+        assert_eq!(creds.api_url, None);
+        assert!(!serde_json::to_string(&creds).unwrap().contains("apiUrl"));
     }
 
     #[test]
@@ -622,6 +960,7 @@ mod tests {
             username: "testuser".to_string(),
             avatar_url: Some("https://example.com/avatar.png".to_string()),
             created_at: "2024-01-01T00:00:00Z".to_string(),
+            api_url: None,
         };
 
         let json = serde_json::to_string(&creds).unwrap();
@@ -640,6 +979,7 @@ mod tests {
             username: "testuser2".to_string(),
             avatar_url: None,
             created_at: "2024-01-02T00:00:00Z".to_string(),
+            api_url: None,
         };
 
         let json = serde_json::to_string(&creds).unwrap();
@@ -714,6 +1054,7 @@ mod tests {
             username: "saveuser".to_string(),
             avatar_url: Some("https://example.com/save.png".to_string()),
             created_at: "2024-01-03T00:00:00Z".to_string(),
+            api_url: None,
         };
 
         save_credentials(&creds).unwrap();
@@ -755,6 +1096,7 @@ mod tests {
             username: "fixture".into(),
             avatar_url: None,
             created_at: "2026-10-09T00:00:00Z".into(),
+            api_url: None,
         };
         save_credentials(&creds).unwrap();
         assert_eq!(
@@ -792,6 +1134,7 @@ mod tests {
             username: "loaduser".to_string(),
             avatar_url: None,
             created_at: "2024-01-04T00:00:00Z".to_string(),
+            api_url: None,
         };
 
         save_credentials(&creds).unwrap();
@@ -837,6 +1180,7 @@ mod tests {
             username: "clearuser".to_string(),
             avatar_url: None,
             created_at: "2024-01-05T00:00:00Z".to_string(),
+            api_url: None,
         };
 
         save_credentials(&creds).unwrap();
@@ -909,6 +1253,7 @@ mod tests {
             username: "roundtripuser".to_string(),
             avatar_url: Some("https://example.com/roundtrip.png".to_string()),
             created_at: "2024-01-06T12:34:56Z".to_string(),
+            api_url: None,
         };
 
         save_credentials(&original).unwrap();
@@ -952,6 +1297,7 @@ mod tests {
             username: "saved-user".to_string(),
             avatar_url: None,
             created_at: "2024-01-01T00:00:00Z".to_string(),
+            api_url: None,
         })
         .unwrap();
 

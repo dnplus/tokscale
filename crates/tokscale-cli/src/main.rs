@@ -219,6 +219,18 @@ enum Commands {
             help = "Save an existing Tokscale API token without browser auth"
         )]
         token: Option<String>,
+        #[arg(
+            long,
+            value_name = "URL",
+            help = "Server to log in to and save with the credentials (default: TOKSCALE_API_URL or https://tokscale.ai)"
+        )]
+        api_url: Option<String>,
+        #[arg(
+            long,
+            value_name = "NAME",
+            help = "Label this machine in submissions (default: TOKSCALE_DEVICE_NAME if set)"
+        )]
+        device_name: Option<String>,
     },
     #[command(about = "Logout from Tokscale")]
     Logout,
@@ -820,9 +832,13 @@ fn main() -> Result<()> {
             run_pricing_lookup(&model_id, json, provider.as_deref(), no_spinner)
         }
         Some(Commands::Clients { json }) => run_clients_command(json, cli.home.clone()),
-        Some(Commands::Login { token }) => {
+        Some(Commands::Login {
+            token,
+            api_url,
+            device_name,
+        }) => {
             reject_unsupported_home_override(&cli.home, "login")?;
-            run_login_command(token)
+            run_login_command(token, api_url, device_name)
         }
         Some(Commands::Logout) => {
             reject_unsupported_home_override(&cli.home, "logout")?;
@@ -5107,14 +5123,25 @@ fn should_suggest_client_scope_tip(
     mode == SubmitMode::Interactive && !explicit_client_filter && full_history_scan
 }
 
-fn run_login_command(token: Option<String>) -> Result<()> {
+fn run_login_command(
+    token: Option<String>,
+    api_url: Option<String>,
+    device_name: Option<String>,
+) -> Result<()> {
     use tokio::runtime::Runtime;
 
+    let device_name = device_name.or_else(|| {
+        std::env::var("TOKSCALE_DEVICE_NAME")
+            .ok()
+            .filter(|name| !name.trim().is_empty())
+    });
     let rt = Runtime::new()?;
     rt.block_on(async {
         match token {
-            Some(token) => auth::login_with_token(&token).await,
-            None => auth::login().await,
+            Some(token) => {
+                auth::login_with_token(&token, api_url.as_deref(), device_name.as_deref()).await
+            }
+            None => auth::login(api_url.as_deref(), device_name.as_deref()).await,
         }
     })
 }
@@ -5186,7 +5213,7 @@ fn run_delete_data_command() -> Result<()> {
 
     println!("\n{}", "  Deleting submitted data...".bright_black());
 
-    let api_url = auth::get_api_base_url();
+    let api_url = auth::api_url_for(&auth_token)?;
     let rt = Runtime::new()?;
 
     let response = rt.block_on(async {
@@ -6359,7 +6386,7 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
         AutosubmitSubcommand::Enable(args) => commands::autosubmit::enable(args),
         AutosubmitSubcommand::Status { json } => commands::autosubmit::status(json),
         AutosubmitSubcommand::Disable => commands::autosubmit::disable(),
-        AutosubmitSubcommand::Run { force } => {
+        AutosubmitSubcommand::Run { force, with_quota } => {
             let now_ms = chrono::Utc::now().timestamp_millis();
             let (settings, decision) = commands::autosubmit::load_run_config(force, now_ms)?;
             match decision {
@@ -6388,6 +6415,19 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
                     commands::autosubmit::record_run_success(
                         chrono::Utc::now().timestamp_millis(),
                     )?;
+                    if with_quota || settings.with_quota {
+                        // A quota failure is reported and recorded on its own,
+                        // never as a failed run: the submit already landed.
+                        let result = commands::autosubmit::upload_quota();
+                        match &result {
+                            Ok(()) => println!("  Quota reading uploaded."),
+                            Err(err) => eprintln!("  Quota upload failed: {err}"),
+                        }
+                        let _ = commands::autosubmit::record_quota_result(
+                            chrono::Utc::now().timestamp_millis(),
+                            &result,
+                        );
+                    }
                     Ok(())
                 }
                 Err(err) => {
@@ -6429,6 +6469,8 @@ fn run_submit_command(
             std::process::exit(1);
         }
     };
+    // Fail before scanning when the saved token belongs to another server.
+    auth::api_url_for(&auth_token)?;
 
     if mode == SubmitMode::Interactive
         && auth_token.source == auth::ApiTokenSource::StoredCredentials
@@ -6639,7 +6681,7 @@ fn post_submission(
 ) -> Result<()> {
     use colored::Colorize;
 
-    let api_url = auth::get_api_base_url();
+    let api_url = auth::api_url_for(auth_token)?;
     // Negotiate before serializing/uploading any family data. A receiver can
     // reject an unknown generation key even when there are no Bot rows.
     let submit_payload =
@@ -8417,7 +8459,21 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Autosubmit {
-                subcommand: commands::autosubmit::AutosubmitSubcommand::Run { force: true }
+                subcommand: commands::autosubmit::AutosubmitSubcommand::Run {
+                    force: true,
+                    with_quota: false
+                }
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["tokscale", "autosubmit", "run", "--with-quota"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Autosubmit {
+                subcommand: commands::autosubmit::AutosubmitSubcommand::Run {
+                    force: false,
+                    with_quota: true
+                }
             })
         ));
 
@@ -8436,8 +8492,35 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Login {
-                token: Some(token)
+                token: Some(token),
+                api_url: None,
+                device_name: None,
             }) if token == "tt_ci_token"
+        ));
+    }
+
+    #[test]
+    fn test_login_api_url_and_device_name_options_parse() {
+        let cli = Cli::try_parse_from([
+            "tokscale",
+            "login",
+            "--token",
+            "tt_ci_token",
+            "--api-url",
+            "https://pa.example.com",
+            "--device-name",
+            "Work laptop",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Login {
+                token: Some(token),
+                api_url: Some(api_url),
+                device_name: Some(device_name),
+            }) if token == "tt_ci_token"
+                && api_url == "https://pa.example.com"
+                && device_name == "Work laptop"
         ));
     }
 

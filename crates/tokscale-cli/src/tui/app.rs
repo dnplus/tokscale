@@ -1179,8 +1179,10 @@ impl App {
             };
             // Env-provided tokens carry no username, so their responses are
             // never trusted from cache (cache entries are scoped per account).
+            let Ok(api_url) = crate::auth::api_url_for(&auth) else {
+                return;
+            };
             let username = auth.username.unwrap_or_default();
-            let api_url = crate::auth::get_api_base_url();
             if let Some(stats) = crate::tui::remote::load_cached_remote_stats(&username, &api_url) {
                 self.remote_stats = Some(stats);
             }
@@ -1217,9 +1219,11 @@ impl App {
             let Some(auth) = crate::auth::resolve_api_token() else {
                 return;
             };
+            let Ok(api_url) = crate::auth::api_url_for(&auth) else {
+                return;
+            };
             let token = auth.token;
             let username = auth.username.unwrap_or_default();
-            let api_url = crate::auth::get_api_base_url();
 
             let (tx, rx) = std::sync::mpsc::channel();
             self.remote_stats_rx = Some(rx);
