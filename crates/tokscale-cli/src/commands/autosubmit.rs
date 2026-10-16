@@ -51,9 +51,9 @@ pub enum AutosubmitSubcommand {
         force: bool,
         #[arg(
             long,
-            help = "Also upload `tokscale usage --json` to <api-url>/api/quota after a successful submit"
+            help = "Disable automatic quota upload after a successful submit"
         )]
-        with_quota: bool,
+        no_quota: bool,
     },
 }
 
@@ -74,9 +74,9 @@ pub struct AutosubmitEnableArgs {
     scheduler: Option<SchedulerKind>,
     #[arg(
         long,
-        help = "After each successful submit, upload `tokscale usage --json` to <api-url>/api/quota"
+        help = "Disable automatic quota upload after each successful submit"
     )]
-    with_quota: bool,
+    no_quota: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, ValueEnum)]
@@ -192,7 +192,7 @@ struct StatusOutput {
     last_run_at_ms: Option<i64>,
     last_error: Option<String>,
     api_url: Option<String>,
-    with_quota: bool,
+    no_quota: bool,
     last_quota_at_ms: Option<i64>,
     last_quota_error: Option<String>,
 }
@@ -237,7 +237,7 @@ where
         last_error: None,
         managed_executable: None,
         managed_executable_version: None,
-        with_quota: args.with_quota,
+        no_quota: args.no_quota,
         last_quota_at_ms: previous_settings.autosubmit.last_quota_at_ms,
         last_quota_error: None,
     };
@@ -357,14 +357,14 @@ where
         interval_minutes,
         scheduler.as_str()
     );
-    print_scheduled_target_notice(next_settings.autosubmit.with_quota);
+    print_scheduled_target_notice(next_settings.autosubmit.no_quota);
     Ok(())
 }
 
 /// Tell the user where scheduled runs will send data. The scheduler starts the
 /// job without the shell's environment, so `TOKSCALE_API_URL` and
 /// `TOKSCALE_API_TOKEN` set here do not reach it; only the saved login does.
-fn print_scheduled_target_notice(with_quota: bool) {
+fn print_scheduled_target_notice(no_quota: bool) {
     let Some(credentials) = crate::auth::load_credentials() else {
         eprintln!(
             "Warning: no saved login. Scheduled runs do not see TOKSCALE_API_TOKEN; \
@@ -380,7 +380,7 @@ fn print_scheduled_target_notice(with_quota: bool) {
         "  Scheduled runs submit to {api_url} as {}.",
         credentials.username
     );
-    if with_quota {
+    if !no_quota && !is_official_api_url(api_url) {
         println!("  Quota readings are uploaded to {api_url}/api/quota after each submit.");
     }
     if let Ok(env_url) = std::env::var("TOKSCALE_API_URL") {
@@ -440,7 +440,7 @@ pub fn status(json: bool) -> Result<()> {
     if let Some(error) = autosubmit.last_error {
         println!("  Last error: {error}");
     }
-    if autosubmit.with_quota {
+    if !autosubmit.no_quota {
         println!("  Quota upload: enabled");
     }
     if let Some(last_quota_at_ms) = autosubmit.last_quota_at_ms {
@@ -539,18 +539,14 @@ pub fn record_quota_result(now_ms: i64, result: &Result<()>) -> Result<()> {
 
 /// POST the `tokscale usage --json` document to `<api-url>/api/quota` with the
 /// same token, and the same origin check, that submit uses.
-pub fn upload_quota() -> Result<()> {
-    let auth = crate::auth::resolve_api_token().ok_or_else(|| {
-        anyhow!("Quota upload requires login. Run `tokscale login` or set TOKSCALE_API_TOKEN.")
-    })?;
-    let api_url = crate::auth::api_url_for(&auth)?;
+pub fn upload_quota(auth: &crate::auth::ApiTokenAuth, api_url: &str) -> Result<()> {
     let body = crate::commands::usage::usage_json()?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let response = tokscale_core::http::client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()?
-            .post(quota_endpoint(&api_url))
+            .post(quota_endpoint(api_url))
             .header("Authorization", format!("Bearer {}", auth.token))
             .header("Content-Type", "application/json")
             .body(body)
@@ -573,6 +569,31 @@ pub fn upload_quota() -> Result<()> {
             .unwrap_or("Quota upload failed");
         bail!("{error} ({status})")
     })
+}
+
+/// Official hosts do not implement the quota upload extension.
+pub fn is_official_api_url(api_url: &str) -> bool {
+    reqwest::Url::parse(api_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| host == "tokscale.ai" || host.ends_with(".tokscale.ai"))
+}
+
+/// Run only after a successful submit. Quota failures never fail the submit.
+pub fn after_submit_quota(
+    no_quota: bool,
+    api_url: &str,
+    upload: impl FnOnce() -> Result<()>,
+    mut warn: impl FnMut(&str),
+) -> Option<Result<()>> {
+    if no_quota || is_official_api_url(api_url) {
+        return None;
+    }
+    let result = upload();
+    if let Err(error) = &result {
+        warn(&format!("Warning: quota upload failed: {error}"));
+    }
+    Some(result)
 }
 
 fn quota_endpoint(api_url: &str) -> String {
@@ -728,8 +749,8 @@ fn enable_command_for(settings: &AutosubmitSettings) -> String {
     if let Some(scheduler) = settings.scheduler.as_deref() {
         parts.push(format!("--scheduler {scheduler}"));
     }
-    if settings.with_quota {
-        parts.push("--with-quota".to_string());
+    if settings.no_quota {
+        parts.push("--no-quota".to_string());
     }
     parts.join(" ")
 }
@@ -768,7 +789,7 @@ fn status_output(settings: &AutosubmitSettings) -> StatusOutput {
         last_run_at_ms: settings.last_run_at_ms,
         last_error: settings.last_error.clone(),
         api_url: scheduled_api_url(),
-        with_quota: settings.with_quota,
+        no_quota: settings.no_quota,
         last_quota_at_ms: settings.last_quota_at_ms,
         last_quota_error: settings.last_quota_error.clone(),
     }
@@ -1117,8 +1138,8 @@ fn render_scheduler_spec(
 /// login, so nothing secret lands in a plist, unit file, crontab or task.
 fn scheduled_run_args(settings: &AutosubmitSettings) -> Vec<&'static str> {
     let mut args = vec!["autosubmit", "run"];
-    if settings.with_quota {
-        args.push("--with-quota");
+    if settings.no_quota {
+        args.push("--no-quota");
     }
     args
 }
@@ -2065,16 +2086,16 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn scheduler_jobs_carry_with_quota_only_when_enabled() {
+    fn scheduler_jobs_carry_no_quota_only_when_enabled() {
         let temp = TempDir::new().unwrap();
         let _config = EnvVarGuard::set("TOKSCALE_CONFIG_DIR", temp.path());
         let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", temp.path());
         let managed = managed_scheduler_executable_path().unwrap();
 
-        for with_quota in [false, true] {
+        for no_quota in [false, true] {
             let settings = AutosubmitSettings {
                 interval_minutes: 60,
-                with_quota,
+                no_quota,
                 ..AutosubmitSettings::default()
             };
             for scheduler in [
@@ -2085,21 +2106,21 @@ mod tests {
             ] {
                 let spec = render_scheduler_spec(scheduler, &managed, &settings).unwrap();
                 let rendered = format!("{spec:?}");
-                let expected = match (scheduler, with_quota) {
+                let expected = match (scheduler, no_quota) {
                     (SchedulerKind::Launchd, false) => "<string>run</string>\\n  </array>",
                     (SchedulerKind::Launchd, true) => {
-                        "<string>run</string>\\n    <string>--with-quota</string>\\n  </array>"
+                        "<string>run</string>\\n    <string>--no-quota</string>\\n  </array>"
                     }
                     (_, false) => "autosubmit run",
-                    (_, true) => "autosubmit run --with-quota",
+                    (_, true) => "autosubmit run --no-quota",
                 };
                 assert!(
                     rendered.contains(expected),
-                    "{scheduler:?} (with_quota={with_quota}) is missing {expected:?}\n{rendered}"
+                    "{scheduler:?} (no_quota={no_quota}) is missing {expected:?}\n{rendered}"
                 );
                 assert_eq!(
-                    rendered.contains("--with-quota"),
-                    with_quota,
+                    rendered.contains("--no-quota"),
+                    no_quota,
                     "{scheduler:?}: {rendered}"
                 );
                 // The job reads the saved login; nothing secret or
@@ -2380,13 +2401,13 @@ mod tests {
             clients: ClientFlags::default(),
             date: DateRangeFlags::default(),
             scheduler: Some(scheduler),
-            with_quota: false,
+            no_quota: false,
         }
     }
 
     #[test]
     #[serial_test::serial]
-    fn enable_persists_with_quota_and_keeps_the_last_quota_upload() {
+    fn enable_persists_no_quota_and_keeps_the_last_quota_upload() {
         let temp = TempDir::new().unwrap();
         let _guard = EnvVarGuard::set("TOKSCALE_CONFIG_DIR", temp.path());
         let mut previous = crate::tui::settings::Settings::load();
@@ -2394,23 +2415,23 @@ mod tests {
         previous.autosubmit.last_quota_error = Some("stale".to_string());
         previous.save().unwrap();
 
-        let mut installed_with_quota = None;
+        let mut installed_no_quota = None;
         enable_with_scheduler_operations(
             AutosubmitEnableArgs {
-                with_quota: true,
+                no_quota: true,
                 ..enable_args(SchedulerKind::Cron)
             },
             |_, _, settings| {
-                installed_with_quota = Some(settings.with_quota);
+                installed_no_quota = Some(settings.no_quota);
                 Ok(())
             },
             |_, _, _| Ok(()),
         )
         .unwrap();
 
-        assert_eq!(installed_with_quota, Some(true));
+        assert_eq!(installed_no_quota, Some(true));
         let saved = crate::tui::settings::Settings::load().autosubmit;
-        assert!(saved.with_quota);
+        assert!(saved.no_quota);
         assert_eq!(saved.last_quota_at_ms, Some(42));
         assert_eq!(saved.last_quota_error, None);
     }
@@ -2447,15 +2468,93 @@ mod tests {
     fn status_output_reports_quota_state() {
         let settings = AutosubmitSettings {
             enabled: true,
-            with_quota: true,
+            no_quota: true,
             last_quota_at_ms: Some(5),
             last_quota_error: Some("boom".to_string()),
             ..AutosubmitSettings::default()
         };
         let json = serde_json::to_value(status_output(&settings)).unwrap();
-        assert_eq!(json["withQuota"], true);
+        assert_eq!(json["noQuota"], true);
         assert_eq!(json["lastQuotaAtMs"], 5);
         assert_eq!(json["lastQuotaError"], "boom");
+    }
+
+    #[test]
+    fn old_autosubmit_configs_default_to_quota_upload() {
+        for json in ["{}", r#"{"withQuota":false}"#, r#"{"withQuota":true}"#] {
+            let settings: AutosubmitSettings = serde_json::from_str(json).unwrap();
+            assert!(!settings.no_quota);
+        }
+        let settings: AutosubmitSettings = serde_json::from_str(r#"{"noQuota":true}"#).unwrap();
+        assert!(settings.no_quota);
+    }
+
+    #[test]
+    fn quota_defaults_to_upload_for_custom_servers() {
+        let mut called = false;
+        let result = after_submit_quota(
+            false,
+            "https://pacafe.example",
+            || {
+                called = true;
+                Ok(())
+            },
+            |_| panic!("unexpected warning"),
+        );
+        assert!(called);
+        assert!(result.unwrap().is_ok());
+    }
+
+    #[test]
+    fn no_quota_skips_upload() {
+        assert!(after_submit_quota(
+            true,
+            "https://pacafe.example",
+            || panic!("must not upload"),
+            |_| panic!("must not warn")
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn official_hosts_silently_skip_quota() {
+        for url in [
+            "https://tokscale.ai",
+            "https://www.tokscale.ai",
+            "https://sub.tokscale.ai",
+        ] {
+            assert!(after_submit_quota(
+                false,
+                url,
+                || panic!("must not upload"),
+                |_| panic!("must not warn")
+            )
+            .is_none());
+        }
+        assert!(!is_official_api_url("https://tokscale.ai.example"));
+        assert!(!is_official_api_url("https://eviltokscale.ai"));
+    }
+
+    #[test]
+    fn quota_failures_only_warn() {
+        for message in [
+            "connection refused",
+            "Quota upload failed (502)",
+            "usage JSON failed",
+        ] {
+            let mut warnings = Vec::new();
+            let result = after_submit_quota(
+                false,
+                "https://pacafe.example",
+                || Err(anyhow!(message.to_string())),
+                |warning| warnings.push(warning.to_owned()),
+            );
+            assert!(result.unwrap().is_err());
+            assert_eq!(
+                warnings,
+                vec![format!("Warning: quota upload failed: {message}")]
+            );
+        }
     }
 
     #[test]
@@ -2954,16 +3053,16 @@ mod tests {
     }
 
     #[test]
-    fn refresh_command_preserves_with_quota() {
+    fn refresh_command_preserves_no_quota() {
         let settings = AutosubmitSettings {
             enabled: true,
             interval_minutes: 60,
-            with_quota: true,
+            no_quota: true,
             ..AutosubmitSettings::default()
         };
         assert_eq!(
             enable_command_for(&settings),
-            "tokscale autosubmit enable --interval 60m --with-quota"
+            "tokscale autosubmit enable --interval 60m --no-quota"
         );
     }
 

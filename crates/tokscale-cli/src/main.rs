@@ -306,6 +306,11 @@ enum Commands {
             help = "Show what would be submitted without actually submitting"
         )]
         dry_run: bool,
+        #[arg(
+            long,
+            help = "Disable automatic quota upload after a successful submit"
+        )]
+        no_quota: bool,
     },
     #[command(about = "Manage periodic usage submission")]
     Autosubmit {
@@ -928,6 +933,7 @@ fn main() -> Result<()> {
             clients,
             date,
             dry_run,
+            no_quota,
         }) => {
             reject_unsupported_home_override(&cli.home, "submit")?;
             let (since, until) = build_date_filter(&date, &cli.home);
@@ -944,6 +950,7 @@ fn main() -> Result<()> {
                 until,
                 year,
                 dry_run,
+                no_quota,
                 SubmitMode::Interactive,
             )
         }
@@ -6520,7 +6527,7 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
         AutosubmitSubcommand::Enable(args) => commands::autosubmit::enable(args),
         AutosubmitSubcommand::Status { json } => commands::autosubmit::status(json),
         AutosubmitSubcommand::Disable => commands::autosubmit::disable(),
-        AutosubmitSubcommand::Run { force, with_quota } => {
+        AutosubmitSubcommand::Run { force, no_quota } => {
             let now_ms = chrono::Utc::now().timestamp_millis();
             let (settings, decision) = commands::autosubmit::load_run_config(force, now_ms)?;
             match decision {
@@ -6544,24 +6551,19 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
             };
 
             let (clients, since, until, year) = commands::autosubmit::submit_filters(&settings);
-            match run_submit_command(clients, since, until, year, false, SubmitMode::Autosubmit) {
+            match run_submit_command(
+                clients,
+                since,
+                until,
+                year,
+                false,
+                no_quota || settings.no_quota,
+                SubmitMode::Autosubmit,
+            ) {
                 Ok(()) => {
                     commands::autosubmit::record_run_success(
                         chrono::Utc::now().timestamp_millis(),
                     )?;
-                    if with_quota || settings.with_quota {
-                        // A quota failure is reported and recorded on its own,
-                        // never as a failed run: the submit already landed.
-                        let result = commands::autosubmit::upload_quota();
-                        match &result {
-                            Ok(()) => println!("  Quota reading uploaded."),
-                            Err(err) => eprintln!("  Quota upload failed: {err}"),
-                        }
-                        let _ = commands::autosubmit::record_quota_result(
-                            chrono::Utc::now().timestamp_millis(),
-                            &result,
-                        );
-                    }
                     Ok(())
                 }
                 Err(err) => {
@@ -6580,6 +6582,7 @@ fn run_submit_command(
     until: Option<String>,
     year: Option<String>,
     dry_run: bool,
+    no_quota: bool,
     mode: SubmitMode,
 ) -> Result<()> {
     use colored::Colorize;
@@ -6877,6 +6880,26 @@ fn run_submit_command(
     let submit_payload =
         to_ts_token_contribution_data(&graph_result, Some(&submit_device), scan_scope);
     post_submission(&rt, &auth_token, &submit_payload, mode)?;
+    let api_url = auth::api_url_for(&auth_token)?;
+    if let Some(result) = commands::autosubmit::after_submit_quota(
+        no_quota,
+        &api_url,
+        || commands::autosubmit::upload_quota(&auth_token, &api_url),
+        |warning| eprintln!("  {}", warning.replace(&auth_token.token, "[REDACTED]")),
+    ) {
+        if result.is_ok() {
+            println!("  Quota reading uploaded.");
+        }
+        if mode == SubmitMode::Autosubmit {
+            let result = result.map_err(|error| {
+                anyhow::anyhow!(error.to_string().replace(&auth_token.token, "[REDACTED]"))
+            });
+            let _ = commands::autosubmit::record_quota_result(
+                chrono::Utc::now().timestamp_millis(),
+                &result,
+            );
+        }
+    }
 
     // Warm the TUI cache so the next `tokscale` launch is instant.
     // Detached subprocess so submit returns to the shell immediately on large
@@ -8673,6 +8696,26 @@ mod tests {
     }
 
     #[test]
+    fn test_submit_quota_flags() {
+        for (args, expected) in [
+            (vec!["tokscale", "submit"], false),
+            (vec!["tokscale", "submit", "--no-quota"], true),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(
+                matches!(cli.command, Some(Commands::Submit { no_quota, .. }) if no_quota == expected)
+            );
+        }
+        for args in [
+            vec!["tokscale", "submit", "--with-quota"],
+            vec!["tokscale", "autosubmit", "run", "--with-quota"],
+            vec!["tokscale", "autosubmit", "enable", "--with-quota"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
     fn test_autosubmit_commands_parse() {
         let cli = Cli::try_parse_from([
             "tokscale",
@@ -8706,18 +8749,18 @@ mod tests {
             Some(Commands::Autosubmit {
                 subcommand: commands::autosubmit::AutosubmitSubcommand::Run {
                     force: true,
-                    with_quota: false
+                    no_quota: false
                 }
             })
         ));
 
-        let cli = Cli::try_parse_from(["tokscale", "autosubmit", "run", "--with-quota"]).unwrap();
+        let cli = Cli::try_parse_from(["tokscale", "autosubmit", "run", "--no-quota"]).unwrap();
         assert!(matches!(
             cli.command,
             Some(Commands::Autosubmit {
                 subcommand: commands::autosubmit::AutosubmitSubcommand::Run {
                     force: false,
-                    with_quota: true
+                    no_quota: true
                 }
             })
         ));

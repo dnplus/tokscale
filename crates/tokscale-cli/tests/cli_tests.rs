@@ -7331,3 +7331,145 @@ fn test_codex_compressed_session_reports_usage() {
         assert_eq!(json["entries"][0]["reasoning"].as_i64().unwrap(), 10);
     }
 }
+
+/// Exercise both command entry points against the same receiver, including
+/// quota errors after a successful usage upload.
+#[test]
+fn test_submit_and_autosubmit_share_default_quota_upload() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    for (automatic, no_quota, quota_status) in [
+        (false, false, 200),
+        (true, false, 200),
+        (false, true, 200),
+        (true, true, 200),
+        (false, false, 502),
+        (true, false, 502),
+    ] {
+        let tmp = create_temp_fixture_dir();
+        prime_pricing_cache_with_a_priced_model(tmp.path());
+        if automatic {
+            write_settings_json(
+                tmp.path(),
+                r#"{"autosubmit":{"enabled":true,"clients":["opencode"]}}"#,
+            );
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::clone(&paths);
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            while stopped.try_recv().is_err() {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 8192];
+                let header_end = loop {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let path = headers
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_owned();
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                while request.len() < header_end + length {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                received.lock().unwrap().push(path.clone());
+                let (status, body) = if path == "/api/quota" {
+                    let json: serde_json::Value =
+                        serde_json::from_slice(&request[header_end..]).unwrap();
+                    assert!(json.is_array(), "quota must match usage --json");
+                    (
+                        quota_status,
+                        if quota_status == 200 {
+                            "{}"
+                        } else {
+                            r#"{"error":"quota unavailable"}"#
+                        },
+                    )
+                } else {
+                    (200, r#"{"submissionId":"fixture","metrics":{}}"#)
+                };
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let mut command = cmd_with_home(tmp.path());
+        command
+            .env("TOKSCALE_API_URL", url)
+            .env("TOKSCALE_API_TOKEN", "fixture-token")
+            .env("NO_PROXY", "127.0.0.1")
+            .env("no_proxy", "127.0.0.1")
+            .arg("--no-spinner");
+        if automatic {
+            command.args(["autosubmit", "run", "--force"]);
+        } else {
+            command.args(["submit", "--client", "opencode"]);
+        }
+        if no_quota {
+            command.arg("--no-quota");
+        }
+        let output = command.output().unwrap();
+        stop.send(()).unwrap();
+        server.join().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Successfully submitted!"));
+        let paths = paths.lock().unwrap();
+        assert_eq!(
+            paths.iter().filter(|path| *path == "/api/submit").count(),
+            1
+        );
+        assert_eq!(
+            paths.iter().filter(|path| *path == "/api/quota").count(),
+            usize::from(!no_quota)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).contains("Warning: quota upload failed"),
+            quota_status == 502
+        );
+        if automatic {
+            let settings: serde_json::Value = serde_json::from_slice(
+                &fs::read(sandbox_config_dir(tmp.path()).join("settings.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(settings["autosubmit"]["lastRunAtMs"].is_number());
+            assert!(settings["autosubmit"]["lastError"].is_null());
+        }
+    }
+}
