@@ -675,8 +675,8 @@ fn render_light(output: &UsageOutput) {
     println!("╰{}╯", "─".repeat(CARD_WIDTH));
 }
 
-/// The document `tokscale usage --json` prints. `autosubmit --with-quota`
-/// uploads exactly this, so the two cannot drift apart.
+/// The document `tokscale usage --json` prints. Automatic quota uploads
+/// use exactly this, so the two cannot drift apart.
 pub fn usage_json() -> Result<String> {
     let report = fetch_all_report_with_intent(UsageFetchIntent::CliReadOnly);
     Ok(serde_json::to_string_pretty(&report.outputs)?)
