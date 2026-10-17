@@ -1503,7 +1503,14 @@ async fn fetch_with_auth_async(
     let has_spend_control = spend_control
         .as_ref()
         .is_some_and(|control| control.individual_limit.is_some() || control.reached.is_some());
-    if metrics.is_empty() && reset_credits.is_none() && !has_credit_status && !has_spend_control {
+    // A plan alone still identifies the account; the report layer warns that
+    // its quota is unknown instead of hiding the card.
+    if metrics.is_empty()
+        && reset_credits.is_none()
+        && !has_credit_status
+        && !has_spend_control
+        && plan.is_none()
+    {
         anyhow::bail!("Codex returned no parseable usage or credit status");
     }
 
@@ -1719,11 +1726,33 @@ fn fetch_all_report_with_opencode_fallback_at(
         UsageFetchReport::default()
     };
 
-    if has_opencode_auth_candidate_at(auth_path) {
+    let report = if has_opencode_auth_candidate_at(auth_path) {
         append_opencode_fallback_at(report, auth_path, endpoints)
     } else {
         report
+    };
+    warn_plan_only_outputs(report)
+}
+
+/// Codex sometimes answers with a plan but no quota windows or credits. Keep
+/// that card, as Grok does, and say its quota is unknown.
+fn warn_plan_only_outputs(mut report: UsageFetchReport) -> UsageFetchReport {
+    for output in &report.outputs {
+        let plan_only = output.metrics.is_empty()
+            && output.reset_credits.is_none()
+            && output.credit_status.is_none()
+            && output.spend_control.is_none();
+        if plan_only {
+            report.diagnostics.push(UsageFetchDiagnostic::with_kind(
+                "Codex",
+                output.account.clone(),
+                UsageFetchDiagnosticKind::FetchFailed,
+                UsageFetchDiagnosticSeverity::Warning,
+                "Codex returned a plan but no quota windows or credit status; quota is unknown",
+            ));
+        }
     }
+    report
 }
 
 fn load_credentials_store_for_fetch_intent(
@@ -2264,6 +2293,7 @@ mod tests {
                 r#"{"rate_limit_reset_credits":{"available_count":0}}"#,
                 true,
             ),
+            (r#"{"plan_type":"plus"}"#, true),
         ] {
             let (base, _) = spawn_server(move |path, _| {
                 if path == USAGE_PATH {
@@ -2294,6 +2324,41 @@ mod tests {
                     .contains("no parseable usage"));
             }
         }
+    }
+
+    #[test]
+    fn plan_only_codex_cards_carry_an_unknown_quota_warning() {
+        let plan_only = UsageOutput {
+            provider: "Codex".into(),
+            account: None,
+            credential_source: None,
+            plan: Some("plus".into()),
+            email: None,
+            metrics: Vec::new(),
+            reset_credits: None,
+            credit_status: None,
+            spend_control: None,
+        };
+        let with_credits = UsageOutput {
+            credit_status: Some(UsageCreditStatus {
+                balance: Some("0".into()),
+                has_credits: Some(false),
+                unlimited: None,
+                overage_limit_reached: None,
+            }),
+            ..plan_only.clone()
+        };
+        let report = warn_plan_only_outputs(UsageFetchReport {
+            outputs: vec![with_credits, plan_only],
+            diagnostics: Vec::new(),
+        });
+        assert_eq!(report.outputs.len(), 2, "the plan-only card is kept");
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0].severity,
+            UsageFetchDiagnosticSeverity::Warning
+        );
+        assert!(report.diagnostics[0].message.contains("quota is unknown"));
     }
 
     #[test]
