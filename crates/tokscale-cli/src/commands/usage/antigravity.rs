@@ -1,6 +1,6 @@
 //! Antigravity subscription quota.
 //!
-//! Prefer the running language server. The Antigravity CLI (`agy`) and IDE both
+//! Read quota from the running language server. The Antigravity CLI (`agy`) and IDE both
 //! run a language server that holds the OAuth token, calls Google Code Assist,
 //! caches the answer, and exposes it over a loopback Connect-RPC endpoint:
 //!
@@ -13,15 +13,6 @@
 //! No CSRF token is required for this method, and tokscale never has to hold
 //! an Antigravity credential of its own for that path — the token stays inside
 //! the language server and we only read the numbers it already computed.
-//!
-//! When the language server is down or signed out, fall back to
-//! `agy --print /usage --output-format json`. That command uses the CLI's own
-//! login at `~/.gemini/antigravity-cli/antigravity-oauth-token` on Linux and
-//! macOS, or the legacy `~/.gemini/oauth_creds.json`, and returns the same
-//! group/bucket shape. `GEMINI_CLI_HOME` overrides `~/.gemini` for both files
-//! and CLI logs. Tokscale checks only file existence: it never reads, refreshes,
-//! or rewrites these credentials or calls Google APIs directly. The `agy`
-//! command owns token refresh and writes tokens back in its own format.
 //!
 //! Calling Google's `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota`
 //! directly was tried first and rejected: authentication succeeds, but a
@@ -39,8 +30,7 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -137,28 +127,22 @@ struct QuotaBucket {
 
 // ── Provider interface ──
 
-/// Whether quota can be read right now.
-///
-/// Prefer a language server that answers with at least one group. When that
-/// probe finds nothing, admit the CLI fallback when `agy` can be resolved and
-/// either the agy login file or legacy `oauth_creds.json` exists in Gemini home.
-/// The file check is cheap; the CLI itself is only spawned in [`fetch_all`].
+/// Whether the running language server has quota groups.
 pub fn has_credentials() -> bool {
     off_caller_runtime(|| {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         else {
-            return agy_cli_available();
+            return false;
         };
         rt.block_on(async {
             discover_quota()
                 .await
                 .is_some_and(|summary| !summary.groups.is_empty())
-                || agy_cli_available()
         })
     })
-    .unwrap_or_else(|_| agy_cli_available())
+    .unwrap_or(false)
 }
 
 pub fn fetch_all() -> Result<Vec<UsageOutput>> {
@@ -168,20 +152,13 @@ pub fn fetch_all() -> Result<Vec<UsageOutput>> {
             .build()?;
 
         rt.block_on(async {
-            if let Some(summary) = discover_quota().await {
-                if !summary.groups.is_empty() {
-                    return Ok(outputs_from_summary(summary, Some("language-server")));
-                }
-            }
-
-            let summary = fetch_via_agy_cli().context(
-                "Antigravity language server has no quota and `agy --print /usage` failed. \
-                 Run `agy` and sign in, then retry.",
-            )?;
+            let summary = discover_quota()
+                .await
+                .context("Antigravity language server is not running")?;
             if summary.groups.is_empty() {
-                anyhow::bail!("Antigravity CLI returned no quota groups");
+                anyhow::bail!("Antigravity is running but not signed in");
             }
-            Ok(outputs_from_summary(summary, Some("cli")))
+            Ok(outputs_from_summary(summary, Some("language-server")))
         })
     })
     .unwrap_or_else(|_| Err(anyhow::anyhow!("Antigravity usage worker thread panicked")))
@@ -202,171 +179,11 @@ fn outputs_from_summary(
         .collect()
 }
 
-const AGY_CLI_TIMEOUT: Duration = Duration::from_secs(35);
-
 fn gemini_home() -> Option<PathBuf> {
     std::env::var_os("GEMINI_CLI_HOME")
         .filter(|home| !home.is_empty())
         .map(PathBuf::from)
         .or_else(|| tokscale_core::paths::home_dir().map(|home| home.join(".gemini")))
-}
-
-fn agy_cli_available() -> bool {
-    agy_cli_available_with(resolve_agy_bin)
-}
-
-fn agy_cli_available_with(resolve_bin: impl FnOnce() -> Option<PathBuf>) -> bool {
-    gemini_home().is_some_and(|home| {
-        home.join("antigravity-cli/antigravity-oauth-token")
-            .is_file()
-            || home.join("oauth_creds.json").is_file()
-    }) && resolve_bin().is_some()
-}
-
-fn resolve_agy_bin() -> Option<PathBuf> {
-    #[cfg(unix)]
-    let fallbacks = {
-        let mut fallbacks = Vec::new();
-        if let Some(home) = tokscale_core::paths::home_dir() {
-            fallbacks.push(home.join(".local/bin/agy"));
-        }
-        fallbacks.push(PathBuf::from("/opt/homebrew/bin/agy"));
-        fallbacks.push(PathBuf::from("/usr/local/bin/agy"));
-        fallbacks
-    };
-    #[cfg(not(unix))]
-    let fallbacks = Vec::new();
-    resolve_agy_bin_with_fallbacks(fallbacks)
-}
-
-fn resolve_agy_bin_with_fallbacks(fallbacks: Vec<PathBuf>) -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("TOKSCALE_AGY_BIN") {
-        let path = PathBuf::from(explicit);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("agy");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            #[cfg(windows)]
-            {
-                let exe = dir.join("agy.exe");
-                if exe.is_file() {
-                    return Some(exe);
-                }
-            }
-        }
-    }
-    fallbacks.into_iter().find(|path| path.is_file())
-}
-
-/// `agy --print /usage --output-format json` envelope (snake_case wire fields).
-#[derive(Debug, Deserialize)]
-struct AgyPrintEnvelope {
-    command: Option<AgyPrintCommand>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AgyPrintCommand {
-    data: Option<AgyPrintData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AgyPrintData {
-    #[serde(default)]
-    groups: Vec<AgyPrintGroup>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AgyPrintGroup {
-    name: String,
-    #[serde(default)]
-    buckets: Vec<AgyPrintBucket>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AgyPrintBucket {
-    name: Option<String>,
-    window: Option<String>,
-    remaining_fraction: Option<f64>,
-    reset_time: Option<String>,
-}
-
-fn parse_agy_print_usage(stdout: &[u8]) -> Result<QuotaSummary> {
-    let envelope: AgyPrintEnvelope =
-        serde_json::from_slice(stdout).context("Antigravity CLI usage was not JSON")?;
-    let groups = envelope
-        .command
-        .and_then(|command| command.data)
-        .map(|data| data.groups)
-        .unwrap_or_default();
-    Ok(QuotaSummary {
-        groups: groups
-            .into_iter()
-            .map(|group| QuotaGroup {
-                display_name: group.name,
-                buckets: group
-                    .buckets
-                    .into_iter()
-                    .map(|bucket| QuotaBucket {
-                        display_name: bucket.name.unwrap_or_default(),
-                        window: bucket.window,
-                        remaining_fraction: bucket.remaining_fraction,
-                        reset_time: bucket.reset_time,
-                    })
-                    .collect(),
-            })
-            .collect(),
-    })
-}
-
-fn fetch_via_agy_cli() -> Result<QuotaSummary> {
-    let agy = resolve_agy_bin().context("agy was not found; install it or set TOKSCALE_AGY_BIN")?;
-    let mut child = Command::new(agy)
-        .args([
-            "--print",
-            "/usage",
-            "--output-format",
-            "json",
-            "--print-timeout",
-            "30s",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to spawn agy --print /usage")?;
-
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stdout = Vec::new();
-                if let Some(mut pipe) = child.stdout.take() {
-                    pipe.read_to_end(&mut stdout)
-                        .context("failed to read agy usage stdout")?;
-                }
-                if !status.success() {
-                    anyhow::bail!("agy --print /usage failed with {status}");
-                }
-                return parse_agy_print_usage(&stdout);
-            }
-            Ok(None) if started.elapsed() >= AGY_CLI_TIMEOUT => {
-                let _ = child.kill();
-                let _ = child.wait();
-                anyhow::bail!("agy --print /usage timed out after {AGY_CLI_TIMEOUT:?}");
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(error) => {
-                let _ = child.kill();
-                return Err(error).context("waiting for agy --print /usage");
-            }
-        }
-    }
 }
 
 /// Run `work` on a dedicated OS thread, off whatever runtime the caller is on.
@@ -839,6 +656,7 @@ mod tests {
             "USERPROFILE",
             "GEMINI_CLI_HOME",
             "TOKSCALE_AGY_BIN",
+            "TOKSCALE_AGY_FIXTURE_MARKER",
             "PATH",
         ]);
         for key in HOME_ENV_KEYS {
@@ -853,162 +671,72 @@ mod tests {
     fn fake_login(home: &Path, relative: &str) {
         let path = home.join(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        // Availability must not depend on reading or parsing token values.
         std::fs::write(path, "{}").unwrap();
     }
 
     #[test]
     #[serial]
-    fn agy_cli_available_with_only_agy_login() {
-        let home = TempDir::new().unwrap();
-        let mut env = isolate_agy_env(&home);
-        let bin = home.path().join("agy");
-        std::fs::write(&bin, "").unwrap();
-        env.set("TOKSCALE_AGY_BIN", &bin);
-        fake_login(
-            &home.path().join(".gemini"),
-            "antigravity-cli/antigravity-oauth-token",
-        );
-        assert!(!home.path().join(".gemini/oauth_creds.json").exists());
-        assert!(agy_cli_available());
+    fn empty_language_server_does_not_launch_cli_for_any_login_file() {
+        for login in [
+            None,
+            Some("oauth_creds.json"),
+            Some("antigravity-cli/antigravity-oauth-token"),
+        ] {
+            let home = TempDir::new().unwrap();
+            let mut env = isolate_agy_env(&home);
+            let marker = home.path().join("invoked");
+            env.set("TOKSCALE_AGY_FIXTURE_MARKER", &marker);
+            #[cfg(windows)]
+            let bin = home.path().join("agy.cmd");
+            #[cfg(not(windows))]
+            let bin = home.path().join("agy");
+            let quota = r#"{"status":"SUCCESS","num_turns":0,"command":{"name":"usage","data":{"groups":[{"name":"Fake CLI","buckets":[{"window":"weekly","remaining_fraction":1}]}]}}}"#;
+            #[cfg(windows)]
+            let script = format!(
+                "@echo off\r\n> \"%TOKSCALE_AGY_FIXTURE_MARKER%\" echo invoked\r\necho {quota}\r\n"
+            );
+            #[cfg(not(windows))]
+            let script = format!(
+                "#!/bin/sh\nprintf invoked > \"$TOKSCALE_AGY_FIXTURE_MARKER\"\nprintf '%s' '{quota}'\n"
+            );
+            std::fs::write(&bin, script).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            env.set("TOKSCALE_AGY_BIN", &bin);
+            env.set("PATH", home.path());
+            if let Some(login) = login {
+                fake_login(&home.path().join(".gemini"), login);
+            }
+            let (base, _) = spawn_server(|_, _| (200, r#"{"response":{"groups":[]}}"#.into()));
+            redirect_home_to_logged_ports(&mut env, &home, &[port_of(&base)]);
+
+            let available = has_credentials();
+            let fetched = fetch_all();
+
+            assert!(
+                !marker.exists(),
+                "an empty language server must not launch agy, login={login:?}"
+            );
+            assert!(!available, "a login file cannot admit a quota source");
+            assert!(fetched.unwrap_err().to_string().contains("not signed in"));
+        }
     }
 
     #[test]
     #[serial]
-    fn agy_cli_available_with_only_legacy_login() {
+    fn gemini_home_override_controls_language_server_logs() {
         let home = TempDir::new().unwrap();
         let mut env = isolate_agy_env(&home);
-        let bin = home.path().join("agy");
-        std::fs::write(&bin, "").unwrap();
-        env.set("TOKSCALE_AGY_BIN", &bin);
-        fake_login(&home.path().join(".gemini"), "oauth_creds.json");
-        assert!(agy_cli_available());
-    }
-
-    #[test]
-    #[serial]
-    fn agy_cli_requires_login_and_resolvable_binary() {
-        let home = TempDir::new().unwrap();
-        let mut env = isolate_agy_env(&home);
-        let bin = home.path().join("agy");
-        std::fs::write(&bin, "").unwrap();
-        env.set("TOKSCALE_AGY_BIN", &bin);
-        assert!(!agy_cli_available());
-        fake_login(
-            &home.path().join(".gemini"),
-            "antigravity-cli/antigravity-oauth-token",
-        );
-        env.remove("TOKSCALE_AGY_BIN");
-        // Exclude system installs so this test is independent of the host.
-        assert!(!agy_cli_available_with(|| resolve_agy_bin_with_fallbacks(
-            Vec::new()
-        )));
-    }
-
-    #[test]
-    #[serial]
-    fn gemini_home_override_controls_login_and_logs() {
-        let home = TempDir::new().unwrap();
-        let mut env = isolate_agy_env(&home);
-        let bin = home.path().join("agy");
-        std::fs::write(&bin, "").unwrap();
-        env.set("TOKSCALE_AGY_BIN", &bin);
         let custom = home.path().join("custom-gemini");
-        env.set("GEMINI_CLI_HOME", &custom);
-        fake_login(
-            &home.path().join(".gemini"),
-            "antigravity-cli/antigravity-oauth-token",
-        );
-        assert!(
-            !agy_cli_available(),
-            "an explicit home replaces the default"
-        );
-        fake_login(&custom, "antigravity-cli/antigravity-oauth-token");
-        assert!(agy_cli_available());
         let log = custom.join("antigravity-cli/cli.log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
         std::fs::write(&log, "listening on random port at 41234 for HTTP\n").unwrap();
+        env.set("GEMINI_CLI_HOME", &custom);
         assert_eq!(cli_log_path(), Some(log));
         assert_eq!(ports_from_cli_log(), vec![41234]);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn resolve_agy_bin_finds_local_install_with_minimal_or_missing_path() {
-        let home = TempDir::new().unwrap();
-        let mut env = isolate_agy_env(&home);
-        let bin = home.path().join(".local/bin/agy");
-        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
-        std::fs::write(&bin, "").unwrap();
-        assert_eq!(resolve_agy_bin(), Some(bin.clone()));
-        env.remove("PATH");
-        assert_eq!(resolve_agy_bin(), Some(bin));
-    }
-
-    #[test]
-    #[serial]
-    fn resolve_agy_bin_prefers_explicit_then_path_then_fallback() {
-        let home = TempDir::new().unwrap();
-        let mut env = isolate_agy_env(&home);
-        let explicit = home.path().join("explicit-agy");
-        let path_bin = home.path().join("agy");
-        let fallback = home.path().join("fallback-agy");
-        for bin in [&explicit, &path_bin, &fallback] {
-            std::fs::write(bin, "").unwrap();
-        }
-        env.set("TOKSCALE_AGY_BIN", &explicit);
-        env.set("PATH", home.path());
-        assert_eq!(
-            resolve_agy_bin_with_fallbacks(vec![fallback.clone()]),
-            Some(explicit)
-        );
-        env.remove("TOKSCALE_AGY_BIN");
-        assert_eq!(
-            resolve_agy_bin_with_fallbacks(vec![fallback.clone()]),
-            Some(path_bin)
-        );
-        env.remove("PATH");
-        assert_eq!(
-            resolve_agy_bin_with_fallbacks(vec![fallback.clone()]),
-            Some(fallback)
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn fake_agy_cli_returns_both_quota_groups() {
-        use std::os::unix::fs::PermissionsExt;
-        let home = TempDir::new().unwrap();
-        let mut env = isolate_agy_env(&home);
-        let bin = home.path().join("agy");
-        std::fs::write(&bin, r#"#!/bin/sh
-[ "$*" = "--print /usage --output-format json --print-timeout 30s" ] || exit 1
-printf '%s\n' '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"window":"weekly","remaining_fraction":0.75}]},{"name":"Claude and GPT models","buckets":[{"window":"5h","remaining_fraction":0.5}]}]}}}'
-"#).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
-        env.set("TOKSCALE_AGY_BIN", &bin);
-        fake_login(
-            &home.path().join(".gemini"),
-            "antigravity-cli/antigravity-oauth-token",
-        );
-        assert!(agy_cli_available());
-        // Process discovery can find a real language server even with fake HOME.
-        // Exercise the CLI subprocess and output conversion directly instead.
-        let outputs = outputs_from_summary(fetch_via_agy_cli().unwrap(), Some("cli"));
-        assert_eq!(outputs.len(), 2);
-        for (output, (label, remaining)) in outputs
-            .iter()
-            .zip([("Gemini Models", 75.0), ("Claude and GPT models", 50.0)])
-        {
-            assert_eq!(output.credential_source.as_deref(), Some("cli"));
-            assert_eq!(
-                output.account.as_ref().unwrap().label.as_deref(),
-                Some(label)
-            );
-            assert_eq!(output.metrics.len(), 1);
-            assert_eq!(output.metrics[0].remaining_percent, remaining);
-        }
     }
 
     /// One quota group, named distinctly enough that a real language server
@@ -1667,39 +1395,6 @@ printf '%s\n' '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{
         }
 
         assert_eq!(ports_from_cli_log(), vec![41234, 5001]);
-    }
-
-    #[test]
-    fn parse_agy_print_usage_maps_snake_case_groups() {
-        let stdout = br#"{
-  "status":"SUCCESS",
-  "command":{
-    "name":"usage",
-    "data":{
-      "groups":[
-        {
-          "name":"Gemini Models",
-          "buckets":[
-            {
-              "name":"Weekly Limit Remaining",
-              "window":"weekly",
-              "remaining_fraction":0.84,
-              "reset_time":"2026-10-09T02:36:07Z"
-            }
-          ]
-        }
-      ]
-    }
-  }
-}"#;
-        let summary = parse_agy_print_usage(stdout).expect("CLI usage JSON parses");
-        assert_eq!(summary.groups.len(), 1);
-        assert_eq!(summary.groups[0].display_name, "Gemini Models");
-        assert_eq!(summary.groups[0].buckets.len(), 1);
-        assert_eq!(summary.groups[0].buckets[0].remaining_fraction, Some(0.84));
-        let outputs = outputs_from_summary(summary, Some("cli"));
-        assert_eq!(outputs[0].credential_source.as_deref(), Some("cli"));
-        assert!((outputs[0].metrics[0].remaining_percent - 84.0).abs() < 1e-6);
     }
 
     #[test]
