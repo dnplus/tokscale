@@ -54,6 +54,8 @@ pub enum AutosubmitSubcommand {
             help = "Disable automatic quota upload after a successful submit"
         )]
         no_quota: bool,
+        #[command(flatten)]
+        extra_targets: crate::extra_targets::ExtraTargetFlags,
     },
 }
 
@@ -195,6 +197,7 @@ struct StatusOutput {
     no_quota: bool,
     last_quota_at_ms: Option<i64>,
     last_quota_error: Option<String>,
+    extra_targets: Vec<crate::extra_targets::TargetStatus>,
 }
 
 pub fn enable(args: AutosubmitEnableArgs) -> Result<()> {
@@ -391,6 +394,15 @@ fn print_scheduled_target_notice(no_quota: bool) {
             );
         }
     }
+    for target in crate::extra_targets::statuses()
+        .iter()
+        .filter(|target| target.enabled)
+    {
+        println!(
+            "  Scheduled runs also submit to extra target {} ({}).",
+            target.name, target.api_url
+        );
+    }
 }
 
 pub fn status(json: bool) -> Result<()> {
@@ -451,6 +463,13 @@ pub fn status(json: bool) -> Result<()> {
     }
     if let Some(error) = autosubmit.last_quota_error {
         println!("  Last quota error: {error}");
+    }
+    let extra_targets = crate::extra_targets::statuses();
+    if !extra_targets.is_empty() {
+        println!("  Extra targets:");
+        for target in &extra_targets {
+            crate::extra_targets::print_status_line(target);
+        }
     }
     Ok(())
 }
@@ -540,7 +559,7 @@ pub fn record_quota_result(now_ms: i64, result: &Result<()>) -> Result<()> {
 /// POST the `tokscale usage --json` document to `<api-url>/api/quota` with the
 /// same token, and the same origin check, that submit uses.
 pub fn upload_quota(auth: &crate::auth::ApiTokenAuth, api_url: &str) -> Result<()> {
-    let body = crate::commands::usage::usage_json()?;
+    let body = quota_body()?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let response = tokscale_core::http::client_builder()
@@ -569,6 +588,18 @@ pub fn upload_quota(auth: &crate::auth::ApiTokenAuth, api_url: &str) -> Result<(
             .unwrap_or("Quota upload failed");
         bail!("{error} ({status})")
     })
+}
+
+/// The usage document, fetched once per process: a submit to extra targets
+/// uploads the same reading to every server instead of refetching each
+/// account. A failed fetch is not cached, so the next upload retries it.
+fn quota_body() -> Result<String> {
+    static BODY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(body) = BODY.get() {
+        return Ok(body.clone());
+    }
+    let body = crate::commands::usage::usage_json()?;
+    Ok(BODY.get_or_init(|| body).clone())
 }
 
 /// Official hosts do not implement the quota upload extension.
@@ -792,6 +823,7 @@ fn status_output(settings: &AutosubmitSettings) -> StatusOutput {
         no_quota: settings.no_quota,
         last_quota_at_ms: settings.last_quota_at_ms,
         last_quota_error: settings.last_quota_error.clone(),
+        extra_targets: crate::extra_targets::statuses(),
     }
 }
 

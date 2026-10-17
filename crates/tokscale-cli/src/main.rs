@@ -5,6 +5,7 @@ mod claude_diagnostics;
 mod commands;
 mod cursor;
 mod device;
+mod extra_targets;
 mod hindsight;
 mod paths;
 mod process_liveness;
@@ -311,6 +312,13 @@ enum Commands {
             help = "Disable automatic quota upload after a successful submit"
         )]
         no_quota: bool,
+        #[command(flatten)]
+        extra_targets: extra_targets::ExtraTargetFlags,
+    },
+    #[command(about = "Manage extra servers that submit also uploads to")]
+    Target {
+        #[command(subcommand)]
+        subcommand: extra_targets::TargetSubcommand,
     },
     #[command(about = "Manage periodic usage submission")]
     Autosubmit {
@@ -936,6 +944,7 @@ fn main() -> Result<()> {
             date,
             dry_run,
             no_quota,
+            extra_targets,
         }) => {
             reject_unsupported_home_override(&cli.home, "submit")?;
             let (since, until) = build_date_filter(&date, &cli.home);
@@ -953,8 +962,13 @@ fn main() -> Result<()> {
                 year,
                 dry_run,
                 no_quota,
+                &extra_targets,
                 SubmitMode::Interactive,
             )
+        }
+        Some(Commands::Target { subcommand }) => {
+            reject_unsupported_home_override(&cli.home, "target")?;
+            extra_targets::run(subcommand)
         }
         Some(Commands::Autosubmit { subcommand }) => {
             reject_unsupported_home_override(&cli.home, "autosubmit")?;
@@ -6661,7 +6675,11 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
         AutosubmitSubcommand::Enable(args) => commands::autosubmit::enable(args),
         AutosubmitSubcommand::Status { json } => commands::autosubmit::status(json),
         AutosubmitSubcommand::Disable => commands::autosubmit::disable(),
-        AutosubmitSubcommand::Run { force, no_quota } => {
+        AutosubmitSubcommand::Run {
+            force,
+            no_quota,
+            extra_targets,
+        } => {
             let now_ms = chrono::Utc::now().timestamp_millis();
             let (settings, decision) = commands::autosubmit::load_run_config(force, now_ms)?;
             match decision {
@@ -6692,6 +6710,7 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
                 year,
                 false,
                 no_quota || settings.no_quota,
+                &extra_targets,
                 SubmitMode::Autosubmit,
             ) {
                 Ok(()) => {
@@ -6717,6 +6736,7 @@ fn run_submit_command(
     year: Option<String>,
     dry_run: bool,
     no_quota: bool,
+    extra_target_flags: &extra_targets::ExtraTargetFlags,
     mode: SubmitMode,
 ) -> Result<()> {
     use colored::Colorize;
@@ -6741,7 +6761,8 @@ fn run_submit_command(
         }
     };
     // Fail before scanning when the saved token belongs to another server.
-    auth::api_url_for(&auth_token)?;
+    let primary_url = auth::api_url_for(&auth_token)?;
+    let extra_plan = extra_targets::Plan::resolve(extra_target_flags, &primary_url)?;
 
     if mode == SubmitMode::Interactive
         && auth_token.source == auth::ApiTokenSource::StoredCredentials
@@ -7004,6 +7025,7 @@ fn run_submit_command(
     }
 
     if dry_run {
+        extra_plan.print_dry_run();
         println!("{}", "  Dry run - not submitting data.\n".yellow());
         return Ok(());
     }
@@ -7013,6 +7035,8 @@ fn run_submit_command(
     let submit_device = device::resolve_submit_device()?;
     let submit_payload =
         to_ts_token_contribution_data(&graph_result, Some(&submit_device), scan_scope);
+    // Before the primary upload, which exits the process when it fails.
+    extra_plan.submit_all(&rt, &submit_payload, no_quota);
     post_submission(&rt, &auth_token, &submit_payload, mode)?;
     let api_url = auth::api_url_for(&auth_token)?;
     if let Some(result) = commands::autosubmit::after_submit_quota(
@@ -8929,7 +8953,8 @@ mod tests {
             Some(Commands::Autosubmit {
                 subcommand: commands::autosubmit::AutosubmitSubcommand::Run {
                     force: true,
-                    no_quota: false
+                    no_quota: false,
+                    ..
                 }
             })
         ));
@@ -8940,7 +8965,8 @@ mod tests {
             Some(Commands::Autosubmit {
                 subcommand: commands::autosubmit::AutosubmitSubcommand::Run {
                     force: false,
-                    no_quota: true
+                    no_quota: true,
+                    ..
                 }
             })
         ));
