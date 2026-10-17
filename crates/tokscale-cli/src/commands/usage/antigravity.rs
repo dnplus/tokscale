@@ -1,8 +1,10 @@
 //! Antigravity subscription quota.
 //!
-//! Read quota from the running language server. The Antigravity CLI (`agy`) and IDE both
-//! run a language server that holds the OAuth token, calls Google Code Assist,
-//! caches the answer, and exposes it over a loopback Connect-RPC endpoint:
+//! Unlike every other provider here, this one never reaches a cloud API. The
+//! Antigravity CLI (`agy`) and IDE both run a language server that holds the
+//! OAuth token, calls Google Code Assist, caches the answer, and exposes it
+//! over a loopback Connect-RPC endpoint. `/usage` inside the CLI reads exactly
+//! that:
 //!
 //! ```text
 //! POST http://127.0.0.1:<port>/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary
@@ -11,8 +13,8 @@
 //! ```
 //!
 //! No CSRF token is required for this method, and tokscale never has to hold
-//! an Antigravity credential of its own for that path — the token stays inside
-//! the language server and we only read the numbers it already computed.
+//! an Antigravity credential of its own — the token stays inside the language
+//! server and we only read the numbers it already computed.
 //!
 //! Calling Google's `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota`
 //! directly was tried first and rejected: authentication succeeds, but a
@@ -127,7 +129,20 @@ struct QuotaBucket {
 
 // ── Provider interface ──
 
-/// Whether the running language server has quota groups.
+/// Whether a reachable language server is serving quota right now.
+///
+/// This probes rather than checking for a credential file, because Antigravity
+/// keeps its token inside the running process: "is it installed" and "can we
+/// read quota" are different questions, and only the second one should put a
+/// card on screen. The probe is a loopback request against a port read out of
+/// the CLI log, so on a machine that has one it costs a few milliseconds. A
+/// machine with neither a logged port nor an Antigravity process sends no
+/// request at all and builds no HTTP client: what it pays is the log read and
+/// the process scan.
+///
+/// This runs the same [`discover_quota`] the fetch runs, so the two cannot
+/// disagree about whether a server is answering: a summary that clears this
+/// gate is a summary the fetch can also obtain.
 pub fn has_credentials() -> bool {
     off_caller_runtime(|| {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -136,11 +151,7 @@ pub fn has_credentials() -> bool {
         else {
             return false;
         };
-        rt.block_on(async {
-            discover_quota()
-                .await
-                .is_some_and(|summary| !summary.groups.is_empty())
-        })
+        rt.block_on(async { discover_quota().await.is_some() })
     })
     .unwrap_or(false)
 }
@@ -155,35 +166,15 @@ pub fn fetch_all() -> Result<Vec<UsageOutput>> {
             let summary = discover_quota()
                 .await
                 .context("Antigravity language server is not running")?;
+
             if summary.groups.is_empty() {
                 anyhow::bail!("Antigravity is running but not signed in");
             }
-            Ok(outputs_from_summary(summary, Some("language-server")))
+
+            Ok(summary.groups.into_iter().map(output_for_group).collect())
         })
     })
     .unwrap_or_else(|_| Err(anyhow::anyhow!("Antigravity usage worker thread panicked")))
-}
-
-fn outputs_from_summary(
-    summary: QuotaSummary,
-    credential_source: Option<&str>,
-) -> Vec<UsageOutput> {
-    summary
-        .groups
-        .into_iter()
-        .map(|group| {
-            let mut output = output_for_group(group);
-            output.credential_source = credential_source.map(str::to_string);
-            output
-        })
-        .collect()
-}
-
-fn gemini_home() -> Option<PathBuf> {
-    std::env::var_os("GEMINI_CLI_HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| tokscale_core::paths::home_dir().map(|home| home.join(".gemini")))
 }
 
 /// Run `work` on a dedicated OS thread, off whatever runtime the caller is on.
@@ -502,7 +493,12 @@ async fn race_for_quota_with(
 }
 
 fn cli_log_path() -> Option<PathBuf> {
-    Some(gemini_home()?.join("antigravity-cli").join("cli.log"))
+    Some(
+        tokscale_core::paths::home_dir()?
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("cli.log"),
+    )
 }
 
 /// Bytes of `cli.log`'s end read when looking for logged ports.
@@ -626,10 +622,6 @@ mod tests {
         fn set(&mut self, key: &str, value: impl AsRef<std::ffi::OsStr>) {
             unsafe { std::env::set_var(key, value) };
         }
-
-        fn remove(&mut self, key: &str) {
-            unsafe { std::env::remove_var(key) };
-        }
     }
 
     impl Drop for EnvGuard {
@@ -649,95 +641,6 @@ mod tests {
     /// override is rejected, so both have to point at the fixture or the
     /// Windows leg reads the runner's real `cli.log`.
     const HOME_ENV_KEYS: [&str; 2] = ["HOME", "USERPROFILE"];
-
-    fn isolate_agy_env(home: &TempDir) -> EnvGuard {
-        let mut env = EnvGuard::capture(&[
-            "HOME",
-            "USERPROFILE",
-            "GEMINI_CLI_HOME",
-            "TOKSCALE_AGY_BIN",
-            "TOKSCALE_AGY_FIXTURE_MARKER",
-            "PATH",
-        ]);
-        for key in HOME_ENV_KEYS {
-            env.set(key, home.path());
-        }
-        env.remove("GEMINI_CLI_HOME");
-        env.remove("TOKSCALE_AGY_BIN");
-        env.set("PATH", home.path().join("empty-path"));
-        env
-    }
-
-    fn fake_login(home: &Path, relative: &str) {
-        let path = home.join(relative);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, "{}").unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn empty_language_server_does_not_launch_cli_for_any_login_file() {
-        for login in [
-            None,
-            Some("oauth_creds.json"),
-            Some("antigravity-cli/antigravity-oauth-token"),
-        ] {
-            let home = TempDir::new().unwrap();
-            let mut env = isolate_agy_env(&home);
-            let marker = home.path().join("invoked");
-            env.set("TOKSCALE_AGY_FIXTURE_MARKER", &marker);
-            #[cfg(windows)]
-            let bin = home.path().join("agy.cmd");
-            #[cfg(not(windows))]
-            let bin = home.path().join("agy");
-            let quota = r#"{"status":"SUCCESS","num_turns":0,"command":{"name":"usage","data":{"groups":[{"name":"Fake CLI","buckets":[{"window":"weekly","remaining_fraction":1}]}]}}}"#;
-            #[cfg(windows)]
-            let script = format!(
-                "@echo off\r\n> \"%TOKSCALE_AGY_FIXTURE_MARKER%\" echo invoked\r\necho {quota}\r\n"
-            );
-            #[cfg(not(windows))]
-            let script = format!(
-                "#!/bin/sh\nprintf invoked > \"$TOKSCALE_AGY_FIXTURE_MARKER\"\nprintf '%s' '{quota}'\n"
-            );
-            std::fs::write(&bin, script).unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
-            }
-            env.set("TOKSCALE_AGY_BIN", &bin);
-            env.set("PATH", home.path());
-            if let Some(login) = login {
-                fake_login(&home.path().join(".gemini"), login);
-            }
-            let (base, _) = spawn_server(|_, _| (200, r#"{"response":{"groups":[]}}"#.into()));
-            redirect_home_to_logged_ports(&mut env, &home, &[port_of(&base)]);
-
-            let available = has_credentials();
-            let fetched = fetch_all();
-
-            assert!(
-                !marker.exists(),
-                "an empty language server must not launch agy, login={login:?}"
-            );
-            assert!(!available, "a login file cannot admit a quota source");
-            assert!(fetched.unwrap_err().to_string().contains("not signed in"));
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn gemini_home_override_controls_language_server_logs() {
-        let home = TempDir::new().unwrap();
-        let mut env = isolate_agy_env(&home);
-        let custom = home.path().join("custom-gemini");
-        let log = custom.join("antigravity-cli/cli.log");
-        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
-        std::fs::write(&log, "listening on random port at 41234 for HTTP\n").unwrap();
-        env.set("GEMINI_CLI_HOME", &custom);
-        assert_eq!(cli_log_path(), Some(log));
-        assert_eq!(ports_from_cli_log(), vec![41234]);
-    }
 
     /// One quota group, named distinctly enough that a real language server
     /// running on the machine under test cannot be mistaken for the fixture.
@@ -902,8 +805,7 @@ mod tests {
         });
 
         let home = TempDir::new().unwrap();
-        let mut env = EnvGuard::capture(&["HOME", "USERPROFILE", "GEMINI_CLI_HOME"]);
-        env.remove("GEMINI_CLI_HOME");
+        let mut env = EnvGuard::capture(&HOME_ENV_KEYS);
         redirect_home_to_logged_ports(&mut env, &home, &[port_of(&base)]);
 
         let (has_credentials, fetch) = registered_antigravity_provider();
@@ -963,8 +865,7 @@ mod tests {
         let (base, seen) = spawn_server(|_path, _calls| (200, FIXTURE_QUOTA.to_string()));
 
         let home = TempDir::new().unwrap();
-        let mut env = EnvGuard::capture(&["HOME", "USERPROFILE", "GEMINI_CLI_HOME"]);
-        env.remove("GEMINI_CLI_HOME");
+        let mut env = EnvGuard::capture(&HOME_ENV_KEYS);
         redirect_home_to_logged_ports(
             &mut env,
             &home,
@@ -1022,8 +923,7 @@ mod tests {
         let (older_base, newer_base, newer_seen) = spawn_ordered_pair(NEWER_DELAY);
 
         let home = TempDir::new().unwrap();
-        let mut env = EnvGuard::capture(&["HOME", "USERPROFILE", "GEMINI_CLI_HOME"]);
-        env.remove("GEMINI_CLI_HOME");
+        let mut env = EnvGuard::capture(&HOME_ENV_KEYS);
         redirect_home_to_logged_ports(
             &mut env,
             &home,
@@ -1355,8 +1255,7 @@ mod tests {
     #[test]
     #[serial]
     fn per_session_log_ports_survive_past_the_tail_window() {
-        let mut env = EnvGuard::capture(&["HOME", "USERPROFILE", "GEMINI_CLI_HOME"]);
-        env.remove("GEMINI_CLI_HOME");
+        let mut env = EnvGuard::capture(&HOME_ENV_KEYS);
         let home = TempDir::new().unwrap();
         let log_dir = home.path().join(".gemini").join("antigravity-cli");
         std::fs::create_dir_all(&log_dir).unwrap();
@@ -1377,8 +1276,7 @@ mod tests {
     #[test]
     #[serial]
     fn tail_window_ports_are_tried_before_head_window_ports() {
-        let mut env = EnvGuard::capture(&["HOME", "USERPROFILE", "GEMINI_CLI_HOME"]);
-        env.remove("GEMINI_CLI_HOME");
+        let mut env = EnvGuard::capture(&HOME_ENV_KEYS);
         let home = TempDir::new().unwrap();
         let log_dir = home.path().join(".gemini").join("antigravity-cli");
         std::fs::create_dir_all(&log_dir).unwrap();
