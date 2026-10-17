@@ -24,6 +24,12 @@ The cache contains usage events, not a guaranteed one-to-one record of user requ
 
 The existing `usage --bots` command is a separate quota-oriented report and still contacts the quota API. Its pooled subtask/schedule breakdown is not a verified parent-child graph. This change does not claim to resolve Bot names, account entitlement linkage, cache completeness, or quota burn-rate accuracy.
 
+## Token coverage
+
+`usage --bots` distinguishes missing token counts from partial and complete token data. Empty objects and cost-only objects count as missing. A row is complete when its input and output counts are valid nonnegative integers. Cursor omits cache-read and cache-write counts on many events, so an absent cache count does not make a row partial, but a present invalid one does. Explicit zero counts are known zero usage.
+
+`missing_token_usage_calls` counts events with no valid token counts. `partial_token_usage_calls` counts events with some valid counts that miss input or output, or carry an invalid cache count. Token columns sum valid counts only: a rejected value such as `"inf"`, a negative number, or a fraction contributes nothing, so omitted or rejected fields are unknown rather than zero. Submitted and cached usage keep their existing normalized token values.
+
 ## Reported monetary amounts
 
 `usage --bots` retains the provider's metered token cost and wallet charge separately when those fields are present. Each `cost_breakdown` amount has a `known_usd` sum and `reported_calls` count. A count of zero means unknown, not a free event. A smaller count than `calls` means the sum covers only part of the report.

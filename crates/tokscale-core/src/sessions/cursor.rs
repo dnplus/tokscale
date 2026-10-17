@@ -221,30 +221,22 @@ pub fn parse_cursor_usage_event_timestamp(value: &serde_json::Value) -> Option<i
 /// string doesn't fail the whole row.
 #[derive(Debug, Deserialize, Default)]
 struct CursorTokenUsage {
-    #[serde(
-        rename = "inputTokens",
-        default,
-        deserialize_with = "de_opt_i64_lenient"
-    )]
-    input_tokens: Option<i64>,
-    #[serde(
-        rename = "outputTokens",
-        default,
-        deserialize_with = "de_opt_i64_lenient"
-    )]
-    output_tokens: Option<i64>,
+    #[serde(rename = "inputTokens", default, deserialize_with = "de_token_count")]
+    input_tokens: CursorTokenCount,
+    #[serde(rename = "outputTokens", default, deserialize_with = "de_token_count")]
+    output_tokens: CursorTokenCount,
     #[serde(
         rename = "cacheReadTokens",
         default,
-        deserialize_with = "de_opt_i64_lenient"
+        deserialize_with = "de_token_count"
     )]
-    cache_read_tokens: Option<i64>,
+    cache_read_tokens: CursorTokenCount,
     #[serde(
         rename = "cacheWriteTokens",
         default,
-        deserialize_with = "de_opt_i64_lenient"
+        deserialize_with = "de_token_count"
     )]
-    cache_write_tokens: Option<i64>,
+    cache_write_tokens: CursorTokenCount,
     /// The metered cost of this event's tokens, in cents. Cursor's
     /// `aiserver.v1.TokenUsage` carries it next to the token counts and the
     /// discount fields, so it is populated even when the event was plan-included
@@ -260,10 +252,10 @@ struct CursorTokenUsage {
 impl CursorTokenUsage {
     fn token_breakdown(&self) -> TokenBreakdown {
         TokenBreakdown {
-            input: self.input_tokens.unwrap_or(0).max(0),
-            output: self.output_tokens.unwrap_or(0).max(0),
-            cache_read: self.cache_read_tokens.unwrap_or(0).max(0),
-            cache_write: self.cache_write_tokens.unwrap_or(0).max(0),
+            input: self.input_tokens.normalized.unwrap_or(0).max(0),
+            output: self.output_tokens.normalized.unwrap_or(0).max(0),
+            cache_read: self.cache_read_tokens.normalized.unwrap_or(0).max(0),
+            cache_write: self.cache_write_tokens.normalized.unwrap_or(0).max(0),
             cache_write_1h: 0,
             reasoning: 0,
         }
@@ -323,12 +315,123 @@ fn json_value_to_f64(value: &serde_json::Value) -> Option<f64> {
     }
 }
 
-fn de_opt_i64_lenient<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+#[derive(Debug, Default, Clone, Copy)]
+struct CursorTokenCount {
+    // Preserve legacy normalized counts independently of raw coverage validity.
+    normalized: Option<i64>,
+    known: bool,
+    /// The field carried a non-null value, valid or not.
+    present: bool,
+}
+
+impl CursorTokenCount {
+    /// The count only when its raw value is a valid nonnegative integer, so a
+    /// rejected value such as `"inf"` or `1.5` never enters a known-data sum.
+    fn known_value(self) -> Option<i64> {
+        self.known.then_some(self.normalized).flatten()
+    }
+}
+
+fn is_known_token_count(value: &serde_json::Value) -> bool {
+    let float = match value {
+        serde_json::Value::Number(number) => {
+            if let Some(integer) = number.as_i64() {
+                return integer >= 0;
+            }
+            number.as_f64()
+        }
+        serde_json::Value::String(text) => return is_known_decimal_token_count(text.trim()),
+        _ => None,
+    };
+    float.is_some_and(|count| {
+        // i64::MAX rounds up to 2^63 as f64, so the upper bound is exclusive.
+        count.is_finite()
+            && (0.0..9_223_372_036_854_775_808.0).contains(&count)
+            && count.fract() == 0.0
+    })
+}
+
+// Validate decimal strings before any floating-point rounding or underflow.
+fn is_known_decimal_token_count(text: &str) -> bool {
+    let (negative, unsigned) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
+        Some(index) => {
+            let raw = &unsigned[index + 1..];
+            let (negative, digits) = match raw.as_bytes().first() {
+                Some(b'-') => (true, &raw[1..]),
+                Some(b'+') => (false, &raw[1..]),
+                _ => (false, raw),
+            };
+            if digits.is_empty() || !digits.bytes().all(|digit| digit.is_ascii_digit()) {
+                return false;
+            }
+            // Saturation bounds the work even for arbitrarily long exponents.
+            let magnitude = digits.bytes().fold(0_i128, |value, digit| {
+                value
+                    .saturating_mul(10)
+                    .saturating_add(i128::from(digit - b'0'))
+            });
+            (
+                &unsigned[..index],
+                if negative { -magnitude } else { magnitude },
+            )
+        }
+        None => (unsigned, 0),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if (whole.is_empty() && fraction.is_empty())
+        || !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|digit| digit.is_ascii_digit())
+    {
+        return false;
+    }
+    let digits = whole.bytes().chain(fraction.bytes());
+    let first = digits.clone().position(|digit| digit != b'0');
+    let Some(first) = first else {
+        return true;
+    };
+    if negative {
+        return false;
+    }
+    let last = digits
+        .clone()
+        .enumerate()
+        .filter_map(|(index, digit)| (digit != b'0').then_some(index))
+        .last()
+        .unwrap();
+    let significant_len = last - first + 1;
+    let trailing_zeros = whole.len() + fraction.len() - last - 1;
+    let scale = exponent
+        .saturating_sub(fraction.len() as i128)
+        .saturating_add(trailing_zeros as i128);
+    if scale < 0 || scale.saturating_add(significant_len as i128) > 19 {
+        return false;
+    }
+    let significant = digits.skip(first).take(significant_len);
+    let value = significant
+        .chain(std::iter::repeat_n(b'0', scale as usize))
+        .try_fold(0_i64, |value, digit| {
+            value.checked_mul(10)?.checked_add(i64::from(digit - b'0'))
+        });
+    value.is_some()
+}
+
+fn de_token_count<'de, D>(deserializer: D) -> Result<CursorTokenCount, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(value.as_ref().and_then(json_value_to_i64))
+    Ok(CursorTokenCount {
+        normalized: value.as_ref().and_then(json_value_to_i64),
+        known: value.as_ref().is_some_and(is_known_token_count),
+        present: value.is_some(),
+    })
 }
 
 fn de_opt_f64_lenient<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
@@ -480,12 +583,60 @@ fn classify_grok_bot_messages(records: &mut [CursorUsageRecord], account_id: &st
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenUsageCoverage {
+    Missing,
+    Partial,
+    Complete,
+}
+
+impl CursorTokenUsage {
+    /// Input and output must be valid. Cursor omits the cache counts on many
+    /// events, so an absent cache count is not a gap, but a present invalid
+    /// one is.
+    fn coverage(&self) -> TokenUsageCoverage {
+        let counts = [
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_read_tokens,
+            self.cache_write_tokens,
+        ];
+        if !counts.iter().any(|count| count.known) {
+            return TokenUsageCoverage::Missing;
+        }
+        let required = self.input_tokens.known && self.output_tokens.known;
+        let optional = [self.cache_read_tokens, self.cache_write_tokens]
+            .iter()
+            .all(|count| !count.present || count.known);
+        if required && optional {
+            TokenUsageCoverage::Complete
+        } else {
+            TokenUsageCoverage::Partial
+        }
+    }
+
+    /// Valid counts only; absent or rejected counts contribute nothing.
+    fn known_token_breakdown(&self) -> TokenBreakdown {
+        TokenBreakdown {
+            input: self.input_tokens.known_value().unwrap_or(0).max(0),
+            output: self.output_tokens.known_value().unwrap_or(0).max(0),
+            cache_read: self.cache_read_tokens.known_value().unwrap_or(0).max(0),
+            cache_write: self.cache_write_tokens.known_value().unwrap_or(0).max(0),
+            cache_write_1h: 0,
+            reasoning: 0,
+        }
+    }
+}
+
 /// Parsed Cursor metadata for local bot accounting. Kept separate from messages
 /// so optional display metadata does not alter cache or submission contracts.
 #[derive(Debug, Clone)]
 pub struct CursorUsageRecord {
     pub message: UnifiedMessage,
-    pub has_token_usage: bool,
+    pub token_usage_coverage: TokenUsageCoverage,
+    /// Only the counts whose raw values are valid. `message.tokens` keeps the
+    /// legacy normalized values that reports and sync identity depend on.
+    pub known_tokens: TokenBreakdown,
     pub metered_cost_usd: Option<f64>,
     pub charged_cost_usd: Option<f64>,
     pub automation_id: Option<String>,
@@ -540,9 +691,10 @@ pub fn parse_cursor_usage_records(content: &str, account_id: &str) -> Vec<Cursor
             ),
         };
 
-        let has_token_usage = event.token_usage.is_some();
         let default_usage = CursorTokenUsage::default();
         let token_usage = event.token_usage.as_ref().unwrap_or(&default_usage);
+        let token_usage_coverage = token_usage.coverage();
+        let known_tokens = token_usage.known_token_breakdown();
 
         // Cursor reports two different amounts. `tokenUsage.totalCents` is the
         // metered cost of the event's own tokens; `chargedCents` is what the
@@ -571,7 +723,8 @@ pub fn parse_cursor_usage_records(content: &str, account_id: &str) -> Vec<Cursor
         }
         messages.push(CursorUsageRecord {
             message,
-            has_token_usage,
+            token_usage_coverage,
+            known_tokens,
             metered_cost_usd,
             charged_cost_usd,
             automation_id: event.automation_id,
@@ -1471,6 +1624,123 @@ mod grok_bot_tests {
     }
 
     #[test]
+    fn token_coverage_distinguishes_absent_counts_from_explicit_zero() {
+        for (tokens, expected) in [
+            (json!(null), TokenUsageCoverage::Missing),
+            (json!({}), TokenUsageCoverage::Missing),
+            (json!({"totalCents": 25}), TokenUsageCoverage::Missing),
+            (json!({"inputTokens": -1}), TokenUsageCoverage::Missing),
+            (json!({"inputTokens": 0}), TokenUsageCoverage::Partial),
+            (
+                json!({"inputTokens": 10, "outputTokens": 2, "cacheReadTokens": 0}),
+                TokenUsageCoverage::Complete,
+            ),
+            (
+                json!({"inputTokens": 10, "outputTokens": 2}),
+                TokenUsageCoverage::Complete,
+            ),
+            (
+                json!({"inputTokens": 10, "outputTokens": 2, "cacheWriteTokens": "inf"}),
+                TokenUsageCoverage::Partial,
+            ),
+            (
+                json!({"inputTokens": 10, "cacheReadTokens": 0, "cacheWriteTokens": 0}),
+                TokenUsageCoverage::Partial,
+            ),
+            (
+                json!({"inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0, "cacheWriteTokens": 0}),
+                TokenUsageCoverage::Complete,
+            ),
+        ] {
+            let content = json!({"usageEventsDisplay": [{
+                "timestamp": 1791417600000_i64,
+                "model": "grok-bot-default",
+                "tokenUsage": tokens,
+            }]})
+            .to_string();
+            let records = parse_cursor_usage_records(&content, "work");
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].token_usage_coverage, expected, "{content}");
+        }
+    }
+
+    #[test]
+    fn token_coverage_validates_raw_counts_without_changing_normalized_tokens() {
+        for (raw, known, normalized) in [
+            (json!(0), true, 0),
+            (json!(10.0), true, 10),
+            (json!("10.0"), true, 10),
+            (json!("1.00e1"), true, 10),
+            (json!("100e-1"), true, 10),
+            (json!("+00010.000"), true, 10),
+            (json!("9223372036854775807.0"), true, i64::MAX),
+            (json!("10.0000000000000001"), false, 10),
+            (json!("-1e-400"), false, 0),
+            (json!("1e-400"), false, 0),
+            (
+                json!("-0.000e-99999999999999999999999999999999999999999"),
+                true,
+                0,
+            ),
+            (
+                json!("1e99999999999999999999999999999999999999999"),
+                false,
+                i64::MAX,
+            ),
+            (
+                json!("1e-99999999999999999999999999999999999999999"),
+                false,
+                0,
+            ),
+            (json!("9223372036854775807.1"), false, i64::MAX),
+            (json!("1e"), false, 0),
+            (json!("1.2.3"), false, 0),
+            (json!(" 0 "), true, 0),
+            (json!(i64::MAX), true, i64::MAX),
+            (json!(i64::MAX.to_string()), true, i64::MAX),
+            (json!(null), false, 0),
+            (json!("invalid"), false, 0),
+            (json!("NaN"), false, 0),
+            (json!("inf"), false, i64::MAX),
+            (json!("-inf"), false, 0),
+            (json!(-0.5), false, 0),
+            (json!("-0.5"), false, 0),
+            (json!(1.5), false, 1),
+            (json!("1.5"), false, 1),
+            (json!(9_223_372_036_854_775_808_u64), false, i64::MAX),
+            (json!("9223372036854775808"), false, i64::MAX),
+            (json!("1e100"), false, i64::MAX),
+        ] {
+            for mixed in [false, true] {
+                let tokens = if mixed {
+                    json!({"inputTokens": raw, "outputTokens": 0,
+                        "cacheReadTokens": 0, "cacheWriteTokens": 0})
+                } else {
+                    json!({"inputTokens": raw, "outputTokens": raw,
+                        "cacheReadTokens": raw, "cacheWriteTokens": raw})
+                };
+                let content = json!({"usageEventsDisplay": [{
+                    "timestamp": 1791417600000_i64,
+                    "model": "grok-bot-default",
+                    "tokenUsage": tokens,
+                }]})
+                .to_string();
+                let records = parse_cursor_usage_records(&content, "work");
+                assert_eq!(records.len(), 1, "{content}");
+                let expected = if known {
+                    TokenUsageCoverage::Complete
+                } else if mixed {
+                    TokenUsageCoverage::Partial
+                } else {
+                    TokenUsageCoverage::Missing
+                };
+                assert_eq!(records[0].token_usage_coverage, expected, "{content}");
+                assert_eq!(records[0].message.tokens.input, normalized, "{content}");
+            }
+        }
+    }
+
+    #[test]
     fn cursor_records_preserve_metered_and_charged_amounts() {
         let content = json!({"usageEventsDisplay": [
             {"timestamp": 1791417600000_i64, "model": "auto", "tokenUsage": {"totalCents": 25}, "chargedCents": 0},
@@ -1515,9 +1785,15 @@ mod grok_bot_tests {
         assert_eq!(
             records
                 .iter()
-                .map(|r| r.has_token_usage)
+                .map(|r| r.token_usage_coverage)
                 .collect::<Vec<_>>(),
-            [true, false, true, true, true]
+            [
+                TokenUsageCoverage::Missing,
+                TokenUsageCoverage::Missing,
+                TokenUsageCoverage::Partial,
+                TokenUsageCoverage::Partial,
+                TokenUsageCoverage::Missing
+            ]
         );
         assert_eq!(records[0].message.tokens, TokenBreakdown::default());
         assert_eq!(records[2].message.tokens, TokenBreakdown::default());
