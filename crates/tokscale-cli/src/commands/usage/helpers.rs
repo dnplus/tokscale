@@ -1,8 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Duration, Local, Utc};
 
-/// Bounds each usage HTTP request, including response body reads, to 30 seconds.
-/// Refreshes and retries each receive their own request deadline.
 pub(super) fn http_client() -> Result<reqwest::Client> {
     http_client_with_timeout(std::time::Duration::from_secs(30))
 }
