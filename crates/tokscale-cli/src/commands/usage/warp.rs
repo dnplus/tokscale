@@ -1,4 +1,7 @@
-use super::{UsageMetric, UsageOutput};
+use super::{
+    UsageFetchDiagnostic, UsageFetchDiagnosticKind, UsageFetchDiagnosticSeverity, UsageFetchReport,
+    UsageMetric, UsageOutput,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::path::Path;
@@ -54,20 +57,55 @@ fn build_metrics(usage: &crate::warp::WarpAggregateUsage) -> Vec<UsageMetric> {
     metrics
 }
 
-pub fn fetch() -> Result<UsageOutput> {
-    read_cache_at(
+const PROVIDER: &str = "Warp/Oz";
+
+/// The cache is only written by `tokscale warp sync`, so an old sync still
+/// shows its numbers, with a warning that says how old they are.
+pub fn fetch() -> Result<UsageFetchReport> {
+    read_report_at(
         &crate::warp::get_warp_cache_dir().join("usage.json"),
         Utc::now(),
     )
 }
 
-fn read_cache_at(path: &Path, now: DateTime<Utc>) -> Result<UsageOutput> {
+fn read_report_at(path: &Path, now: DateTime<Utc>) -> Result<UsageFetchReport> {
     let content = std::fs::read_to_string(path).context("Warp aggregate usage cache not found")?;
     let cache = serde_json::from_str(&content).context("Invalid Warp aggregate usage cache")?;
-    build_output(&cache, now)
+    let (output, age) = build_output(&cache, now)?;
+    let mut diagnostics = Vec::new();
+    if age > chrono::Duration::seconds(super::USAGE_CACHE_MAX_AGE_SECONDS as i64) {
+        diagnostics.push(UsageFetchDiagnostic::with_kind(
+            PROVIDER,
+            None,
+            UsageFetchDiagnosticKind::FetchFailed,
+            UsageFetchDiagnosticSeverity::Warning,
+            format!(
+                "Warp usage was last synced {} ago; run `tokscale warp sync` to refresh it",
+                describe_age(age)
+            ),
+        ));
+    }
+    Ok(UsageFetchReport {
+        outputs: vec![output],
+        diagnostics,
+    })
 }
 
-fn build_output(cache: &crate::warp::WarpUsageCache, now: DateTime<Utc>) -> Result<UsageOutput> {
+fn describe_age(age: chrono::Duration) -> String {
+    let minutes = age.num_minutes();
+    if minutes < 60 {
+        format!("{minutes} min")
+    } else if minutes < 48 * 60 {
+        format!("{} h", minutes / 60)
+    } else {
+        format!("{} days", minutes / (24 * 60))
+    }
+}
+
+fn build_output(
+    cache: &crate::warp::WarpUsageCache,
+    now: DateTime<Utc>,
+) -> Result<(UsageOutput, chrono::Duration)> {
     anyhow::ensure!(
         cache.version == 1,
         "Unsupported Warp aggregate usage cache version {}",
@@ -80,14 +118,10 @@ fn build_output(cache: &crate::warp::WarpUsageCache, now: DateTime<Utc>) -> Resu
         age >= chrono::Duration::zero(),
         "Warp aggregate usage cache source timestamp is in the future"
     );
-    anyhow::ensure!(
-        age <= chrono::Duration::seconds(super::USAGE_CACHE_MAX_AGE_SECONDS as i64),
-        "Warp aggregate usage cache is stale; sync Warp usage to refresh it"
-    );
     let metrics = build_metrics(&cache.usage);
 
-    Ok(UsageOutput {
-        provider: "Warp/Oz".to_string(),
+    let output = UsageOutput {
+        provider: PROVIDER.to_string(),
         account: None,
         credential_source: None,
         plan: None,
@@ -96,7 +130,8 @@ fn build_output(cache: &crate::warp::WarpUsageCache, now: DateTime<Utc>) -> Resu
         reset_credits: None,
         credit_status: None,
         spend_control: None,
-    })
+    };
+    Ok((output, age))
 }
 
 #[cfg(test)]
@@ -125,7 +160,7 @@ mod tests {
     #[test]
     fn freshness_accepts_current_and_boundary_known_zero_usage() {
         for timestamp in ["2026-10-17T12:00:00Z", "2026-10-17T11:55:00Z"] {
-            let output = build_output(&fixture(timestamp), now()).unwrap();
+            let (output, _) = build_output(&fixture(timestamp), now()).unwrap();
             assert_eq!(output.metrics.len(), 2);
             assert_eq!(output.metrics[0].used_percent, 0.0);
             assert_eq!(output.metrics[0].remaining_percent, 100.0);
@@ -134,10 +169,8 @@ mod tests {
     }
 
     #[test]
-    fn freshness_rejects_stale_future_and_malformed_source_times() {
+    fn freshness_rejects_future_and_malformed_source_times() {
         for (timestamp, reason) in [
-            ("2026-10-17T11:54:59Z", "stale"),
-            ("2026-10-17T11:54:59.999Z", "stale"),
             ("2026-10-17T12:00:01Z", "future"),
             ("2026-10-17T12:00:00.001Z", "future"),
             ("", "timestamp"),
@@ -167,7 +200,7 @@ mod tests {
         assert!(has_cache_file_at(&path));
         let report = super::super::fetch_provider_report(
             "Warp/Oz",
-            read_cache_at(&path, now()).map(|output| vec![output]),
+            read_report_at(&path, now()).map(|report| report.outputs),
         );
         assert!(report.outputs.is_empty());
         assert_eq!(report.diagnostics.len(), 1);
@@ -184,14 +217,44 @@ mod tests {
             serde_json::to_string(&fixture("2026-10-17T11:54:59Z")).unwrap(),
         )
         .unwrap();
-        let error = read_cache_at(&path, now()).unwrap_err().to_string();
-        assert!(error.contains("stale"), "{error}");
+        let report = read_report_at(&path, now()).unwrap();
+        assert_eq!(report.outputs.len(), 1);
         assert!(path.exists());
         std::fs::write(&path, r#"{"version":1,"usage":{},"workspaces":[]}"#).unwrap();
-        assert!(read_cache_at(&path, now())
+        assert!(read_report_at(&path, now())
             .unwrap_err()
             .to_string()
             .contains("Invalid"));
+    }
+
+    #[test]
+    fn stale_cache_keeps_the_card_and_warns_with_its_age() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("usage.json");
+        for (timestamp, age) in [
+            ("2026-10-17T11:54:59Z", "5 min"),
+            ("2026-10-17T09:00:00Z", "3 h"),
+            ("2026-10-10T12:00:00Z", "7 days"),
+        ] {
+            std::fs::write(&path, serde_json::to_string(&fixture(timestamp)).unwrap()).unwrap();
+            let report = read_report_at(&path, now()).unwrap();
+            assert_eq!(
+                report.outputs.len(),
+                1,
+                "a stale cache still shows its card"
+            );
+            assert_eq!(report.diagnostics.len(), 1);
+            let diagnostic = &report.diagnostics[0];
+            assert_eq!(diagnostic.severity, UsageFetchDiagnosticSeverity::Warning);
+            assert!(diagnostic.message.contains(age), "{}", diagnostic.message);
+            assert!(diagnostic.message.contains("tokscale warp sync"));
+        }
+        std::fs::write(
+            &path,
+            serde_json::to_string(&fixture("2026-10-17T11:55:00Z")).unwrap(),
+        )
+        .unwrap();
+        assert!(read_report_at(&path, now()).unwrap().diagnostics.is_empty());
     }
 
     #[test]
