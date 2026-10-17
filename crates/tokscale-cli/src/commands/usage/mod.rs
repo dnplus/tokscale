@@ -285,6 +285,7 @@ impl UsageOutput {
 
 // ── Cache ──
 
+const USAGE_CACHE_MAX_AGE_SECONDS: u64 = 300;
 const SUBSCRIPTION_CACHE_FILE: &str = "subscription-usage-cache.json";
 
 fn cache_path_in(dir: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -335,7 +336,7 @@ pub fn clear_cache() {
     }
 }
 
-fn load_cache_at(path: &std::path::Path) -> Option<Vec<UsageOutput>> {
+fn load_startup_cache_at(path: &std::path::Path) -> Option<Vec<UsageOutput>> {
     let content = std::fs::read_to_string(path).ok()?;
     let doc: serde_json::Value = serde_json::from_str(&content).ok()?;
     let timestamp = doc.get("timestamp")?.as_u64()?;
@@ -345,15 +346,21 @@ fn load_cache_at(path: &std::path::Path) -> Option<Vec<UsageOutput>> {
         .as_secs()
         .saturating_sub(timestamp);
     // Cache expires after 5 minutes
-    if age > 300 {
+    if age > USAGE_CACHE_MAX_AGE_SECONDS {
         return None;
     }
-    serde_json::from_value(doc.get("data")?.clone()).ok()
+    let outputs: Vec<UsageOutput> = serde_json::from_value(doc.get("data")?.clone()).ok()?;
+    Some(
+        outputs
+            .into_iter()
+            .filter(|output| output.provider != "Warp/Oz")
+            .collect(),
+    )
 }
 
 #[cfg_attr(test, allow(dead_code))]
 pub fn load_cache() -> Option<Vec<UsageOutput>> {
-    load_cache_at(&cache_path()?)
+    load_startup_cache_at(&cache_path()?)
         .map(|outputs| filter_disabled_outputs(outputs, &disabled_provider_ids()))
 }
 
@@ -817,6 +824,20 @@ mod tests {
     }
 
     #[test]
+    fn warp_freshness_cannot_be_renewed_by_subscription_recaching() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("subscription.json");
+        for _ in 0..2 {
+            save_cache_at(&path, &[sample_output("Warp/Oz"), sample_output("Codex")]);
+            let cached = load_startup_cache_at(&path).unwrap();
+            assert_eq!(cached.len(), 1);
+            assert_eq!(cached[0].provider, "Codex");
+        }
+        save_cache_at(&path, &[sample_output("Codex")]);
+        assert_eq!(load_startup_cache_at(&path).unwrap()[0].provider, "Codex");
+    }
+
+    #[test]
     fn subscription_cache_helpers_use_explicit_path() {
         let temp = TempDir::new().unwrap();
         let expected = cache_path_in(&temp.path().join("cache")).unwrap();
@@ -827,7 +848,7 @@ mod tests {
             temp.path().join("cache/subscription-usage-cache.json")
         );
         save_cache_at(&expected, &data);
-        assert_eq!(load_cache_at(&expected).unwrap().len(), 1);
+        assert_eq!(load_startup_cache_at(&expected).unwrap().len(), 1);
         assert!(expected.exists());
         clear_cache_at(&expected);
         assert!(!expected.exists());
