@@ -304,7 +304,10 @@ fn map_cursor_metrics(
     sand: Option<&Value>,
 ) -> Result<Vec<UsageMetric>> {
     let plan_info = parse_plan_info(plan);
-    let parsed_sand = sand.and_then(|value| parse_sand_usage(value).ok().flatten());
+    // A malformed response for an eligible account is an error, not an
+    // absence: falling back to the invoice-cycle tracks would present stale
+    // Auto/API bars as a unified account's current usage.
+    let parsed_sand = sand.map(parse_sand_usage).transpose()?.flatten();
     let unified = parsed_sand
         .as_ref()
         .is_some_and(|parsed| sand_replaces_cursor_tracks(&plan_info, parsed));
@@ -657,9 +660,13 @@ async fn refreshed_bearer(
 }
 
 async fn refresh_access_token(refresh_token: &str) -> Result<RefreshedCursorAuth> {
+    refresh_access_token_at(REFRESH_URL, refresh_token).await
+}
+
+async fn refresh_access_token_at(url: &str, refresh_token: &str) -> Result<RefreshedCursorAuth> {
     let client = plan_http_client()?;
     let response = client
-        .post(REFRESH_URL)
+        .post(url)
         .header("Content-Type", "application/json")
         .json(&serde_json::json!({
             "grant_type": "refresh_token",
@@ -698,9 +705,11 @@ async fn refresh_access_token(refresh_token: &str) -> Result<RefreshedCursorAuth
         .map(str::trim)
         .filter(|token| access_token_usable(token))
         .map(str::to_string)
-        // Cursor currently rotates the returned access JWT into the next
-        // refresh grant when no separate refresh_token field is sent.
-        .unwrap_or_else(|| access.clone());
+        // A response that omits refresh_token leaves the original grant
+        // valid: at this PR's head both usage workers reused the stored
+        // grant on every run, so it is not single-use. Substituting the
+        // access JWT would break every refresh after the first rotation.
+        .unwrap_or_else(|| refresh_token.to_string());
     Ok(RefreshedCursorAuth {
         access_token: access,
         refresh_token: refresh,
@@ -1029,6 +1038,19 @@ mod tests {
     }
 
     #[test]
+    fn malformed_eligible_sand_response_errors_instead_of_stale_tracks() {
+        let usage = json!({
+            "billingCycleEnd": "2026-11-01T00:00:00Z",
+            "planUsage": { "autoPercentUsed": 4.0, "apiPercentUsed": 64.0 }
+        });
+        // Eligible account, but the promised percentage is missing: this is
+        // a schema/auth failure, and the stale invoice-cycle tracks must not
+        // be presented as the unified account's current usage.
+        let sand = json!({ "hasNonZeroIncludedLimit": true });
+        assert!(map_cursor_metrics(&usage, None, Some(&sand)).is_err());
+    }
+
+    #[test]
     fn monthly_plan_keeps_distinct_grok_bot_pool() {
         let plan = json!({
             "planInfo": { "includedUsagePeriod": "INCLUDED_USAGE_PERIOD_MONTHLY" }
@@ -1296,6 +1318,52 @@ mod tests {
                 .expect("cached successor");
             assert_eq!(bearer, successor);
         }
+    }
+
+    #[test]
+    fn omitted_refresh_token_preserves_the_original_grant() {
+        let next_access =
+            auth_with_subject(Some(5_000_000_000), "auth0|account-a", None, None).access_token;
+        let body = serde_json::json!({ "access_token": next_access }).to_string();
+        let (base, _log) = spawn_server(move |_, _| (200, body.clone()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let refreshed = runtime
+            .block_on(refresh_access_token_at(
+                &format!("{base}/oauth/token"),
+                "original-grant",
+            ))
+            .expect("refresh succeeds");
+        assert_eq!(refreshed.access_token, next_access);
+        assert_eq!(refreshed.refresh_token, "original-grant");
+    }
+
+    #[test]
+    fn returned_refresh_token_supersedes_the_original_grant() {
+        let next_access =
+            auth_with_subject(Some(5_000_000_000), "auth0|account-a", None, None).access_token;
+        let next_refresh =
+            auth_with_subject(Some(6_000_000_000), "auth0|account-a", None, None).access_token;
+        let body = serde_json::json!({
+            "access_token": next_access,
+            "refresh_token": next_refresh
+        })
+        .to_string();
+        let (base, _log) = spawn_server(move |_, _| (200, body.clone()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let refreshed = runtime
+            .block_on(refresh_access_token_at(
+                &format!("{base}/oauth/token"),
+                "original-grant",
+            ))
+            .expect("refresh succeeds");
+        assert_eq!(refreshed.access_token, next_access);
+        assert_eq!(refreshed.refresh_token, next_refresh);
     }
 
     #[test]
