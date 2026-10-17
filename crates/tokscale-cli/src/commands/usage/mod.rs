@@ -210,7 +210,7 @@ impl UsageFetchDiagnostic {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct UsageFetchReport {
     pub outputs: Vec<UsageOutput>,
     pub diagnostics: Vec<UsageFetchDiagnostic>,
@@ -363,13 +363,19 @@ pub fn load_cache() -> Option<Vec<UsageOutput>> {
 enum Fetch {
     Single(fn() -> Result<UsageOutput>),
     Multi(fn() -> Result<Vec<UsageOutput>>),
+    Report(fn() -> Result<UsageFetchReport>),
 }
 
 impl Fetch {
-    fn call(self) -> Result<Vec<UsageOutput>> {
+    fn call(self, provider: &'static str) -> UsageFetchReport {
         match self {
-            Fetch::Single(fetch) => fetch().map(|output| vec![output]),
-            Fetch::Multi(fetch) => fetch(),
+            Fetch::Single(fetch) => {
+                fetch_provider_report(provider, fetch().map(|output| vec![output]))
+            }
+            Fetch::Multi(fetch) => fetch_provider_report(provider, fetch()),
+            Fetch::Report(fetch) => {
+                fetch().unwrap_or_else(|error| UsageFetchReport::from_error(provider, None, error))
+            }
         }
     }
 }
@@ -429,7 +435,7 @@ fn usage_providers(codex_fetch: Fetch) -> Vec<UsageProvider> {
             cursor::has_grok_bot_credentials,
             // One card per Cursor account signed into Grok Bot.app when the
             // local sand-secrets store decrypts; otherwise Cursor desktop auth.
-            Fetch::Multi(cursor::fetch_grok_bot_all),
+            Fetch::Report(cursor::fetch_grok_bot_report),
         ),
         (
             "grok",
@@ -572,7 +578,7 @@ fn fetch_all_report_from_providers(
                 let handle = if provider == "Codex" {
                     scope.spawn(codex_fetch)
                 } else {
-                    scope.spawn(move || fetch_provider_report(provider, fetch.call()))
+                    scope.spawn(move || fetch.call(provider))
                 };
                 (provider, handle)
             })
@@ -679,10 +685,18 @@ fn render_light(output: &UsageOutput) {
 /// use exactly this, so the two cannot drift apart.
 pub fn usage_json() -> Result<String> {
     let report = fetch_all_report_with_intent(UsageFetchIntent::CliReadOnly);
-    Ok(serde_json::to_string_pretty(&report.outputs)?)
+    serialize_usage_json(&report, false)
 }
 
-pub fn run(json: bool, _light: bool, debug: bool) -> Result<()> {
+fn serialize_usage_json(report: &UsageFetchReport, detailed: bool) -> Result<String> {
+    if detailed {
+        Ok(serde_json::to_string_pretty(report)?)
+    } else {
+        Ok(serde_json::to_string_pretty(&report.outputs)?)
+    }
+}
+
+pub fn run(json: bool, json_report: bool, _light: bool, debug: bool) -> Result<()> {
     if debug {
         // Log to stderr so `--json` stdout stays pure JSON for downstream
         // consumers (see the note in the json branch below).
@@ -691,10 +705,11 @@ pub fn run(json: bool, _light: bool, debug: bool) -> Result<()> {
             .with_writer(std::io::stderr)
             .try_init();
     }
-    if json {
+    if json || json_report {
         // Keep stdout pure JSON: do NOT emit provider warnings here, since they
         // would corrupt downstream `--json` consumers that read stderr too.
-        println!("{}", usage_json()?);
+        let report = fetch_all_report_with_intent(UsageFetchIntent::CliReadOnly);
+        println!("{}", serialize_usage_json(&report, json_report)?);
         return Ok(());
     }
     let report = fetch_all_report_with_intent(UsageFetchIntent::CliReadOnly);
@@ -749,6 +764,48 @@ mod tests {
                 "stale diagnostic",
             )],
         }
+    }
+
+    #[test]
+    fn report_provider_preserves_partial_failures_in_detailed_json() {
+        let report = fetch_all_report_from_providers(
+            vec![(
+                "copilot",
+                "Copilot",
+                || true,
+                Fetch::Report(|| Ok(copilot_report_fetch())),
+            )],
+            &std::collections::HashSet::new(),
+            empty_codex_fetch,
+        );
+        let detailed: serde_json::Value =
+            serde_json::from_str(&serialize_usage_json(&report, true).unwrap()).unwrap();
+        assert_eq!(detailed["outputs"].as_array().unwrap().len(), 1);
+        assert_eq!(detailed["diagnostics"][0]["message"], "stale diagnostic");
+        let legacy: serde_json::Value =
+            serde_json::from_str(&serialize_usage_json(&report, false).unwrap()).unwrap();
+        assert!(legacy.is_array());
+        assert_eq!(legacy, detailed["outputs"]);
+    }
+
+    #[test]
+    fn no_credentials_is_distinct_from_a_failed_report() {
+        let fetch = Fetch::Report(|| Err(anyhow::anyhow!("HTTP 401")));
+        let absent = fetch_all_report_from_providers(
+            vec![("grok-bot", "Grok Bot", || false, fetch)],
+            &std::collections::HashSet::new(),
+            empty_codex_fetch,
+        );
+        assert!(absent.outputs.is_empty());
+        assert!(absent.diagnostics.is_empty());
+        let failed = fetch_all_report_from_providers(
+            vec![("grok-bot", "Grok Bot", || true, fetch)],
+            &std::collections::HashSet::new(),
+            empty_codex_fetch,
+        );
+        assert!(failed.outputs.is_empty());
+        assert_eq!(failed.diagnostics.len(), 1);
+        assert_eq!(failed.diagnostics[0].message, "HTTP 401");
     }
 
     #[test]

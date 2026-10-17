@@ -261,10 +261,19 @@ pub fn run(json: bool, since: Option<DateTime<Utc>>) -> Result<()> {
         since.is_none_or(|s| s <= now),
         "--since must not be in the future"
     );
-    let cards = cursor::fetch_grok_bot_all();
+    let cards = cursor::fetch_grok_bot_report();
     let mut diagnostics = vec![];
     let cards = match cards {
-        Ok(cards) => cards,
+        Ok(report) => {
+            diagnostics.extend(report.diagnostics.iter().map(|diagnostic| {
+                format!(
+                    "Weekly quota unavailable for {}: {}",
+                    diagnostic.display_name(),
+                    diagnostic.message
+                )
+            }));
+            report.outputs
+        }
         Err(e) => {
             diagnostics.push(format!("Weekly quota unavailable: {e}"));
             vec![]

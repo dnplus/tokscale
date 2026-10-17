@@ -877,12 +877,17 @@ tokscale report --workspace my-project --client opencode
 
 Tokscale can fetch and display your real-time subscription quota across AI providers. This shows how much of your plan you've used and when limits reset.
 
+`--json-report` returns `{ "outputs": [...], "diagnostics": [...] }`. A failed Grok Bot account appears in diagnostics even when another account succeeds. Providers without detected credentials are skipped. `--json` and automatic quota uploads keep their existing array format.
+
 ```bash
 # Show subscription usage for all detected providers
 tokscale usage
 
 # Output as JSON (for scripting)
 tokscale usage --json
+
+# Include per-account fetch errors alongside successful results
+tokscale usage --json-report
 
 # Lightweight terminal output (no TUI)
 tokscale usage --light
