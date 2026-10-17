@@ -197,6 +197,7 @@ jobs:
       - name: Verify coverage
         run: |
           cargo tarpaulin \
+            --engine llvm \
             --workspace \
             --all-features \
             --out Xml Json \
@@ -247,6 +248,7 @@ jobs:
       - name: Generate coverage report
         run: |
           cargo tarpaulin \
+            --engine llvm \
             --workspace \
             --all-features \
             --out Xml Json \
