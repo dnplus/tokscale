@@ -107,42 +107,6 @@ fn summarize(events: &[CursorUsageRecord], now: DateTime<Utc>, start: DateTime<U
     result
 }
 
-#[derive(Debug, Serialize)]
-struct BurnRate {
-    percent_per_hour: f64,
-    exhausted_at: DateTime<Utc>,
-    before_reset: bool,
-    hours_before_reset: f64,
-    remaining_at_reset_percent: f64,
-}
-
-fn estimate(
-    data: &Breakdown,
-    now: DateTime<Utc>,
-    reset: Option<DateTime<Utc>>,
-    used: Option<f64>,
-) -> Option<BurnRate> {
-    let reset = reset.filter(|reset| *reset > now)?;
-    let used = used.filter(|v| v.is_finite() && *v > 0.0)?;
-    if data.cost_week_usd <= 0.0 || data.cost_24h_usd <= 0.0 {
-        return None;
-    }
-    let rate = used * (data.cost_24h_usd / data.cost_week_usd) / 24.0;
-    let hours = (100.0 - used).max(0.0) / rate;
-    if !rate.is_finite() || rate <= 0.0 || !hours.is_finite() {
-        return None;
-    }
-    let exhausted_at = now.checked_add_signed(Duration::try_seconds((hours * 3600.0) as i64)?)?;
-    let until_reset = (reset - now).num_seconds() as f64 / 3600.0;
-    Some(BurnRate {
-        percent_per_hour: rate,
-        exhausted_at,
-        before_reset: exhausted_at < reset,
-        hours_before_reset: (until_reset - hours).max(0.0),
-        remaining_at_reset_percent: (100.0 - used - rate * until_reset).max(0.0),
-    })
-}
-
 #[derive(Serialize)]
 struct AccountReport {
     cache_account_id: Option<String>,
@@ -151,7 +115,8 @@ struct AccountReport {
     week_start: DateTime<Utc>,
     reset_at: Option<DateTime<Utc>>,
     breakdown: Option<Breakdown>,
-    burn_rate: Option<BurnRate>,
+    burn_rate: Option<()>,
+    burn_rate_unavailable_reason: &'static str,
 }
 
 fn weekly(card: &UsageOutput) -> Option<&UsageMetric> {
@@ -175,9 +140,6 @@ fn report(
         .map(|r| r - Duration::days(7))
         .unwrap_or_else(|| since.unwrap_or(now - Duration::days(7)));
     let data = events.map(|e| summarize(e, now, start));
-    let burn = data
-        .as_ref()
-        .and_then(|d| estimate(d, now, valid_reset, metric.map(|m| m.used_percent)));
     let status = if events.is_none() {
         "This account has no local Cursor usage cache"
     } else if card.is_none() {
@@ -194,7 +156,8 @@ fn report(
         week_start: start,
         reset_at: reset,
         breakdown: data,
-        burn_rate: burn,
+        burn_rate: None,
+        burn_rate_unavailable_reason: "Quota pool scope and consumption history are unavailable; Bot event costs cannot predict shared quota exhaustion",
     }
 }
 
@@ -425,24 +388,8 @@ fn render(account: &AccountReport) {
         data.missing_token_usage_calls
     );
     print!("  Last 24h: ${:.2}", data.cost_24h_usd);
-    match &account.burn_rate {
-        Some(burn) => {
-            print!(
-                " ({:.3}%/h) → estimated exhaustion {}",
-                burn.percent_per_hour,
-                display_time(burn.exhausted_at)
-            );
-            if burn.before_reset {
-                println!("; before reset ({:.1}h early)", burn.hours_before_reset);
-            } else {
-                println!(
-                    "; lasts until reset ({:.1}% remaining at reset)",
-                    burn.remaining_at_reset_percent
-                );
-            }
-        }
-        None => println!("; cannot estimate quota %/h or exhaustion"),
-    }
+    println!("; cannot estimate quota exhaustion");
+    println!("  {}", account.burn_rate_unavailable_reason);
     println!(
         "  Non-Grok Bot Cursor usage (excluded): {} calls / ${:.2}",
         data.excluded_calls, data.excluded_cost_usd
@@ -643,31 +590,37 @@ mod tests {
     }
 
     #[test]
-    fn burn_rate_before_after_reset_and_unavailable() {
-        let now = time("2026-10-08T00:00:00Z");
-        let data = Breakdown {
-            rows: vec![],
-            calls: 1,
-            cost_week_usd: 100.0,
-            cost_24h_usd: 24.0,
-            tokens: TokenBreakdown::default(),
-            missing_token_usage_calls: 0,
-            excluded_calls: 0,
-            excluded_cost_usd: 0.0,
-        };
-        let burn = estimate(&data, now, Some(now + Duration::hours(48)), Some(80.0)).unwrap();
-        assert!((burn.percent_per_hour - 0.8).abs() < 1e-9);
-        assert_eq!(burn.exhausted_at, now + Duration::hours(25));
-        assert!(burn.before_reset);
-        assert!((burn.hours_before_reset - 23.0).abs() < 1e-9);
-        let burn = estimate(&data, now, Some(now + Duration::hours(10)), Some(80.0)).unwrap();
-        assert!(!burn.before_reset);
-        assert!((burn.remaining_at_reset_percent - 12.0).abs() < 1e-9);
-        assert!(estimate(&data, now, None, Some(80.0)).is_none());
-        assert!(estimate(&data, now, Some(now), Some(80.0)).is_none());
-        assert!(estimate(&data, now, Some(now + Duration::days(1)), Some(f64::NAN)).is_none());
-        let empty = summarize(&[], now, now - Duration::days(7));
-        assert!(estimate(&empty, now, Some(now + Duration::days(1)), Some(80.0)).is_none());
+    fn bot_costs_do_not_predict_shared_quota_exhaustion() {
+        let now = time("2026-10-08T06:00:00Z");
+        let records = parse_cursor_usage_records(
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../tokscale-core/tests/fixtures/grok_bot_usage.json"
+            )),
+            "synthetic",
+        );
+        let card: UsageOutput = serde_json::from_value(serde_json::json!({
+            "provider": "Grok Bot", "plan": null, "email": null,
+            "metrics": [{"label": "Weekly", "used_percent": 80.0, "remaining_percent": 20.0,
+                "remaining_label": null, "resets_at": (now + Duration::days(3)).to_rfc3339()}]
+        }))
+        .unwrap();
+        let result = report(
+            Some("synthetic".into()),
+            Some(card),
+            Some(&records),
+            now,
+            None,
+        );
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json["burn_rate"].is_null());
+        assert!(json["burn_rate_unavailable_reason"]
+            .as_str()
+            .unwrap()
+            .contains("pool scope"));
+        assert_eq!(json["quota"]["metrics"][0]["used_percent"], 80.0);
+        assert_eq!(json["breakdown"]["cost_week_usd"], 5.5);
+        assert!(json["breakdown"]["cost_24h_usd"].as_f64().unwrap() > 0.0);
     }
 
     #[test]
