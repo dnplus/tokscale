@@ -162,12 +162,6 @@ struct CursorUsageEvent {
         deserialize_with = "de_opt_f64_lenient"
     )]
     charged_cents: Option<f64>,
-    #[serde(
-        rename = "cursorTokenFee",
-        default,
-        deserialize_with = "de_opt_f64_lenient"
-    )]
-    cursor_token_fee: Option<f64>,
     #[serde(rename = "tokenUsage", default)]
     token_usage: Option<CursorTokenUsage>,
     #[serde(
@@ -494,7 +488,6 @@ pub struct CursorUsageRecord {
     pub has_token_usage: bool,
     pub metered_cost_usd: Option<f64>,
     pub charged_cost_usd: Option<f64>,
-    pub cursor_token_fee_usd: Option<f64>,
     pub automation_id: Option<String>,
 }
 
@@ -551,11 +544,17 @@ pub fn parse_cursor_usage_records(content: &str, account_id: &str) -> Vec<Cursor
         let default_usage = CursorTokenUsage::default();
         let token_usage = event.token_usage.as_ref().unwrap_or(&default_usage);
 
+        // Cursor reports two different amounts. `tokenUsage.totalCents` is the
+        // metered cost of the event's own tokens; `chargedCents` is what the
+        // wallet was debited. They agree whenever the user pays, and diverge
+        // exactly on plan-included / free-credit rows, where nothing is billed
+        // but the usage still cost something. Prefer the metered figure so those
+        // rows keep Cursor's own number instead of falling through to local
+        // pricing, which refuses the router labels `auto`/`agent_review` (#1062)
+        // and would drop them into the unpriced bucket at $0.00.
         let metered_cost_usd =
             finite_non_negative_cents(token_usage.total_cents).map(|c| c / 100.0);
         let charged_cost_usd = finite_non_negative_cents(event.charged_cents).map(|c| c / 100.0);
-        let cursor_token_fee_usd =
-            finite_non_negative_cents(event.cursor_token_fee).map(|c| c / 100.0);
         let cost = metered_cost_usd.or(charged_cost_usd);
 
         let mut message = UnifiedMessage::new(
@@ -575,7 +574,6 @@ pub fn parse_cursor_usage_records(content: &str, account_id: &str) -> Vec<Cursor
             has_token_usage,
             metered_cost_usd,
             charged_cost_usd,
-            cursor_token_fee_usd,
             automation_id: event.automation_id,
         });
     }
@@ -1473,7 +1471,7 @@ mod grok_bot_tests {
     }
 
     #[test]
-    fn cursor_records_preserve_metered_charged_and_fee_amounts() {
+    fn cursor_records_preserve_metered_and_charged_amounts() {
         let content = json!({"usageEventsDisplay": [
             {"timestamp": 1791417600000_i64, "model": "auto", "tokenUsage": {"totalCents": 25}, "chargedCents": 0},
             {"timestamp": 1791417600000_i64, "model": "auto", "tokenUsage": {"totalCents": "20"}, "chargedCents": "21.5", "cursorTokenFee": "1.5"},
@@ -1482,15 +1480,12 @@ mod grok_bot_tests {
         let records = parse_cursor_usage_records(&content, "work");
         assert_eq!(records[0].metered_cost_usd, Some(0.25));
         assert_eq!(records[0].charged_cost_usd, Some(0.0));
-        assert_eq!(records[0].cursor_token_fee_usd, None);
         assert_eq!(records[0].message.cost, 0.25);
         assert_eq!(records[1].metered_cost_usd, Some(0.20));
         assert_eq!(records[1].charged_cost_usd, Some(0.215));
-        assert_eq!(records[1].cursor_token_fee_usd, Some(0.015));
         assert_eq!(records[1].message.cost, 0.20);
         assert_eq!(records[2].metered_cost_usd, None);
         assert_eq!(records[2].charged_cost_usd, Some(0.1));
-        assert_eq!(records[2].cursor_token_fee_usd, None);
         assert_eq!(records[2].message.cost, 0.1);
     }
 

@@ -41,22 +41,19 @@ impl ReportedAmount {
 struct CostBreakdown {
     metered: ReportedAmount,
     charged: ReportedAmount,
-    cursor_token_fee: ReportedAmount,
 }
 
 impl CostBreakdown {
     fn add(&mut self, record: &CursorUsageRecord) {
         self.metered.add(record.metered_cost_usd);
         self.charged.add(record.charged_cost_usd);
-        self.cursor_token_fee.add(record.cursor_token_fee_usd);
     }
 
     fn render(&self, calls: usize) {
         println!(
-            "    Metered: {}; wallet charge: {}; Cursor token fee: {}",
+            "    Metered: {}; wallet charge: {}",
             self.metered.display(calls),
-            self.charged.display(calls),
-            self.cursor_token_fee.display(calls)
+            self.charged.display(calls)
         );
     }
 }
@@ -489,7 +486,7 @@ fn render(account: &AccountReport) {
         data.missing_token_usage_calls
     );
     data.cost_breakdown.render(data.calls);
-    println!("  Cost USD uses metered cost, or wallet charge when metered cost is unavailable; fees are not added again.");
+    println!("  Cost USD uses metered cost, or wallet charge when metered cost is unavailable.");
     print!("  Last 24h: ${:.2}", data.cost_24h_usd);
     println!("; cannot estimate quota exhaustion");
     println!("  {}", account.burn_rate_unavailable_reason);
@@ -548,11 +545,11 @@ mod tests {
     }
 
     #[test]
-    fn cost_breakdown_preserves_zero_unknown_and_fee_without_double_counting() {
+    fn cost_breakdown_preserves_zero_and_unknown_amounts() {
         let now = time("2026-10-08T06:00:00Z");
         let rows: Vec<_> = [
             serde_json::json!({"totalCents": 25, "charged": 0}),
-            serde_json::json!({"totalCents": 20, "charged": 21.5, "fee": 1.5}),
+            serde_json::json!({"totalCents": 20, "charged": 21.5}),
             serde_json::json!({}),
         ]
         .into_iter()
@@ -561,7 +558,7 @@ mod tests {
                 "timestamp": now.timestamp_millis(), "model": "grok-bot-default",
                 "conversationId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
                 "tokenUsage": {"totalCents": amounts["totalCents"]},
-                "chargedCents": amounts["charged"], "cursorTokenFee": amounts["fee"],
+                "chargedCents": amounts["charged"],
             })
         })
         .collect();
@@ -575,14 +572,7 @@ mod tests {
         assert_eq!(json["cost_breakdown"]["metered"]["known_usd"], 0.45);
         assert_eq!(json["cost_breakdown"]["charged"]["known_usd"], 0.215);
         assert_eq!(json["cost_breakdown"]["charged"]["reported_calls"], 2);
-        assert_eq!(
-            json["cost_breakdown"]["cursor_token_fee"]["known_usd"],
-            0.015
-        );
-        assert_eq!(
-            json["cost_breakdown"]["cursor_token_fee"]["reported_calls"],
-            1
-        );
+        assert!(json["cost_breakdown"].get("cursor_token_fee").is_none());
         assert_eq!(json["rows"][0]["cost_breakdown"], json["cost_breakdown"]);
         assert_eq!(ReportedAmount::default().display(3), "unknown");
         assert_eq!(data.cost_breakdown.charged.display(3), "$0.21 (2/3 calls)");

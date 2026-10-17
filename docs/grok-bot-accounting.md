@@ -26,9 +26,9 @@ The existing `usage --bots` command is a separate quota-oriented report and stil
 
 ## Reported monetary amounts
 
-`usage --bots` retains the provider's metered token cost, wallet charge, and Cursor token fee separately when those fields are present. Each `cost_breakdown` amount has a `known_usd` sum and `reported_calls` count. A count of zero means unknown, not a free event. A smaller count than `calls` means the sum covers only part of the report.
+`usage --bots` retains the provider's metered token cost and wallet charge separately when those fields are present. Each `cost_breakdown` amount has a `known_usd` sum and `reported_calls` count. A count of zero means unknown, not a free event. A smaller count than `calls` means the sum covers only part of the report.
 
-The existing `cost_usd`, weekly cost, and share fields keep their original accounting rule: prefer metered cost and fall back to wallet charge. The token fee is a separate reported component and is never added to the wallet charge again. Included usage can have nonzero metered cost with a zero wallet charge. This local report does not change submitted cost totals or claim that every Cursor endpoint exposes fees.
+The existing `cost_usd`, weekly cost, and share fields keep their original accounting rule: prefer metered cost and fall back to wallet charge. `cursorTokenFee` is not reported: every observed event carried `0`, so its unit (cents or dollars) is unverified, and a guessed unit could misstate the fee by 100x. Included usage can have nonzero metered cost with a zero wallet charge. This local report does not change submitted cost totals.
 
 ## Quota forecasts
 
