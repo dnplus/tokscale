@@ -125,13 +125,13 @@ jobs:
     name: Tests
     runs-on: ${{ matrix.os }}
     strategy:
-      # Both platforms must report. Cancelling the Windows leg the moment
+      # All platforms must report. Cancelling the Windows leg the moment
       # Ubuntu fails (or vice versa) would hide whether a failure is
       # cross-platform or platform-specific - the single most useful bit of
       # information when triaging.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-26]
 
     steps:
       - name: Checkout repository

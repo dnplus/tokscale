@@ -1,6 +1,16 @@
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Duration, Local, Utc};
 
+pub(super) fn http_client() -> Result<reqwest::Client> {
+    http_client_with_timeout(std::time::Duration::from_secs(30))
+}
+
+fn http_client_with_timeout(timeout: std::time::Duration) -> Result<reqwest::Client> {
+    Ok(tokscale_core::http::client_builder()
+        .timeout(timeout)
+        .build()?)
+}
+
 pub fn capitalize(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
@@ -212,6 +222,107 @@ pub fn atomic_write_secret(path: &std::path::Path, data: &[u8]) -> std::io::Resu
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::time::Duration as StdDuration;
+
+    struct StalledServer {
+        addr: std::net::SocketAddr,
+        release: Option<mpsc::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl StalledServer {
+        fn start(body: bool) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (release, released) = mpsc::channel();
+            let (ready, observed) = tokio::sync::oneshot::channel();
+            let thread = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(StdDuration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while stream.read_exact(&mut byte).is_ok() {
+                    request.push(byte[0]);
+                    if request.ends_with(b"\r\n\r\n") {
+                        if body {
+                            stream
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n{")
+                                .unwrap();
+                            stream.flush().unwrap();
+                        }
+                        let _ = ready.send(());
+                        let _ = released.recv();
+                        return;
+                    }
+                }
+            });
+            (
+                Self {
+                    addr,
+                    release: Some(release),
+                    thread: Some(thread),
+                },
+                observed,
+            )
+        }
+    }
+
+    impl Drop for StalledServer {
+        fn drop(&mut self) {
+            self.release.take();
+            // Wake accept if the client failed before establishing a connection.
+            let _ = TcpStream::connect(self.addr);
+            self.thread.take().unwrap().join().unwrap();
+        }
+    }
+
+    async fn assert_usage_request_times_out(body: bool) {
+        let (server, observed) = StalledServer::start(body);
+        let client = super::http_client_with_timeout(StdDuration::from_millis(100)).unwrap();
+        let url = format!("http://{}/", server.addr);
+        let request = async {
+            let response = client.get(url).send().await?;
+            response.text().await
+        };
+        let (observed, result) = tokio::join!(
+            tokio::time::timeout(StdDuration::from_secs(2), observed),
+            tokio::time::timeout(StdDuration::from_secs(2), request),
+        );
+        observed.expect("fixture must observe the request").unwrap();
+        let error = result
+            .expect("usage client must time out before the outer watchdog")
+            .expect_err("stalled response must fail");
+        assert!(
+            error.is_timeout(),
+            "expected a reqwest timeout, got {error}"
+        );
+    }
+
+    #[test]
+    fn usage_http_timeout_defaults_to_thirty_seconds() {
+        let client = super::http_client().unwrap();
+        let rendered = format!("{client:?}");
+        assert!(
+            rendered.contains("TotalTimeout: 30s"),
+            "usage client must configure a 30 second request deadline, got {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_http_timeout_bounds_stalled_headers() {
+        assert_usage_request_times_out(false).await;
+    }
+
+    #[tokio::test]
+    async fn usage_http_timeout_bounds_stalled_body() {
+        assert_usage_request_times_out(true).await;
+    }
+
     use super::*;
 
     fn utc(value: &str) -> DateTime<Utc> {
