@@ -7,7 +7,7 @@ use anyhow::Result;
 use chrono::{TimeZone, Utc};
 use serde_json::Value;
 
-use super::{UsageMetric, UsageOutput};
+use super::{UsageFetchReport, UsageMetric, UsageOutput};
 
 const SUBSCRIPTIONS_URL: &str = "https://grok.com/rest/subscriptions";
 const TASK_USAGE_URL: &str = "https://grok.com/rest/tasks/usage";
@@ -810,13 +810,32 @@ fn usage_output(
     }
 }
 
-pub fn fetch() -> Result<UsageOutput> {
+pub fn fetch() -> Result<UsageFetchReport> {
     let credentials = read_credentials()?;
+    fetch_with(&credentials, fetch_network_usage, fetch_agent_billing)
+}
+
+fn fetch_with(
+    credentials: &[Credentials],
+    fetch_network: impl FnMut(&Credentials) -> Result<UsageOutput>,
+    fetch_agent: impl FnMut(Duration) -> Option<Value>,
+) -> Result<UsageFetchReport> {
+    fetch_output_with(credentials, fetch_network, fetch_agent).map(|output| UsageFetchReport {
+        outputs: vec![output],
+        diagnostics: Vec::new(),
+    })
+}
+
+fn fetch_output_with(
+    credentials: &[Credentials],
+    mut fetch_network: impl FnMut(&Credentials) -> Result<UsageOutput>,
+    mut fetch_agent: impl FnMut(Duration) -> Option<Value>,
+) -> Result<UsageOutput> {
     let mut errors = Vec::new();
     let mut plan_only: Option<UsageOutput> = None;
 
     for (index, credential) in credentials.iter().enumerate() {
-        match fetch_network_usage(credential) {
+        match fetch_network(credential) {
             Ok(output) if !output.metrics.is_empty() => return Ok(output),
             Ok(output) => {
                 if plan_only.is_none() {
@@ -834,7 +853,7 @@ pub fn fetch() -> Result<UsageOutput> {
     if credentials.len() > 1 {
         errors
             .push("Grok agent billing fallback skipped: multiple credentials present".to_string());
-    } else if let Some(billing) = fetch_agent_billing(Duration::from_secs(4)) {
+    } else if let Some(billing) = fetch_agent(Duration::from_secs(4)) {
         let mut metrics = Vec::new();
         if let Some(metric) = parse_billing_json_metric(&billing) {
             metrics.push(metric);
@@ -873,6 +892,157 @@ pub fn fetch() -> Result<UsageOutput> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_credentials(token: &str) -> Credentials {
+        Credentials {
+            token: token.into(),
+            email: Some(format!("{token}@fixture.invalid")),
+        }
+    }
+
+    fn fixture_output(credentials: &Credentials, quota: bool) -> UsageOutput {
+        usage_output(
+            Some("SuperGrok".into()),
+            credentials.email.clone(),
+            if quota {
+                vec![parse_proxy_weekly_metric(&serde_json::json!({
+                    "config": { "creditUsagePercent": 25 }
+                }))
+                .unwrap()]
+            } else {
+                Vec::new()
+            },
+        )
+    }
+
+    fn fixture_agent_billing() -> Value {
+        serde_json::json!({ "usedPercent": 75 })
+    }
+
+    #[test]
+    fn http_only_unavailable_never_uses_agent_quota() {
+        let calls = std::cell::Cell::new(0);
+        let result = fetch_with(
+            &[fixture_credentials("first")],
+            |_| anyhow::bail!("HTTP fixture unavailable"),
+            |_| {
+                calls.set(calls.get() + 1);
+                Some(fixture_agent_billing())
+            },
+        );
+        assert_eq!(calls.get(), 0, "quota refresh must not launch an agent");
+        let report = result.expect("unavailable quota is a diagnostic report");
+        assert!(report.outputs.is_empty());
+        assert_eq!(report.diagnostics.len(), 1);
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(
+            diagnostic.kind,
+            super::super::UsageFetchDiagnosticKind::FetchFailed
+        );
+        assert_eq!(
+            diagnostic.severity,
+            super::super::UsageFetchDiagnosticSeverity::Error
+        );
+        assert!(diagnostic.message.contains("Grok quota unavailable"));
+        assert!(diagnostic.message.contains("HTTP fixture unavailable"));
+        assert!(diagnostic.message.contains("documented quota-only surface"));
+    }
+
+    #[test]
+    fn http_only_plan_retains_unknown_quota_with_warning() {
+        let calls = std::cell::Cell::new(0);
+        let report = fetch_with(
+            &[fixture_credentials("first")],
+            |credential| Ok(fixture_output(credential, false)),
+            |_| {
+                calls.set(calls.get() + 1);
+                Some(fixture_agent_billing())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 0, "plan-only refresh must not launch an agent");
+        assert_eq!(report.outputs.len(), 1);
+        let output = &report.outputs[0];
+        assert_eq!(output.plan.as_deref(), Some("SuperGrok"));
+        assert_eq!(output.email.as_deref(), Some("first@fixture.invalid"));
+        assert!(output.metrics.is_empty(), "unknown quota must stay unknown");
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0].severity,
+            super::super::UsageFetchDiagnosticSeverity::Warning
+        );
+        assert!(report.diagnostics[0]
+            .message
+            .contains("Grok quota unavailable"));
+    }
+
+    #[test]
+    fn http_only_success_preserves_metrics_and_legacy_json() {
+        let report = fetch_with(
+            &[fixture_credentials("first")],
+            |credential| Ok(fixture_output(credential, true)),
+            |_| panic!("HTTP quota success must not call the agent"),
+        )
+        .unwrap();
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(report.outputs.len(), 1);
+        let output = &report.outputs[0];
+        assert_eq!(output.metrics[0].used_percent, 25.0);
+        assert_eq!(output.metrics[0].remaining_percent, 75.0);
+        let json = serde_json::to_value(output).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "provider": "Grok Build", "plan": "SuperGrok", "email": "first@fixture.invalid",
+                "metrics": [{ "label": "Weekly", "used_percent": 25.0, "remaining_percent": 75.0,
+                    "remaining_label": null, "resets_at": null }]
+            })
+        );
+    }
+
+    #[test]
+    fn http_only_candidates_keep_the_successful_identity() {
+        let mut attempted = Vec::new();
+        let report = fetch_with(
+            &[
+                fixture_credentials("first"),
+                fixture_credentials("second"),
+                fixture_credentials("third"),
+            ],
+            |credential| {
+                attempted.push(credential.token.clone());
+                Ok(fixture_output(credential, credential.token == "second"))
+            },
+            |_| panic!("multiple HTTP identities must not call the agent"),
+        )
+        .unwrap();
+        assert_eq!(attempted, ["first", "second"]);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(
+            report.outputs[0].email.as_deref(),
+            Some("second@fixture.invalid")
+        );
+        assert_eq!(report.outputs[0].metrics[0].used_percent, 25.0);
+    }
+
+    #[test]
+    fn http_only_all_candidate_failures_are_reported_without_tokens() {
+        let report = fetch_with(
+            &[
+                fixture_credentials("first-secret"),
+                fixture_credentials("second-secret"),
+            ],
+            |_| anyhow::bail!("HTTP fixture unavailable"),
+            |_| panic!("multiple HTTP identities must not call the agent"),
+        )
+        .expect("unavailable quota is a diagnostic report");
+        assert!(report.outputs.is_empty());
+        let message = &report.diagnostics[0].message;
+        assert!(message.contains("credential #1"));
+        assert!(message.contains("credential #2"));
+        assert!(!message.contains("first-secret"));
+        assert!(!message.contains("second-secret"));
+    }
 
     fn push_varint(mut value: u64, out: &mut Vec<u8>) {
         while value >= 0x80 {

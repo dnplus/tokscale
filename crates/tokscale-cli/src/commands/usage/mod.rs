@@ -448,7 +448,7 @@ fn usage_providers(codex_fetch: Fetch) -> Vec<UsageProvider> {
             "grok",
             "Grok",
             grok::has_credentials,
-            Fetch::Single(grok::fetch),
+            Fetch::Report(grok::fetch),
         ),
         (
             "kimi",
