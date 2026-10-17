@@ -161,30 +161,58 @@ fn report(
     }
 }
 
+/// Maps each usage cache id to the email tokscale saved for the account that
+/// owns it: `active` is `usage.json`, other accounts use their cache stem.
+fn cache_account_emails(
+    store: Option<&crate::cursor::CursorCredentialsStore>,
+) -> BTreeMap<String, String> {
+    let mut emails = BTreeMap::new();
+    let Some(store) = store else {
+        return emails;
+    };
+    for (id, account) in &store.accounts {
+        let Some(email) = account.email.as_deref().filter(|e| !e.trim().is_empty()) else {
+            continue;
+        };
+        emails.insert(crate::cursor::cursor_account_cache_stem(id), email.into());
+        if id == &store.active_account_id {
+            emails.insert("active".into(), email.into());
+        }
+    }
+    emails
+}
+
+/// Pairs each quota card with the cache whose saved account email matches.
+/// The desktop email only stands in for `active` when tokscale saved none.
 fn account_reports(
     cards: Vec<UsageOutput>,
     mut caches: BTreeMap<String, Vec<CursorUsageRecord>>,
-    email: Option<&str>,
+    saved_emails: &BTreeMap<String, String>,
+    desktop_email: Option<&str>,
     now: DateTime<Utc>,
     since: Option<DateTime<Utc>>,
 ) -> Vec<AccountReport> {
     let mut reports = vec![];
     for card in cards {
-        let matched = email
-            .zip(card.email.as_deref())
-            .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b));
-        let events = if matched {
-            caches.remove("active")
-        } else {
-            None
+        let same = |email: &str| {
+            card.email
+                .as_deref()
+                .is_some_and(|card| card.eq_ignore_ascii_case(email))
         };
-        reports.push(report(
-            events.as_ref().map(|_| "active".into()),
-            Some(card),
-            events.as_deref(),
-            now,
-            since,
-        ));
+        let active_email = saved_emails
+            .get("active")
+            .map(String::as_str)
+            .or(desktop_email);
+        let id = caches
+            .keys()
+            .filter(|id| match id.as_str() {
+                "active" => active_email.is_some_and(same),
+                id => saved_emails.get(id).is_some_and(|email| same(email)),
+            })
+            .min_by_key(|id| *id != "active")
+            .cloned();
+        let events = id.as_ref().and_then(|id| caches.remove(id));
+        reports.push(report(id, Some(card), events.as_deref(), now, since));
     }
     for (id, events) in caches {
         reports.push(report(Some(id), None, Some(&events), now, since));
@@ -242,7 +270,8 @@ pub fn run(json: bool, since: Option<DateTime<Utc>>) -> Result<()> {
             vec![]
         }
     };
-    let email = cursor::local_cursor_email();
+    let desktop_email = cursor::local_cursor_email();
+    let saved_emails = cache_account_emails(crate::cursor::load_credentials_store().as_ref());
     let mut caches = BTreeMap::new();
     let dir = crate::cursor::get_cursor_cache_dir()?;
     if dir.exists() {
@@ -282,7 +311,14 @@ pub fn run(json: bool, since: Option<DateTime<Utc>>) -> Result<()> {
             }
         }
     }
-    let mut reports = account_reports(cards, caches, email.as_deref(), now, since);
+    let mut reports = account_reports(
+        cards,
+        caches,
+        &saved_emails,
+        desktop_email.as_deref(),
+        now,
+        since,
+    );
     let alias_path = crate::paths::get_config_dir().join("grok-bot-aliases.json");
     match load_aliases(&alias_path) {
         Ok(aliases) => apply_aliases(&mut reports, &aliases),
@@ -499,6 +535,7 @@ mod tests {
         let mut reports = account_reports(
             vec![],
             BTreeMap::from([("active".into(), events)]),
+            &BTreeMap::new(),
             None,
             now,
             None,
@@ -649,6 +686,7 @@ mod tests {
         let results = account_reports(
             vec![card.clone()],
             caches,
+            &BTreeMap::new(),
             Some("SYNTHETIC@example.invalid"),
             now,
             Some(now - Duration::days(1)),
@@ -657,9 +695,135 @@ mod tests {
         assert_eq!(results[0].cache_account_id.as_deref(), Some("active"));
         assert_eq!(results[0].week_start, reset - Duration::days(7));
         assert!(results[1].quota.is_none());
-        let results = account_reports(vec![card], BTreeMap::new(), None, now, None);
+        let results = account_reports(
+            vec![card],
+            BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+            now,
+            None,
+        );
         assert!(results[0].breakdown.is_none());
         assert_eq!(results[0].reset_at, Some(reset));
+    }
+
+    fn card(email: &str) -> UsageOutput {
+        serde_json::from_value(serde_json::json!({
+            "provider":"Grok Bot", "plan":null, "email":email, "metrics":[]
+        }))
+        .unwrap()
+    }
+
+    fn store(
+        active: &str,
+        accounts: &[(&str, Option<&str>)],
+    ) -> crate::cursor::CursorCredentialsStore {
+        crate::cursor::CursorCredentialsStore {
+            version: 1,
+            active_account_id: active.into(),
+            accounts: accounts
+                .iter()
+                .map(|(id, email)| {
+                    let credentials = crate::cursor::CursorCredentials {
+                        email: email.map(Into::into),
+                        ..Default::default()
+                    };
+                    (id.to_string(), credentials)
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn saved_emails_cover_active_and_per_account_caches() {
+        let store = store(
+            "synthetic-a",
+            &[
+                ("synthetic-a", Some("a@example.invalid")),
+                ("synthetic-b", Some("b@example.invalid")),
+                ("synthetic-c", None),
+            ],
+        );
+        let emails = cache_account_emails(Some(&store));
+        let stem = crate::cursor::cursor_account_cache_stem;
+        assert_eq!(
+            emails.get("active").map(String::as_str),
+            Some("a@example.invalid")
+        );
+        assert_eq!(
+            emails.get(&stem("synthetic-a")).map(String::as_str),
+            Some("a@example.invalid")
+        );
+        assert_eq!(
+            emails.get(&stem("synthetic-b")).map(String::as_str),
+            Some("b@example.invalid")
+        );
+        assert!(!emails.contains_key(&stem("synthetic-c")));
+        assert!(cache_account_emails(None).is_empty());
+    }
+
+    #[test]
+    fn per_account_cache_matches_card_by_saved_email() {
+        let now = time("2026-10-08T00:00:00Z");
+        let store = store(
+            "synthetic-a",
+            &[
+                ("synthetic-a", Some("a@example.invalid")),
+                ("synthetic-b", Some("B@example.invalid")),
+            ],
+        );
+        let secondary = crate::cursor::cursor_account_cache_stem("synthetic-b");
+        let caches = BTreeMap::from([("active".into(), vec![]), (secondary.clone(), vec![])]);
+        // The desktop is signed in to the second account; the saved email
+        // still decides which cache `usage.json` belongs to.
+        let results = account_reports(
+            vec![card("b@example.invalid"), card("a@example.invalid")],
+            caches,
+            &cache_account_emails(Some(&store)),
+            Some("b@example.invalid"),
+            now,
+            None,
+        );
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].cache_account_id.as_deref(),
+            Some(secondary.as_str())
+        );
+        assert_eq!(results[1].cache_account_id.as_deref(), Some("active"));
+        assert!(results
+            .iter()
+            .all(|r| r.quota.is_some() && r.breakdown.is_some()));
+    }
+
+    #[test]
+    fn desktop_email_only_maps_active_cache_without_saved_email() {
+        let now = time("2026-10-08T00:00:00Z");
+        let caches = || BTreeMap::from([("active".into(), vec![])]);
+        let unsaved = store("synthetic-a", &[("synthetic-a", None)]);
+        let results = account_reports(
+            vec![card("a@example.invalid")],
+            caches(),
+            &cache_account_emails(Some(&unsaved)),
+            Some("a@example.invalid"),
+            now,
+            None,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].cache_account_id.as_deref(), Some("active"));
+
+        let saved = store("synthetic-a", &[("synthetic-a", Some("a@example.invalid"))]);
+        let results = account_reports(
+            vec![card("b@example.invalid")],
+            caches(),
+            &cache_account_emails(Some(&saved)),
+            Some("b@example.invalid"),
+            now,
+            None,
+        );
+        assert_eq!(results.len(), 2);
+        assert!(results[0].breakdown.is_none());
+        assert_eq!(results[1].cache_account_id.as_deref(), Some("active"));
+        assert!(results[1].quota.is_none());
     }
 
     #[test]
