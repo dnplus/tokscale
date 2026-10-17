@@ -1,13 +1,13 @@
-use std::io::{BufRead, Write};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{TimeZone, Utc};
 use serde_json::Value;
 
-use super::{UsageFetchReport, UsageMetric, UsageOutput};
+use super::{
+    UsageFetchDiagnostic, UsageFetchDiagnosticKind, UsageFetchDiagnosticSeverity, UsageFetchReport,
+    UsageMetric, UsageOutput,
+};
 
 const SUBSCRIPTIONS_URL: &str = "https://grok.com/rest/subscriptions";
 const TASK_USAGE_URL: &str = "https://grok.com/rest/tasks/usage";
@@ -148,79 +148,6 @@ async fn fetch_billing_grpc(client: &reqwest::Client, token: &str) -> Result<Vec
     Ok(resp.bytes().await?.to_vec())
 }
 
-fn fetch_agent_billing(timeout: Duration) -> Option<Value> {
-    let mut child = Command::new("grok")
-        .args(["agent", "--no-leader", "stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    let stdout = child.stdout.take()?;
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let reader = std::io::BufReader::new(stdout);
-        for line in reader.lines().map_while(std::result::Result::ok) {
-            let _ = tx.send(line);
-        }
-    });
-
-    let result = (|| {
-        let stdin = child.stdin.as_mut()?;
-        let initialize = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "1",
-                "clientCapabilities": {
-                    "fs": { "readTextFile": false, "writeTextFile": false },
-                    "terminal": false
-                }
-            }
-        });
-        let billing = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "x.ai/billing",
-            "params": {}
-        });
-        writeln!(stdin, "{}", serde_json::to_string(&initialize).ok()?).ok()?;
-        writeln!(stdin, "{}", serde_json::to_string(&billing).ok()?).ok()?;
-        stdin.flush().ok()?;
-
-        let response = wait_for_rpc_response(&rx, 2, timeout)?;
-        if response.get("error").is_some() {
-            return None;
-        }
-        response.get("result").cloned()
-    })();
-
-    let _ = child.kill();
-    let _ = child.wait();
-
-    result
-}
-
-fn wait_for_rpc_response(
-    rx: &mpsc::Receiver<String>,
-    expected_id: i64,
-    timeout: Duration,
-) -> Option<Value> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let remaining = deadline.checked_duration_since(Instant::now())?;
-        let line = rx.recv_timeout(remaining).ok()?;
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if value.get("id").and_then(Value::as_i64) == Some(expected_id) {
-            return Some(value);
-        }
-    }
-}
-
 fn title_words(raw: &str) -> String {
     raw.replace(['_', '-'], " ")
         .split_whitespace()
@@ -314,63 +241,6 @@ fn cycle_label(start: Option<&str>, end: Option<&str>) -> String {
     } else {
         "Credits".into()
     }
-}
-
-fn parse_billing_json_metric(value: &Value) -> Option<UsageMetric> {
-    if let Some(metric) = parse_billing_json_object(value) {
-        return Some(metric);
-    }
-    match value {
-        Value::Array(items) => items.iter().find_map(parse_billing_json_metric),
-        Value::Object(object) => object.values().find_map(parse_billing_json_metric),
-        _ => None,
-    }
-}
-
-fn parse_billing_json_object(value: &Value) -> Option<UsageMetric> {
-    let monthly_limit = number_at(value, &["monthlyLimit"])
-        .or_else(|| number_at(value, &["config", "monthlyLimit"]));
-    let total_used = number_at(value, &["usage", "totalUsed"])
-        .or_else(|| number_at(value, &["totalUsed"]))
-        .or_else(|| number_at(value, &["config", "usage", "totalUsed"]));
-    let percent = if let (Some(limit), Some(used)) = (monthly_limit, total_used) {
-        if limit > 0.0 {
-            Some((used / limit * 100.0).clamp(0.0, 100.0))
-        } else {
-            None
-        }
-    } else {
-        number_at(value, &["usedPercent"])
-            .or_else(|| number_at(value, &["usagePercent"]))
-            .or_else(|| number_at(value, &["creditUsagePercent"]))
-    }?;
-    let percent = percent.is_finite().then(|| percent.clamp(0.0, 100.0))?;
-
-    let start = string_at(value, &["billingCycle", "billingPeriodStart"])
-        .or_else(|| string_at(value, &["billingPeriodStart"]))
-        .or_else(|| epoch_at(value, &["billingPeriodStart"]));
-    let end = string_at(value, &["billingCycle", "billingPeriodEnd"])
-        .or_else(|| string_at(value, &["billingPeriodEnd"]))
-        .or_else(|| epoch_at(value, &["billingPeriodEnd"]));
-
-    let remaining_label = if let (Some(limit), Some(used)) = (monthly_limit, total_used) {
-        let remaining = (limit - used).max(0.0);
-        Some(format!(
-            "{}/{} left",
-            format_cents(remaining),
-            format_cents(limit)
-        ))
-    } else {
-        None
-    };
-
-    Some(UsageMetric {
-        label: cycle_label(start.as_deref(), end.as_deref()),
-        used_percent: percent,
-        remaining_percent: 100.0 - percent,
-        remaining_label,
-        resets_at: end,
-    })
 }
 
 fn push_limit_metric(
@@ -792,6 +662,7 @@ fn parse_proxy_monthly_metric(value: &Value) -> Option<UsageMetric> {
     })
 }
 
+#[cfg(test)]
 fn usage_output(
     plan: Option<String>,
     email: Option<String>,
@@ -812,31 +683,21 @@ fn usage_output(
 
 pub fn fetch() -> Result<UsageFetchReport> {
     let credentials = read_credentials()?;
-    fetch_with(&credentials, fetch_network_usage, fetch_agent_billing)
+    fetch_with(&credentials, fetch_network_usage)
 }
 
 fn fetch_with(
     credentials: &[Credentials],
-    fetch_network: impl FnMut(&Credentials) -> Result<UsageOutput>,
-    fetch_agent: impl FnMut(Duration) -> Option<Value>,
-) -> Result<UsageFetchReport> {
-    fetch_output_with(credentials, fetch_network, fetch_agent).map(|output| UsageFetchReport {
-        outputs: vec![output],
-        diagnostics: Vec::new(),
-    })
-}
-
-fn fetch_output_with(
-    credentials: &[Credentials],
     mut fetch_network: impl FnMut(&Credentials) -> Result<UsageOutput>,
-    mut fetch_agent: impl FnMut(Duration) -> Option<Value>,
-) -> Result<UsageOutput> {
+) -> Result<UsageFetchReport> {
     let mut errors = Vec::new();
     let mut plan_only: Option<UsageOutput> = None;
 
     for (index, credential) in credentials.iter().enumerate() {
         match fetch_network(credential) {
-            Ok(output) if !output.metrics.is_empty() => return Ok(output),
+            Ok(output) if !output.metrics.is_empty() => {
+                return Ok(UsageFetchReport::from_outputs(vec![output]));
+            }
             Ok(output) => {
                 if plan_only.is_none() {
                     plan_only = Some(output);
@@ -846,47 +707,26 @@ fn fetch_output_with(
         }
     }
 
-    // The `grok agent --no-leader stdio` billing fallback runs without
-    // credential context, so its metrics cannot be attributed to a specific
-    // account. Skip it when auth.json holds multiple credentials to avoid
-    // merging metrics with a plan/email that belongs to a different account.
-    if credentials.len() > 1 {
-        errors
-            .push("Grok agent billing fallback skipped: multiple credentials present".to_string());
-    } else if let Some(billing) = fetch_agent(Duration::from_secs(4)) {
-        let mut metrics = Vec::new();
-        if let Some(metric) = parse_billing_json_metric(&billing) {
-            metrics.push(metric);
-        }
-        collect_task_usage_metrics(&billing, &mut metrics);
-        if !metrics.is_empty() {
-            return Ok(usage_output(
-                plan_only.as_ref().and_then(|output| output.plan.clone()),
-                plan_only
-                    .as_ref()
-                    .and_then(|output| output.email.clone())
-                    .or_else(|| {
-                        credentials
-                            .first()
-                            .and_then(|credential| credential.email.clone())
-                    }),
-                metrics,
-            ));
-        }
+    let mut report = UsageFetchReport::default();
+    let severity = if let Some(output) = plan_only {
+        report.outputs.push(output);
+        UsageFetchDiagnosticSeverity::Warning
     } else {
-        errors.push("Grok agent billing RPC unavailable".to_string());
-    }
-
-    if let Some(output) = plan_only {
-        return Ok(output);
-    }
-
-    let detail = if errors.is_empty() {
-        "no usage or active subscription data returned".to_string()
-    } else {
-        errors.join("; ")
+        UsageFetchDiagnosticSeverity::Error
     };
-    anyhow::bail!("Grok usage unavailable: {detail}");
+    let mut message = "Grok quota unavailable; automatic agent billing fallback is unavailable without a documented quota-only surface.".to_string();
+    if !errors.is_empty() {
+        message.push_str(" HTTP candidates: ");
+        message.push_str(&errors.join("; "));
+    }
+    report.diagnostics.push(UsageFetchDiagnostic::with_kind(
+        "Grok",
+        None,
+        UsageFetchDiagnosticKind::FetchFailed,
+        severity,
+        message,
+    ));
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -915,22 +755,11 @@ mod tests {
         )
     }
 
-    fn fixture_agent_billing() -> Value {
-        serde_json::json!({ "usedPercent": 75 })
-    }
-
     #[test]
     fn http_only_unavailable_never_uses_agent_quota() {
-        let calls = std::cell::Cell::new(0);
-        let result = fetch_with(
-            &[fixture_credentials("first")],
-            |_| anyhow::bail!("HTTP fixture unavailable"),
-            |_| {
-                calls.set(calls.get() + 1);
-                Some(fixture_agent_billing())
-            },
-        );
-        assert_eq!(calls.get(), 0, "quota refresh must not launch an agent");
+        let result = fetch_with(&[fixture_credentials("first")], |_| {
+            anyhow::bail!("HTTP fixture unavailable")
+        });
         let report = result.expect("unavailable quota is a diagnostic report");
         assert!(report.outputs.is_empty());
         assert_eq!(report.diagnostics.len(), 1);
@@ -950,17 +779,10 @@ mod tests {
 
     #[test]
     fn http_only_plan_retains_unknown_quota_with_warning() {
-        let calls = std::cell::Cell::new(0);
-        let report = fetch_with(
-            &[fixture_credentials("first")],
-            |credential| Ok(fixture_output(credential, false)),
-            |_| {
-                calls.set(calls.get() + 1);
-                Some(fixture_agent_billing())
-            },
-        )
+        let report = fetch_with(&[fixture_credentials("first")], |credential| {
+            Ok(fixture_output(credential, false))
+        })
         .unwrap();
-        assert_eq!(calls.get(), 0, "plan-only refresh must not launch an agent");
         assert_eq!(report.outputs.len(), 1);
         let output = &report.outputs[0];
         assert_eq!(output.plan.as_deref(), Some("SuperGrok"));
@@ -978,11 +800,9 @@ mod tests {
 
     #[test]
     fn http_only_success_preserves_metrics_and_legacy_json() {
-        let report = fetch_with(
-            &[fixture_credentials("first")],
-            |credential| Ok(fixture_output(credential, true)),
-            |_| panic!("HTTP quota success must not call the agent"),
-        )
+        let report = fetch_with(&[fixture_credentials("first")], |credential| {
+            Ok(fixture_output(credential, true))
+        })
         .unwrap();
         assert!(report.diagnostics.is_empty());
         assert_eq!(report.outputs.len(), 1);
@@ -1013,7 +833,6 @@ mod tests {
                 attempted.push(credential.token.clone());
                 Ok(fixture_output(credential, credential.token == "second"))
             },
-            |_| panic!("multiple HTTP identities must not call the agent"),
         )
         .unwrap();
         assert_eq!(attempted, ["first", "second"]);
@@ -1033,7 +852,6 @@ mod tests {
                 fixture_credentials("second-secret"),
             ],
             |_| anyhow::bail!("HTTP fixture unavailable"),
-            |_| panic!("multiple HTTP identities must not call the agent"),
         )
         .expect("unavailable quota is a diagnostic report");
         assert!(report.outputs.is_empty());
@@ -1068,31 +886,6 @@ mod tests {
         push_varint(1 << 3, &mut out);
         push_varint(seconds, &mut out);
         out
-    }
-
-    #[test]
-    fn parses_billing_json_metric() {
-        let value = serde_json::json!({
-            "billingCycle": {
-                "billingPeriodStart": "2026-06-01T00:00:00Z",
-                "billingPeriodEnd": "2026-07-01T00:00:00Z"
-            },
-            "monthlyLimit": { "val": 10000 },
-            "usage": {
-                "includedUsed": { "val": 1250 },
-                "onDemandUsed": { "val": 0 },
-                "totalUsed": { "val": 1250 }
-            }
-        });
-
-        let metric = parse_billing_json_metric(&value).expect("billing metric");
-        assert_eq!(metric.label, "Monthly");
-        assert_eq!(metric.used_percent, 12.5);
-        assert_eq!(
-            metric.remaining_label.as_deref(),
-            Some("$87.50/$100.00 left")
-        );
-        assert_eq!(metric.resets_at.as_deref(), Some("2026-07-01T00:00:00Z"));
     }
 
     #[test]
@@ -1151,20 +944,6 @@ mod tests {
             }
         });
         assert!(parse_proxy_monthly_metric(&zero_monthly).is_none());
-    }
-
-    #[test]
-    fn rejects_non_finite_billing_json_percentages() {
-        for value in [
-            serde_json::json!({ "usedPercent": "NaN" }),
-            serde_json::json!({ "usedPercent": "inf" }),
-            serde_json::json!({
-                "monthlyLimit": "NaN",
-                "usage": { "totalUsed": 10 }
-            }),
-        ] {
-            assert!(parse_billing_json_metric(&value).is_none());
-        }
     }
 
     #[test]
