@@ -652,11 +652,28 @@ pub fn cursor_state_vscdb_candidates(home_dir: &Path) -> Vec<PathBuf> {
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        paths.push(home_dir.join(".config/Cursor/User/globalStorage/state.vscdb"));
-    }
+    add_linux_cursor_state_candidates(
+        &mut paths,
+        home_dir,
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+    );
 
     paths
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn add_linux_cursor_state_candidates(
+    paths: &mut Vec<PathBuf>,
+    home_dir: &Path,
+    xdg_config_home: Option<PathBuf>,
+) {
+    if let Some(xdg_config) = xdg_config_home.filter(|path| path.is_absolute()) {
+        paths.push(xdg_config.join("Cursor/User/globalStorage/state.vscdb"));
+    }
+    let fallback = home_dir.join(".config/Cursor/User/globalStorage/state.vscdb");
+    if !paths.contains(&fallback) {
+        paths.push(fallback);
+    }
 }
 
 fn find_cursor_state_vscdb(home_dir: &Path) -> Option<PathBuf> {
@@ -2930,6 +2947,24 @@ mod tests {
         assert_eq!(
             extract_user_id_from_session_token(&session),
             Some("user_01ABCXYZ".to_string())
+        );
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn xdg_config_home_precedes_linux_cursor_fallback() {
+        let mut paths = Vec::new();
+        add_linux_cursor_state_candidates(
+            &mut paths,
+            Path::new("/home/dev"),
+            Some(PathBuf::from("/custom/config")),
+        );
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/custom/config/Cursor/User/globalStorage/state.vscdb"),
+                PathBuf::from("/home/dev/.config/Cursor/User/globalStorage/state.vscdb"),
+            ]
         );
     }
 
