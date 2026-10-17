@@ -367,12 +367,11 @@ fn metric_from_window(
 
 fn plan_http_client() -> Result<reqwest::Client> {
     // Match the Cursor CLI client: cursor.com / api2 sit behind fingerprints
-    // that reject rustls on some networks (#1250).
-    #[allow(clippy::disallowed_methods)]
-    let builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
-    #[cfg(not(target_os = "android"))]
-    let builder = builder.use_native_tls();
-    builder
+    // that reject rustls on some networks (#1250). The one sanctioned
+    // native-TLS builder lives in `crate::cursor`; everything else in the
+    // workspace stays on rustls through `tokscale_core::http`.
+    crate::cursor::cursor_http_client_builder()
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .context("Failed to build Cursor plan HTTP client")
 }
