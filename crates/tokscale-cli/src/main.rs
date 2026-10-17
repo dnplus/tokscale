@@ -6729,6 +6729,7 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_submit_command(
     clients: Option<Vec<String>>,
     since: Option<String>,
