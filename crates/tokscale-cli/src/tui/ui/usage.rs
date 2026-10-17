@@ -2003,7 +2003,11 @@ fn external_credential_manager(output: &UsageOutput) -> Option<&'static str> {
 }
 
 fn credential_detail(lang: TuiLanguage, output: &UsageOutput) -> String {
-    match &output.account {
+    match output
+        .account
+        .as_ref()
+        .filter(|_| output.provider == "Codex")
+    {
         Some(account) if account.is_active => {
             tr(lang, MessageKey::CredentialSavedActive).to_string()
         }
@@ -2027,7 +2031,11 @@ fn selected_account_actions_line(
     y: u16,
 ) -> Line<'static> {
     let lang = app.settings.tui_language;
-    if let Some(account) = &selected.account {
+    if let Some(account) = selected
+        .account
+        .as_ref()
+        .filter(|_| selected.provider == "Codex")
+    {
         let mut spans = Vec::new();
         let mut buttons = Vec::new();
         if has_available_reset_credit(selected) {
@@ -2733,10 +2741,11 @@ fn readiness_color(app: &App, status: UsageReadiness) -> Color {
 
 fn active_output(outputs: &[UsageOutput]) -> Option<&UsageOutput> {
     outputs.iter().find(|output| {
-        output
-            .account
-            .as_ref()
-            .is_some_and(|account| account.is_active)
+        output.provider == "Codex"
+            && output
+                .account
+                .as_ref()
+                .is_some_and(|account| account.is_active)
     })
 }
 
@@ -2744,10 +2753,11 @@ fn best_fallback_output(outputs: &[UsageOutput]) -> Option<&UsageOutput> {
     outputs
         .iter()
         .filter(|output| {
-            !output
-                .account
-                .as_ref()
-                .is_some_and(|account| account.is_active)
+            output.provider == "Codex"
+                && output
+                    .account
+                    .as_ref()
+                    .is_some_and(|account| !account.is_active)
                 && readiness_status(output) == UsageReadiness::Ready
         })
         .max_by(|a, b| output_score(a).total_cmp(&output_score(b)))
@@ -3712,6 +3722,14 @@ mod tests {
 
         assert!(saved.contains("Use Account"), "{saved}");
         assert!(saved.contains("Remove"), "{saved}");
+        assert!(app.click_areas.iter().any(|area| matches!(
+            &area.action,
+            ClickAction::CodexUseAccount { account_id } if account_id == "acct_personal"
+        )));
+        assert!(app.click_areas.iter().any(|area| matches!(
+            &area.action,
+            ClickAction::CodexRemoveAccount { account_id } if account_id == "acct_personal"
+        )));
 
         let mut managed = output("Codex", None);
         managed.credential_source = Some("opencode".to_string());
@@ -3721,6 +3739,113 @@ mod tests {
 
         assert!(!external.contains("Use Account"), "{external}");
         assert!(!external.contains("Remove"), "{external}");
+    }
+
+    #[test]
+    fn grok_accounts_never_offer_codex_actions() {
+        for is_active in [false, true] {
+            let mut app = make_app();
+            app.subscription_usage = vec![output_with_reset_credits(
+                "Grok Bot",
+                Some(UsageAccount {
+                    id: "grok_account".to_string(),
+                    label: Some("bot account".to_string()),
+                    is_active,
+                }),
+                1,
+                &far_future_reset_timestamp(),
+            )];
+
+            let body = render_body(&mut app, 180, 32);
+
+            assert!(body.contains("Managed externally"), "{body}");
+            assert!(!body.contains("saved store"), "{body}");
+            assert!(!body.contains("Use Account"), "{body}");
+            assert!(!app.click_areas.iter().any(|area| matches!(
+                area.action,
+                ClickAction::CodexUseAccount { .. }
+                    | ClickAction::CodexRemoveAccount { .. }
+                    | ClickAction::CodexResetAccount { .. }
+            )));
+        }
+    }
+
+    #[test]
+    fn fallback_recommendations_only_use_saved_codex_accounts() {
+        let active = output_with_remaining(
+            "Codex",
+            Some(UsageAccount {
+                id: "active_codex".to_string(),
+                label: None,
+                is_active: true,
+            }),
+            5.0,
+        );
+        let grok = output(
+            "Grok Bot",
+            Some(UsageAccount {
+                id: "grok_account".to_string(),
+                label: None,
+                is_active: false,
+            }),
+        );
+        let external_codex = output("Codex", None);
+        let mut outputs = vec![active, grok, external_codex];
+        assert!(best_fallback_output(&outputs).is_none());
+        assert_ne!(
+            overall_state_label(TuiLanguage::En, &outputs),
+            tr(TuiLanguage::En, MessageKey::StateSwitchRecommended)
+        );
+
+        outputs.push(output_with_remaining(
+            "Codex",
+            Some(UsageAccount {
+                id: "fallback_codex".to_string(),
+                label: None,
+                is_active: false,
+            }),
+            50.0,
+        ));
+        assert_eq!(
+            best_fallback_output(&outputs)
+                .unwrap()
+                .account
+                .as_ref()
+                .unwrap()
+                .id,
+            "fallback_codex"
+        );
+        assert_eq!(
+            overall_state_label(TuiLanguage::En, &outputs),
+            tr(TuiLanguage::En, MessageKey::StateSwitchRecommended)
+        );
+    }
+
+    #[test]
+    fn active_grok_account_does_not_drive_codex_switching() {
+        let grok = output_with_remaining(
+            "Grok Bot",
+            Some(UsageAccount {
+                id: "grok_account".to_string(),
+                label: None,
+                is_active: true,
+            }),
+            5.0,
+        );
+        let codex = output(
+            "Codex",
+            Some(UsageAccount {
+                id: "active_codex".to_string(),
+                label: None,
+                is_active: true,
+            }),
+        );
+        let outputs = vec![grok, codex];
+        assert_eq!(active_output(&outputs).unwrap().provider, "Codex");
+        assert_eq!(
+            overall_state_label(TuiLanguage::En, &outputs),
+            tr(TuiLanguage::En, MessageKey::StateReadyWithWarnings)
+        );
     }
 
     #[test]
