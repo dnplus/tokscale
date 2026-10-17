@@ -86,7 +86,7 @@
 | <img width="48px" src=".github/assets/client-kilocode.png" alt="Kilo CLI" /> | [Kilo CLI](https://github.com/nicepkg/kilo) | `~/.local/share/kilo/kilo.db` |
 | <img width="48px" src=".github/assets/client-mux.png" alt="Mux" /> | [Mux](https://github.com/coder/mux) | `~/.mux/sessions/` |
 | <img width="48px" src=".github/assets/client-crush.png" alt="Crush" /> | [Crush](https://crush.ai/) | `$XDG_DATA_HOME/crush/projects.json` (프로젝트 레지스트리, 기본값: `~/.local/share/crush/projects.json`) |
-| <img width="48px" src=".github/assets/client-goose.png" alt="Goose" /> | [Goose](https://github.com/aaif-goose/goose) | `~/.local/share/goose/sessions/sessions.db` (+ macOS Application Support, 레거시 Block/goose 경로; `GOOSE_PATH_ROOT`로 오버라이드 가능) |
+| <img width="48px" src=".github/assets/client-goose.png" alt="Goose" /> | [Goose](https://github.com/aaif-goose/goose) | `~/.local/share/goose/sessions/sessions.db` / `%APPDATA%\Block\goose\data\sessions\sessions.db` (+ macOS Application Support, 레거시 Block/goose 경로; `GOOSE_PATH_ROOT`로 오버라이드 가능) |
 | <img width="48px" src=".github/assets/client-antigravity.png" alt="Antigravity" /> | [Google Antigravity](https://antigravity.google/) | `tokscale antigravity sync`로 `~/.config/tokscale/antigravity-cache/sessions/*.jsonl`에 캐싱 (로컬 언어 서버 RPC 사용) |
 | <img width="48px" src=".github/assets/client-antigravity.png" alt="Antigravity CLI" /> | [Antigravity CLI](https://antigravity.google/) | `~/.gemini/antigravity-cli/conversations/*.db` (`GEMINI_CLI_HOME`로 Gemini 홈 경로 오버라이드 가능; 로컬 SQLite를 직접 읽으므로 `antigravity sync`가 필요 없음) |
 | <img width="48px" src=".github/assets/client-antigravity.png" alt="Antigravity IDE Extension" /> | [Antigravity IDE Extension](https://www.antigravity.google/docs/ide/extensions/) | `~/.gemini/antigravity/conversations/*.db` (로컬 SQLite를 직접 읽음) |
@@ -117,6 +117,8 @@
 | <img width="48px" src="https://github.com/deepseek-ai.png" alt="DeepSeek Harness" /> | [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) | `~/.dsh/sessions/**/session.jsonl.zstd`（압축 없이 기록된 경우 `session.jsonl`, 버전이 붙은 `session.v<N>.jsonl[.zstd]` 형식도 읽음, `DSH_HOME`으로 재정의 가능） |
 | <img width="48px" src=".github/assets/client-fx.png" alt="Fx" /> | [fx](https://github.com/vercel-labs/fx) | `~/.fx/sessions/<sessionId>/usage-v2.json` (세션 단위 집계) |
 | <img width="48px" src="https://github.com/meta-models.png" alt="Muse Code" /> | [Muse Code](https://dev.meta.ai/docs/muse-code) | `~/.local/share/muse/sessions/**/session.jsonl` (Windows 포함 전 플랫폼 공통 XDG 경로, `subagent/<uuid>/` 하위 서브에이전트 기록 포함) |
+| <img width="48px" src=".github/assets/client-aside.png" alt="Aside" /> | [Aside](https://asidehq.com) | `~/.aside/u/<account>/sessions/<session>/messages.jsonl` |
+| <img width="48px" src="https://github.com/mistralai.png" alt="Mistral Vibe" /> | [Mistral Vibe](https://github.com/mistralai/mistral-vibe) | `~/.vibe/logs/session/<session-dir>/meta.json` (Windows 포함 전 플랫폼 공통 경로, 루트는 `VIBE_HOME`으로 변경 가능) |
 
 [🚅 LiteLLM의 가격 데이터](https://github.com/BerriAI/litellm)를 사용해 **실시간 비용 계산**을 제공합니다. 구간별 가격 모델(대용량 컨텍스트 등)과 **캐시 토큰 할인**도 지원합니다.
 
@@ -190,7 +192,7 @@ AI 지원 개발 시대에 **토큰은 새로운 에너지**입니다. 토큰은
   - 설정 가능한 색상 테마의 GitHub 스타일 기여 그래프
   - 실시간 필터링 및 정렬
   - 깜빡임 없는 렌더링
-- **멀티 플랫폼 지원** - OpenCode, Claude Code, Codex CLI, Prime Agent, Copilot CLI, Cursor IDE, Gemini CLI, Amp, Codebuff, Droid, OpenClaw, Hermes Agent, Pi, Kimchi Coding, Reasonix, Kimi CLI, Kimi Work, Qwen CLI, Roo Code, Kilo, Mux, Kilo CLI, Crush, Goose, Antigravity, Antigravity CLI, Antigravity IDE Extension, Zed, Kiro, Trae, Warp/Oz, Cline, Gajae-Code, Grok Build, Jcode, MiMo Code, Xiaomi MiMo AI, Command Code, Junie, ZCode, OpenCodeReview, CodeBuddy, WorkBuddy, Devin CLI, Devin Desktop, Augment Code, Synthetic, Cherry Studio, LM Studio, Unsloth Studio, Hindsight, fx, Oh My Pi, Muse Code 사용량 통합 추적
+- **멀티 플랫폼 지원** - OpenCode, Claude Code, Codex CLI, Prime Agent, Copilot CLI, Cursor IDE, Gemini CLI, Amp, Codebuff, Droid, OpenClaw, Hermes Agent, Pi, Kimchi Coding, Reasonix, Kimi CLI, Kimi Work, Qwen CLI, Roo Code, Kilo, Mux, Kilo CLI, Crush, Goose, Antigravity, Antigravity CLI, Antigravity IDE Extension, Zed, Kiro, Trae, Warp/Oz, Cline, Gajae-Code, Grok Build, Jcode, MiMo Code, Xiaomi MiMo AI, Command Code, Junie, ZCode, OpenCodeReview, CodeBuddy, WorkBuddy, Devin CLI, Devin Desktop, Augment Code, Synthetic, Cherry Studio, LM Studio, Unsloth Studio, Hindsight, fx, Oh My Pi, Muse Code, Aside, Mistral Vibe 사용량 통합 추적
 - **실시간 가격 반영** - LiteLLM에서 최신 가격을 가져와(디스크 캐시 1시간) 비용 계산; OpenRouter 자동 폴백 및 신규 모델용 Cursor 가격 지원
 - **상세 분석** - 입력, 출력, 캐시 읽기/쓰기, 추론 토큰까지 추적
 - **네이티브 Rust 코어** - 모든 파싱과 집계를 Rust로 처리해 최대 10배 빠른 성능
@@ -425,7 +427,7 @@ tokscale --client synthetic
 tokscale --client opencode,claude --week --json
 ```
 
-가능한 값: `opencode`, `claude`, `codex`, `copilot`, `gemini`, `cursor`, `amp`, `codebuff`, `droid`, `openclaw`, `hermes`, `pi`, `prime-agent`, `kimchi`, `kimi`, `qwen`, `roocode`, `kilocode`, `kilo`, `mux`, `crush`, `goose`, `antigravity`, `antigravity-cli`, `antigravity-extension`, `zed`, `kiro`, `trae`, `warp`, `cline`, `gjc`, `grok`, `jcode`, `micode`, `micode-desktop`, `commandcode`, `junie`, `zcode`, `opencodereview`, `codebuddy`, `augment`, `synthetic`, `cherrystudio`, `lmstudio`, `unsloth`, `hindsight`, `muse`.
+가능한 값: `opencode`, `claude`, `codex`, `copilot`, `gemini`, `cursor`, `amp`, `codebuff`, `droid`, `openclaw`, `hermes`, `pi`, `prime-agent`, `kimchi`, `kimi`, `qwen`, `roocode`, `kilocode`, `kilo`, `mux`, `crush`, `goose`, `antigravity`, `antigravity-cli`, `antigravity-extension`, `zed`, `kiro`, `trae`, `warp`, `cline`, `gjc`, `grok`, `jcode`, `micode`, `micode-desktop`, `commandcode`, `junie`, `zcode`, `opencodereview`, `codebuddy`, `augment`, `synthetic`, `cherrystudio`, `lmstudio`, `unsloth`, `hindsight`, `muse`, `aside`, `vibe`.
 
 > **Breaking change (v4.0.0):** 클라이언트별 boolean 플래그(`--opencode`, `--claude`, `--codex` 등)는 제거되었으며 이제 오류를 발생시킵니다. 대신 정식 `--client`/`-c` 플래그를 사용하세요 — 예: `tokscale --client opencode,claude`.
 
@@ -1120,7 +1122,7 @@ tokscale sources --json
 - **인터랙티브 툴팁**: 호버 시 상세 일별 분석 표시
 - **일별 분석 패널**: 클릭하여 소스별, 모델별 세부사항 확인
 - **연도 필터링**: 연도 간 탐색
-- **소스 필터링**: 플랫폼별 필터 (OpenCode, Claude, Codex, Copilot, Cursor, Gemini, Amp, Codebuff, Droid, OpenClaw, Hermes Agent, Pi, Prime Agent, Kimi, Qwen, Roo Code, Kilo, Mux, Kilo CLI, Crush, Goose, Antigravity, Antigravity CLI, Antigravity IDE Extension, Zed, Kiro, Trae, Warp, Cline, Gajae-Code, Grok Build, Jcode, MiMo Code, Xiaomi MiMo AI, Command Code, Junie, ZCode, OpenCodeReview, CodeBuddy, WorkBuddy, Devin CLI, Devin Desktop, Augment Code, Synthetic, Cherry Studio, LM Studio, Unsloth, Hindsight, Muse Code)
+- **소스 필터링**: 플랫폼별 필터 (OpenCode, Claude, Codex, Copilot, Cursor, Gemini, Amp, Codebuff, Droid, OpenClaw, Hermes Agent, Pi, Prime Agent, Kimi, Qwen, Roo Code, Kilo, Mux, Kilo CLI, Crush, Goose, Antigravity, Antigravity CLI, Antigravity IDE Extension, Zed, Kiro, Trae, Warp, Cline, Gajae-Code, Grok Build, Jcode, MiMo Code, Xiaomi MiMo AI, Command Code, Junie, ZCode, OpenCodeReview, CodeBuddy, WorkBuddy, Devin CLI, Devin Desktop, Augment Code, Synthetic, Cherry Studio, LM Studio, Unsloth, Hindsight, Muse Code, Aside, Mistral Vibe)
 - **통계 패널**: 총 비용, 토큰, 활동 일수, 연속 기록
 - **FOUC 방지**: React 하이드레이션 전 테마 적용 (깜빡임 없음)
 
@@ -1521,7 +1523,7 @@ AI 코딩 도구들은 크로스 플랫폼 위치에 세션 데이터를 저장�
 | Codebuff | `~/.config/manicode/projects/` (+ `manicode-dev`, `manicode-staging`) | `%USERPROFILE%\.config\manicode\projects\` | `CODEBUFF_DATA_DIR` 환경변수로 오버라이드 |
 | Kilo CLI | `~/.local/share/kilo/` | `%USERPROFILE%\.local\share\kilo\` | OpenCode와 같이 `xdg-basedir` 사용 |
 | Crush | `$XDG_DATA_HOME/crush/` (기본값: `~/.local/share/crush/`) | `%USERPROFILE%\.local\share\crush\` (설정된 경우 `%XDG_DATA_HOME%\crush\`) | 기본 경로를 포함한 XDG 데이터 디렉토리 사용 |
-| Goose | `~/.local/share/goose/sessions/` (+ macOS Application Support, 레거시 Block 경로) | `%USERPROFILE%\.local\share\goose\sessions\` | `GOOSE_PATH_ROOT` 환경변수로 설정 가능 |
+| Goose | `~/.local/share/goose/sessions/` (+ macOS Application Support, 레거시 Block 경로) | `%APPDATA%\Block\goose\data\sessions` (폴백: `%USERPROFILE%\.local\share\goose\sessions\` 및 레거시 `Block` 경로) | `GOOSE_PATH_ROOT` 환경변수로 설정 가능 |
 | Antigravity | `~/.config/tokscale/antigravity-cache/sessions/` | — | `tokscale antigravity sync`는 현재 macOS/Linux에서만 지원 |
 | Zed Agent | `~/.local/share/zed/threads/threads.db` | `%LOCALAPPDATA%\Zed\threads\threads.db` | 호스팅된 Zed 모델 사용량 전용; 외부 ACP 에이전트는 포함되지 않음 |
 | Kiro | `~/.kiro/sessions/cli/` 및 `~/.local/share/kiro-cli/data.sqlite3` | `%USERPROFILE%\.kiro\sessions\cli\` 및 `%USERPROFILE%\.local\share\kiro-cli\data.sqlite3` | Kiro 세션 파일과 함께 존재하는 경우 Kiro CLI SQLite 데이터베이스를 파싱 |
@@ -1544,8 +1546,10 @@ AI 코딩 도구들은 크로스 플랫폼 위치에 세션 데이터를 저장�
 | Synthetic | 다른 소스에서 재귀속 | 다른 소스에서 재귀속 | `hf:` 모델 접두사 + `synthetic` provider 감지 |
 | Hindsight | `$HINDSIGHT_HOME/usage/` (폴백: `~/.hindsight/usage/`) | `%HINDSIGHT_HOME%\usage\` (폴백: `%USERPROFILE%\.hindsight\usage\`) | `tokscale hindsight sync`를 통한 API 동기화; Hindsight 자체는 로컬 세션 로그를 남기지 않으므로 LLM 추적 API에서 추가 전용 JSONL 캐시로 동기화 |
 | Muse Code | `~/.local/share/muse/sessions/` | `%USERPROFILE%\.local\share\muse\sessions\` | 전 플랫폼 공통 XDG 경로; `session.jsonl`의 `model_completed` 사용량 이벤트와 `subagent/` 기록 파싱 |
+| Aside | `~/.aside/u/<account>/sessions/<session>/messages.jsonl` | `%USERPROFILE%\.aside\u\<account>\sessions\<session>\messages.jsonl` | 계정별 네이티브 브라우저 사용량; `messages.jsonl`만 읽고 artifacts, memory, passwords 제외. |
+| Mistral Vibe | `$VIBE_HOME/logs/session/` (기본값: `~/.vibe/logs/session/`) | `%VIBE_HOME%\logs\session\` (기본값: `%USERPROFILE%\.vibe\logs\session\`) | 전 플랫폼 공통 `~/.vibe` 루트; 각 세션 디렉터리의 `meta.json` 누적 `stats`만 읽고 `messages.jsonl` 대화 내용은 읽지 않음 |
 
-> **참고**: Windows에서 `~`는 `%USERPROFILE%`로 확장됩니다 (예: `C:\Users\사용자이름`). 이러한 도구들은 `%APPDATA%`와 같은 Windows 기본 경로 대신 크로스 플랫폼 일관성을 위해 의도적으로 Unix 스타일 경로(`.local/share` 등)를 사용합니다.
+> **참고**: Windows에서 `~`는 `%USERPROFILE%`로 확장됩니다 (예: `C:\Users\사용자이름`). 일부 도구는 크로스 플랫폼 일관성을 위해 Unix 스타일 경로(`.local/share` 등)를 사용하고, Goose를 포함한 다른 도구는 위 표의 Windows 기본 경로(`%APPDATA%` 등)를 사용합니다.
 
 > **Devin Desktop 에이전트 지원**: 로컬 사용량 파싱은 NDJSON 스트림에서 `usage_update` 이벤트를 내보내는 ACP 연결 에이전트(예: Cascade/Windsurf, claude-code, opencode)에서 동작합니다. 기본 **devin-cloud** 에이전트는 로컬 `usage_update` 이벤트를 내보내지 않으므로, 계정 수준 API 없이는 tokscale로 추적할 수 없으며 사용량은 서버에만 남습니다.
 
@@ -1979,6 +1983,8 @@ Crush는 프로젝트별 SQLite 데이터베이스(`crush.db`)에 사용량을 �
 
 위치: `~/.local/share/goose/sessions/sessions.db` (`~/Library/Application Support/goose/`, `~/Library/Application Support/Block/goose/`, `~/.local/share/Block/goose/`도 스캔; `GOOSE_PATH_ROOT`로 오버라이드 가능)
 
+네이티브 Windows 스캔은 XDG 및 기존 위치보다 먼저 `%APPDATA%\Block\goose\data\sessions\sessions.db`를 확인합니다. `APPDATA`가 설정되지 않았거나 비어 있으면 시스템 Roaming 디렉터리를 먼저 확인한 뒤 Desktop의 `<HOME>/AppData/Roaming`을 확인합니다. `--home` 스캔은 `GOOSE_PATH_ROOT`와 프로세스 환경 기반 Windows 위치를 사용하지 않으며 `<home>/AppData/Roaming/Block/goose/data/sessions/sessions.db`도 확인합니다. `--home` 없이 절대 경로인 `GOOSE_PATH_ROOT`가 지정되면 데이터베이스가 없어도 다른 위치로 폴백하지 않으며, 상대 경로 값은 무시합니다. 실행 파일을 옮겨도 데이터베이스 위치는 바뀌지 않습니다.
+
 Goose는 세션별 사용량을 SQLite `sessions.db`에 저장합니다. Tokscale은 `model_config_json`에서 모델, `provider_name`에서 공급자, 그리고 세션별로 누적된 입력/출력 토큰 합계를 추출합니다. 추론 토큰은 해당 컬럼이 채워져 있을 때 추정됩니다.
 
 ### Codebuff
@@ -2038,6 +2044,10 @@ WHERE json_extract(m.data, '$.role') = 'assistant'
 ```
 Tokscale은 타임스탬프, 모델, 프로바이더, 토큰 수, 비용, 에이전트 이름의 지문을 사용하여 포크된 세션 간 메시지를 중복 제거합니다.
 
+### Aside
+
+Aside의 평면 assistant 사용량 기록은 `~/.aside/u/<account>/sessions/<session>/messages.jsonl`에 저장됩니다. Tokscale은 원본 타임스탬프, 모델 정보, 캐시 입력 구간(1시간 TTL 캐시 쓰기 부분 포함)을 보존합니다. reasoning은 output에서 분리하여 토큰 합계와 추정 비용에 한 번만 반영합니다. Aside의 `provider` 필드는 공급자가 아니라 경로를 기록하므로, Claude Code 경로는 Anthropic으로 집계하고 범용 게이트웨이 경로는 모델 계열 추론을 따릅니다. 명시적인 공급자 ID는 그대로 우선합니다. 같은 제공자의 반복 response ID는 세션·계정 간 한 번만 집계하고, ID 없는 호출은 각각 유지합니다. 양수 기록 비용은 보존하며 0 또는 누락 비용에는 기존 가격 계산을 적용합니다. `tokscale --no-spinner --client aside`로 필터링할 수 있습니다. Windows 실행은 검증하지 않았습니다.
+
 ### Muse Code
 
 위치: `~/.local/share/muse/sessions/YYYY/MM/DD/<session-uuid>/session.jsonl` (Windows 포함 전 플랫폼 공통 XDG 경로, `subagent/<uuid>/` 하위 서브에이전트 기록도 함께 스캔)
@@ -2045,6 +2055,14 @@ Tokscale은 타임스탬프, 모델, 프로바이더, 토큰 수, 비용, 에이
 Muse Code는 세션마다 이벤트 소싱 방식의 JSONL 트랜스크립트를 하나씩 기록합니다. Tokscale은 모델 ID(`muse-spark-*`), Responses 형태의 `usage` 객체(`input_tokens`, `output_tokens`, `cached_tokens`/`cache_read_tokens`, `cache_write_tokens`, `reasoning_tokens`), 호출의 `duration_ms`를 담은 `model_completed` 이벤트를 읽습니다. `recorded_at`의 단위는 마이크로초입니다. `cached_tokens`은 `input_tokens`의 부분집합이고 reasoning은 `output_tokens`에 포함되어 있으므로, 가격 계산과 집계 전에 둘 다 분리합니다. 부모 세션의 `workflow_child_lifecycle` 사용량 집계는 자식 트랜스크립트를 별도로 스캔하므로 건너뜁니다. 워크스페이스 레이블은 파일의 `runtime.session.metadata` 레코드에서 가져옵니다.
 
 Muse Spark 모델은 업스트림 데이터셋에서 가격이 책정됩니다. LiteLLM과 models.dev가 Meta 공개 요금의 `meta/muse-spark-*` 행을 수록하고 있어 Muse 사용량은 별도 설정 없이 비용이 계산됩니다 (Standard: 입력/출력 100만 토큰당 $1.25/$4.25, 캐시 입력 $0.15; Contributor: $0.10/$0.20, 캐시 입력 $0.002 — [가격 및 rate limit](https://dev.meta.ai/docs/pricing-rate-limits) 참조).
+
+### Mistral Vibe
+
+위치: `~/.vibe/logs/session/<prefix>_<YYYYMMDD_HHMMSS>_<short-id>/meta.json` (macOS, Linux, Windows 모두 동일한 `~/.vibe` 루트 — Vibe는 XDG나 `%APPDATA%` 경로를 쓰지 않음; 루트는 `VIBE_HOME`, 세션 디렉터리는 `session_logging.save_dir`로 변경 가능)
+
+Vibe는 세션마다 디렉터리를 만들어 `meta.json`과 `messages.jsonl` 대화 기록을 저장합니다. 사용량은 세션 단위입니다. 대화 기록에는 메시지별 모델, 타임스탬프, 토큰 수가 없으므로 Tokscale은 `meta.json`의 누적 `stats` 블록(`session_prompt_tokens`, `session_completion_tokens`, `session_cached_tokens`)만 읽고 대화 내용은 읽지 않습니다. `session_cached_tokens`는 `session_prompt_tokens`에 더해지는 값이 아니라 그 *부분집합*이므로, 가격 계산 전에 캐시 읽기를 입력 토큰에서 분리합니다 — Vibe 자체 비용 표시와 동일한 계산입니다. 따라서 세션당 메시지 1건이 이 포맷이 지원하는 가장 세밀한 단위이며, `steps`가 메시지 수, `end_time`(ISO-8601, 없으면 `start_time`)이 타임스탬프가 됩니다. 2.0 이전 세션은 같은 필드를 `metadata` 키 아래 담은 플랫 `<prefix>_*.json` 파일로 저장했고, 이 형식도 계속 읽습니다.
+
+모델은 `meta.json`의 `config.active_model`에서 가져오며, 이는 세션에 고정된 별칭입니다. 한 번도 고정하지 않은 세션은 빈 문자열을 기록하는데 이는 Vibe가 문서화한 "설정된 기본값을 따름" 센티널이므로, Tokscale은 빈 모델로 사용량을 집계하지 않고 세션 자체의 `config.models` 테이블, 다음으로 Mistral이 공개한 기본 별칭에서 해석합니다. 별칭(`mistral-medium-3.5`)은 실제 전송 ID가 아닙니다. Vibe는 공개 가격 데이터셋에 없는 CLI 전용 엔드포인트 이름(`mistral-vibe-cli-latest`)을 전송하므로 가격은 별칭으로 조회합니다. 워크스페이스 레이블은 `environment.working_directory`에서, 없으면 `origin_directory`에서 가져옵니다.
 
 ## 가격
 

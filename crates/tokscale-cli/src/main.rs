@@ -15,7 +15,7 @@ mod ui_glyphs;
 mod warp;
 
 use crate::tui::client_ui;
-use crate::ui_glyphs::{AMBIENT_STABLE_SCANNER_ACTIVE, AMBIENT_STABLE_SCANNER_INACTIVE};
+use crate::ui_glyphs::Glyphs;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::io::{self, IsTerminal, Write};
@@ -1237,6 +1237,8 @@ pub enum ClientFilter {
     Muse,
     #[value(name = "antigravity-extension")]
     AntigravityExtension,
+    Aside,
+    Vibe,
     #[value(name = "grok-bot")]
     GrokBot,
     Synthetic,
@@ -1306,6 +1308,8 @@ impl ClientFilter {
             Self::Hindsight => "hindsight",
             Self::MicodeDesktop => "micode-desktop",
             Self::Muse => "muse",
+            Self::Aside => "aside",
+            Self::Vibe => "vibe",
             Self::Synthetic => "synthetic",
         }
     }
@@ -1376,6 +1380,8 @@ impl ClientFilter {
             Self::Hindsight => Some(ClientId::Hindsight),
             Self::MicodeDesktop => Some(ClientId::MiMoDesktop),
             Self::Muse => Some(ClientId::Muse),
+            Self::Aside => Some(ClientId::Aside),
+            Self::Vibe => Some(ClientId::Vibe),
             Self::Synthetic => None,
         }
     }
@@ -1442,6 +1448,8 @@ impl ClientFilter {
             ClientId::Hindsight => Self::Hindsight,
             ClientId::MiMoDesktop => Self::MicodeDesktop,
             ClientId::Muse => Self::Muse,
+            ClientId::Aside => Self::Aside,
+            ClientId::Vibe => Self::Vibe,
         }
     }
 
@@ -2177,13 +2185,14 @@ impl LightSpinner {
                 let color = Self::TRAIL_COLORS[distance.min(Self::TRAIL_COLORS.len() - 1)];
                 out.push_str(&format!(
                     "\x1b[38;5;{}m{}\x1b[0m",
-                    color, AMBIENT_STABLE_SCANNER_ACTIVE
+                    color,
+                    Glyphs::ascii_safe().scanner_active
                 ));
             } else {
                 out.push_str(&format!(
                     "\x1b[38;5;{}m{}\x1b[0m",
                     Self::INACTIVE_COLOR,
-                    AMBIENT_STABLE_SCANNER_INACTIVE
+                    Glyphs::ascii_safe().scanner_inactive
                 ));
             }
         }
@@ -4266,13 +4275,19 @@ fn format_currency(n: f64) -> String {
     format!("${:.2}", n)
 }
 
+/// Blended cost per 1M tokens for a report row. A positive rate that `{:.2}`
+/// would round to `$0.00` renders as `<$0.01/M` instead: the report tables are
+/// fixed-width, so the honest alternative to a lost digit is a bound, not the
+/// escalating decimals [`format_per_million`] uses for published sheet prices.
 fn format_cost_per_million(cost: f64, total_tokens: i64) -> String {
-    if total_tokens <= 0 || !cost.is_finite() {
+    if total_tokens <= 0 || !cost.is_finite() || cost < 0.0 {
         return "—".to_string();
     }
     let cost_per_m = cost * 1_000_000.0 / total_tokens as f64;
     if !cost_per_m.is_finite() {
         "—".to_string()
+    } else if cost > 0.0 && cost_per_m < 0.01 {
+        "<$0.01/M".to_string()
     } else {
         format!("${:.2}/M", cost_per_m)
     }
@@ -4966,6 +4981,8 @@ struct TsSourceContribution {
     tokens: TsTokenBreakdown,
     cost: f64,
     messages: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_provenance: Option<tokscale_core::CostProvenance>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -4978,6 +4995,8 @@ struct TsDailyTotals {
     /// predate #1044. Only incomplete days pay a wire-format cost.
     #[serde(skip_serializing_if = "Option::is_none")]
     cost_is_complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_provenance: Option<tokscale_core::CostProvenance>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -5005,6 +5024,8 @@ struct TsYearSummary {
     total_tokens: i64,
     total_cost: f64,
     range: DateRange,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_provenance: Option<tokscale_core::CostProvenance>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -5018,6 +5039,8 @@ struct TsDataSummary {
     max_cost_in_single_day: f64,
     clients: Vec<String>,
     models: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_provenance: Option<tokscale_core::CostProvenance>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -5065,6 +5088,8 @@ struct TsScanScope {
     parser_versions: std::collections::BTreeMap<String, u32>,
     full_history: bool,
     full_history_clients: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retention_floors: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// Submission-level provenance (#888): history recovered from an aggregate
@@ -5098,10 +5123,36 @@ struct TsTokenContributionData {
 }
 
 fn to_ts_token_contribution_data(
-    graph: &tokscale_core::GraphResult,
+    graph: &tokscale_core::GraphResultV2,
     device: Option<&device::SubmitDevice>,
     scan_scope: Option<TsScanScope>,
 ) -> TsTokenContributionData {
+    let scan_scope = scan_scope.map(|mut scope| {
+        if scope.full_history || !scope.full_history_clients.is_empty() {
+            let mut floors = std::collections::BTreeMap::new();
+            for d in &graph.contributions {
+                for s in &d.clients {
+                    if !scope.full_history
+                        && !scope.full_history_clients.iter().any(|c| c == &s.client)
+                    {
+                        continue;
+                    }
+                    floors
+                        .entry(s.client.clone())
+                        .and_modify(|earliest: &mut String| {
+                            if d.date < *earliest {
+                                *earliest = d.date.clone();
+                            }
+                        })
+                        .or_insert_with(|| d.date.clone());
+                }
+            }
+            if !floors.is_empty() {
+                scope.retention_floors = Some(floors);
+            }
+        }
+        scope
+    });
     TsTokenContributionData {
         meta: TsExportMeta {
             generated_at: graph.meta.generated_at.clone(),
@@ -5125,6 +5176,7 @@ fn to_ts_token_contribution_data(
             max_cost_in_single_day: graph.summary.max_cost_in_single_day,
             clients: graph.summary.clients.clone(),
             models: graph.summary.models.clone(),
+            cost_provenance: graph.summary.cost_provenance,
         },
         years: graph
             .years
@@ -5137,6 +5189,7 @@ fn to_ts_token_contribution_data(
                     start: y.range_start.clone(),
                     end: y.range_end.clone(),
                 },
+                cost_provenance: y.cost_provenance,
             })
             .collect(),
         contributions: graph
@@ -5152,6 +5205,7 @@ fn to_ts_token_contribution_data(
                         .incomplete_cost_dates
                         .contains(&d.date)
                         .then_some(false),
+                    cost_provenance: d.totals.cost_provenance,
                 },
                 intensity: d.intensity,
                 token_breakdown: TsTokenBreakdown {
@@ -5181,6 +5235,7 @@ fn to_ts_token_contribution_data(
                         },
                         cost: s.cost,
                         messages: s.messages,
+                        cost_provenance: s.cost_provenance,
                     })
                     .collect(),
                 active_time_ms: d.active_time_ms,
@@ -5242,6 +5297,7 @@ fn submit_scan_scope(
         // Fail closed for receivers predating `fullHistoryClients`.
         full_history: full_history && every_client_complete,
         full_history_clients,
+        retention_floors: None,
     })
 }
 
@@ -5704,7 +5760,7 @@ fn run_graph_command(
     no_spinner: bool,
 ) -> Result<()> {
     use colored::Colorize;
-    use tokscale_core::{generate_local_graph_report, GroupBy};
+    use tokscale_core::{generate_local_graph_report_v2, GroupBy};
 
     let show_progress = output.is_some() && !no_spinner;
     let mut context = LocalReportContext::new(home_dir, clients, date, None);
@@ -5720,7 +5776,7 @@ fn run_graph_command(
     let rt = tokio::runtime::Runtime::new()?;
     let graph_result = rt
         .block_on(async {
-            generate_local_graph_report(context.report_options(GroupBy::default())).await
+            generate_local_graph_report_v2(context.report_options(GroupBy::default())).await
         })
         .map_err(|e| anyhow::anyhow!(e))?;
     emit_cursor_sync_warning(
@@ -6131,10 +6187,10 @@ fn submit_imported_graph(payload: &TsTokenContributionData) -> Result<()> {
 /// the local recovery overlay reconstructs, which submission never sends and
 /// which therefore must not count as coverage.
 fn drop_locally_scanned_usage(
-    graph: &mut tokscale_core::GraphResult,
+    graph: &mut tokscale_core::GraphResultV2,
     imported_clients: &[String],
 ) -> Result<Vec<(String, String)>> {
-    use tokscale_core::{generate_source_graph_report, GroupBy, ReportOptions};
+    use tokscale_core::{generate_source_graph_report_v2, GroupBy, ReportOptions};
 
     // This scan only feeds overlap detection, which reads (date, client)
     // identities and non-zero token flags — never costs — so the lenient local
@@ -6142,14 +6198,14 @@ fn drop_locally_scanned_usage(
     // must not abort the whole import over a scan whose costs nobody reads.
     // The imported costs come from the export itself.
     //
-    // Source-only, not `generate_local_graph_report`: the question here is
+    // Source-only, not `generate_local_graph_report_v2`: the question here is
     // "does `tokscale submit` already report this row?", and submission reads
     // source messages alone. The local recovery overlay is never submitted, so
     // counting it as coverage would drop an imported row that nothing else ever
     // uploads (#1364).
     let rt = tokio::runtime::Runtime::new()?;
     let local = rt
-        .block_on(generate_source_graph_report(ReportOptions {
+        .block_on(generate_source_graph_report_v2(ReportOptions {
             home_dir: None,
             use_env_roots: true,
             clients: Some(imported_clients.to_vec()),
@@ -6165,8 +6221,8 @@ fn drop_locally_scanned_usage(
 }
 
 fn drop_overlapping_rows(
-    graph: &mut tokscale_core::GraphResult,
-    local: &tokscale_core::GraphResult,
+    graph: &mut tokscale_core::GraphResultV2,
+    local: &tokscale_core::GraphResultV2,
 ) -> Vec<(String, String)> {
     let scanned: std::collections::HashSet<(&str, &str)> = local
         .contributions
@@ -6216,11 +6272,11 @@ fn drop_overlapping_rows(
 /// rollups, and the meta date range from what remains. Shared by
 /// [`drop_overlapping_rows`] and the tokenless-cost exclusion path in
 /// `run_import_command`, where exclusion can empty every client of a day.
-fn normalize_graph_after_row_removal(graph: &mut tokscale_core::GraphResult) {
+fn normalize_graph_after_row_removal(graph: &mut tokscale_core::GraphResultV2) {
     graph.contributions.retain(|day| !day.clients.is_empty());
-    tokscale_core::calculate_intensities(&mut graph.contributions);
-    graph.summary = tokscale_core::calculate_summary(&graph.contributions);
-    graph.years = tokscale_core::calculate_years(&graph.contributions);
+    tokscale_core::calculate_intensities_v2(&mut graph.contributions);
+    graph.summary = tokscale_core::calculate_summary_v2(&graph.contributions);
+    graph.years = tokscale_core::calculate_years_v2(&graph.contributions);
     if let (Some(first), Some(last)) = (graph.contributions.first(), graph.contributions.last()) {
         graph.meta.date_range_start = first.date.clone();
         graph.meta.date_range_end = last.date.clone();
@@ -6230,7 +6286,10 @@ fn normalize_graph_after_row_removal(graph: &mut tokscale_core::GraphResult) {
 /// The submit payload for an imported graph. MCP names stay the local ones, as
 /// `submit` sends them: the server stores the latest list per profile, and an
 /// empty one would clear it.
-fn backfill_payload(graph: &tokscale_core::GraphResult, importer: &str) -> TsTokenContributionData {
+fn backfill_payload(
+    graph: &tokscale_core::GraphResultV2,
+    importer: &str,
+) -> TsTokenContributionData {
     let mut payload = to_ts_token_contribution_data(graph, None, None);
     payload.provenance = Some(TsSubmissionProvenance {
         origin: "backfill",
@@ -6251,9 +6310,69 @@ struct SubmitResponse {
     details: Option<Vec<String>>,
 }
 
+fn deserialize_optional_i64_from_any<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptionalI64Visitor;
+    impl<'de> serde::de::Visitor<'de> for OptionalI64Visitor {
+        type Value = Option<i64>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("an integer, a string representing an integer, or null")
+        }
+
+        fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+            i64::try_from(v).map(Some).map_err(E::custom)
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> {
+            if v.is_finite()
+                && v.fract() == 0.0
+                && v >= i64::MIN as f64
+                && v < 9223372036854775808.0
+            {
+                Ok(Some(v as i64))
+            } else {
+                Err(E::custom(format!("invalid integer value: {v}")))
+            }
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+            v.parse::<i64>().map(Some).map_err(E::custom)
+        }
+
+        fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> std::result::Result<Self::Value, D::Error> {
+            deserializer.deserialize_any(self)
+        }
+
+        fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+    deserializer.deserialize_option(OptionalI64Visitor)
+}
+
 #[derive(serde::Deserialize)]
 struct SubmitMetrics {
-    #[serde(rename = "totalTokens")]
+    #[serde(
+        rename = "totalTokens",
+        default,
+        deserialize_with = "deserialize_optional_i64_from_any"
+    )]
     total_tokens: Option<i64>,
     #[serde(rename = "totalCost")]
     total_cost: Option<f64>,
@@ -6286,13 +6405,13 @@ fn client_token_total(tokens: &tokscale_core::TokenBreakdown) -> i64 {
 /// drop them either — otherwise that legitimate cost silently disappears from
 /// the submission. Keep in sync with `CURSOR_LEGACY_TOKENLESS_MODELS` in
 /// packages/frontend/src/lib/validation/submission.ts.
-fn is_legacy_tokenless_cursor_row(client: &tokscale_core::ClientContribution) -> bool {
+fn is_legacy_tokenless_cursor_row(client: &tokscale_core::ClientContributionV2) -> bool {
     client.client == "cursor"
         && client.model_id == "premium-tool-call"
         && client_token_total(&client.tokens) == 0
 }
 
-fn is_aggregate_only_warp_row(client: &tokscale_core::ClientContribution) -> bool {
+fn is_aggregate_only_warp_row(client: &tokscale_core::ClientContributionV2) -> bool {
     client.client == "warp"
         && client.model_id == "aggregate-requests"
         && client_token_total(&client.tokens) == 0
@@ -6301,7 +6420,7 @@ fn is_aggregate_only_warp_row(client: &tokscale_core::ClientContribution) -> boo
 /// A row the server's "Cost submitted without tokens" sanity check would
 /// reject: real cost with every token bucket at zero, excluding the Cursor
 /// `premium-tool-call` carve-out above.
-fn is_tokenless_costed_row(client: &tokscale_core::ClientContribution) -> bool {
+fn is_tokenless_costed_row(client: &tokscale_core::ClientContributionV2) -> bool {
     (is_aggregate_only_warp_row(client) || client.cost > 0.0)
         && client_token_total(&client.tokens) == 0
         && !is_legacy_tokenless_cursor_row(client)
@@ -6321,7 +6440,7 @@ fn is_tokenless_costed_row(client: &tokscale_core::ClientContribution) -> bool {
 /// totals, breakdowns, and intensities are untouched. Summary and year rollups
 /// are recomputed from the trimmed contributions.
 fn exclude_tokenless_cost_contributions(
-    graph_result: &mut tokscale_core::GraphResult,
+    graph_result: &mut tokscale_core::GraphResultV2,
 ) -> Vec<ExcludedTokenlessRow> {
     let mut excluded: Vec<ExcludedTokenlessRow> = Vec::new();
 
@@ -6350,12 +6469,24 @@ fn exclude_tokenless_cost_contributions(
         if removed_cost > 0.0 || removed_messages > 0 {
             day.totals.cost = (day.totals.cost - removed_cost).max(0.0);
             day.totals.messages = day.totals.messages.saturating_sub(removed_messages).max(0);
+
+            // The day's provenance folded in the rows just dropped, so rebuild
+            // it from the clients that remain.
+            let mut provenance = tokscale_core::CostProvenanceAccumulator::default();
+            for client in &day.clients {
+                provenance.add_usage(
+                    client.tokens.total(),
+                    client.cost,
+                    &client.cost_provenance(),
+                );
+            }
+            day.totals.cost_provenance = Some(provenance.finish());
         }
     }
 
     if !excluded.is_empty() {
-        graph_result.summary = tokscale_core::calculate_summary(&graph_result.contributions);
-        graph_result.years = tokscale_core::calculate_years(&graph_result.contributions);
+        graph_result.summary = tokscale_core::calculate_summary_v2(&graph_result.contributions);
+        graph_result.years = tokscale_core::calculate_years_v2(&graph_result.contributions);
     }
 
     excluded
@@ -6428,7 +6559,7 @@ fn report_unpriced_submission_usage(unpriced: &[tokscale_core::UnpricedSubmissio
     // (dozens in practice), burying the submittable summary. Cap the per-row
     // detail exactly like `report_excluded_tokenless_rows` and report the
     // aggregate instead. This print is the only place the rows surface at all:
-    // `GraphResult::unpriced_submission_usage` is `#[serde(skip)]` and never
+    // `GraphResultV2::unpriced_submission_usage` is `#[serde(skip)]` and never
     // reaches a payload, and `--dry-run` runs this same reporter — so the
     // capped rows are still named by id below rather than dropped.
     const MAX_DETAIL_ROWS: usize = 20;
@@ -6591,7 +6722,7 @@ fn run_submit_command(
     use colored::Colorize;
     use std::io::IsTerminal;
     use tokio::runtime::Runtime;
-    use tokscale_core::{generate_submission_graph, GroupBy, ReportOptions};
+    use tokscale_core::{generate_submission_graph_v2, GroupBy, ReportOptions};
 
     let auth_token = match auth::resolve_api_token() {
         Some(token) => token,
@@ -6793,7 +6924,7 @@ fn run_submit_command(
     let rt = Runtime::new()?;
     let mut graph_result = rt
         .block_on(async {
-            generate_submission_graph(ReportOptions {
+            generate_submission_graph_v2(ReportOptions {
                 home_dir: None,
                 use_env_roots: true,
                 clients,
@@ -7808,8 +7939,8 @@ mod tests {
     use clap::Parser;
     use reqwest::StatusCode;
     use tokscale_core::{
-        calculate_summary, calculate_years, ClientContribution, DailyContribution, DailyTotals,
-        GraphMeta, GraphResult, TokenBreakdown,
+        calculate_summary_v2, calculate_years_v2, ClientContributionV2, DailyContributionV2,
+        DailyTotalsV2, GraphMeta, GraphResultV2, TokenBreakdown,
     };
 
     #[test]
@@ -7896,6 +8027,24 @@ mod tests {
                 "{cost_per_token:e} per token rendered as ${rendered}"
             );
         }
+    }
+
+    /// A report row priced below half a cent per 1M rounded to `$0.00/M` under
+    /// `{:.2}`, which read as free. Negative cost is the missing-value marker
+    /// rather than a bound: a refund is not a cheap rate.
+    #[test]
+    fn format_cost_per_million_renders_sub_cent_and_zero_cleanly() {
+        assert_eq!(format_cost_per_million(0.0, 0), "—");
+        assert_eq!(format_cost_per_million(-1.0, 100), "—");
+        assert_eq!(format_cost_per_million(f64::NAN, 100), "—");
+        assert_eq!(format_cost_per_million(f64::INFINITY, 100), "—");
+        assert_eq!(format_cost_per_million(0.0, 1000), "$0.00/M");
+        assert_eq!(format_cost_per_million(0.000004, 1000), "<$0.01/M");
+        assert_eq!(format_cost_per_million(0.003625, 1_000_000), "<$0.01/M");
+        assert_eq!(format_cost_per_million(0.005, 1_000_000), "<$0.01/M");
+        assert_eq!(format_cost_per_million(0.0099, 1_000_000), "<$0.01/M");
+        assert_eq!(format_cost_per_million(0.01, 1_000_000), "$0.01/M");
+        assert_eq!(format_cost_per_million(15.0, 1_000_000), "$15.00/M");
     }
 
     #[test]
@@ -8080,30 +8229,32 @@ mod tests {
         total_cost: f64,
         client: &str,
         model_id: &str,
-    ) -> DailyContribution {
-        DailyContribution {
+    ) -> DailyContributionV2 {
+        DailyContributionV2 {
             date: date.to_string(),
-            totals: DailyTotals {
+            totals: DailyTotalsV2 {
                 tokens: total_tokens,
                 cost: total_cost,
                 messages: 1,
+                cost_provenance: None,
             },
             intensity: 0,
             token_breakdown: token_breakdown(total_tokens),
-            clients: vec![ClientContribution {
+            clients: vec![ClientContributionV2 {
                 client: client.to_string(),
                 model_id: model_id.to_string(),
                 provider_id: "openai".to_string(),
                 tokens: token_breakdown(total_tokens),
                 cost: total_cost,
                 messages: 1,
+                cost_provenance: None,
             }],
             active_time_ms: None,
         }
     }
 
-    fn graph_result_with_contributions(contributions: Vec<DailyContribution>) -> GraphResult {
-        GraphResult {
+    fn graph_result_with_contributions(contributions: Vec<DailyContributionV2>) -> GraphResultV2 {
+        GraphResultV2 {
             meta: GraphMeta {
                 generated_at: "2026-03-24T00:00:00Z".to_string(),
                 version: "test".to_string(),
@@ -8117,8 +8268,8 @@ mod tests {
                     .unwrap_or_default(),
                 processing_time_ms: 0,
             },
-            summary: calculate_summary(&contributions),
-            years: calculate_years(&contributions),
+            summary: calculate_summary_v2(&contributions),
+            years: calculate_years_v2(&contributions),
             contributions,
             time_metrics: None,
             unpriced_submission_usage: Vec::new(),
@@ -9422,22 +9573,22 @@ mod tests {
     #[test]
     fn test_light_spinner_frame_0() {
         let frame = LightSpinner::frame(0);
-        assert!(frame.contains(AMBIENT_STABLE_SCANNER_ACTIVE));
-        assert!(frame.contains(AMBIENT_STABLE_SCANNER_INACTIVE));
+        assert!(frame.contains(Glyphs::ascii_safe().scanner_active));
+        assert!(frame.contains(Glyphs::ascii_safe().scanner_inactive));
     }
 
     #[test]
     fn test_light_spinner_frame_1() {
         let frame = LightSpinner::frame(1);
-        assert!(frame.contains(AMBIENT_STABLE_SCANNER_ACTIVE));
-        assert!(frame.contains(AMBIENT_STABLE_SCANNER_INACTIVE));
+        assert!(frame.contains(Glyphs::ascii_safe().scanner_active));
+        assert!(frame.contains(Glyphs::ascii_safe().scanner_inactive));
     }
 
     #[test]
     fn test_light_spinner_frame_2() {
         let frame = LightSpinner::frame(2);
-        assert!(frame.contains(AMBIENT_STABLE_SCANNER_ACTIVE));
-        assert!(frame.contains(AMBIENT_STABLE_SCANNER_INACTIVE));
+        assert!(frame.contains(Glyphs::ascii_safe().scanner_active));
+        assert!(frame.contains(Glyphs::ascii_safe().scanner_inactive));
     }
 
     #[test]
@@ -9505,31 +9656,33 @@ mod tests {
         total_tokens: i64,
         cost: f64,
         messages: i32,
-    ) -> ClientContribution {
-        ClientContribution {
+    ) -> ClientContributionV2 {
+        ClientContributionV2 {
             client: client.to_string(),
             model_id: model_id.to_string(),
             provider_id: provider_id.to_string(),
             tokens: token_breakdown(total_tokens),
             cost,
             messages,
+            cost_provenance: None,
         }
     }
 
     fn day_with_clients(
         date: &str,
         token_breakdown_total: i64,
-        clients: Vec<ClientContribution>,
-    ) -> DailyContribution {
+        clients: Vec<ClientContributionV2>,
+    ) -> DailyContributionV2 {
         let tokens: i64 = clients.iter().map(|c| client_token_total(&c.tokens)).sum();
         let cost: f64 = clients.iter().map(|c| c.cost).sum();
         let messages: i32 = clients.iter().map(|c| c.messages).sum();
-        DailyContribution {
+        DailyContributionV2 {
             date: date.to_string(),
-            totals: DailyTotals {
+            totals: DailyTotalsV2 {
                 tokens,
                 cost,
                 messages,
+                cost_provenance: None,
             },
             intensity: 0,
             token_breakdown: token_breakdown(token_breakdown_total),
@@ -9573,6 +9726,32 @@ mod tests {
         assert_eq!(day.totals.messages, 45);
         assert!((graph.summary.total_cost - 2.08).abs() < 1e-9);
         assert_eq!(graph.summary.total_tokens, 100);
+    }
+
+    #[test]
+    fn test_exclude_tokenless_cost_rebuilds_day_provenance_from_retained_rows() {
+        let mut kept =
+            client_contribution("cursor", "claude-3.7-sonnet", "anthropic", 100, 0.03, 1);
+        kept.cost_provenance = Some(tokscale_core::CostProvenance::provider_reported());
+        let mut dropped = client_contribution("cursor", "auto", "cursor", 0, 0.04, 1);
+        dropped.cost_provenance = Some(tokscale_core::CostProvenance::estimated(
+            tokscale_core::EstimateSource::Catalog,
+        ));
+        let empty = client_contribution("cursor", "empty", "cursor", 0, 0.0, 1);
+        let mut day = day_with_clients("2025-05-28", 100, vec![kept, dropped, empty]);
+        day.totals.cost_provenance = Some(tokscale_core::CostProvenance::mixed(None));
+        let mut graph = graph_result_with_contributions(vec![day]);
+
+        exclude_tokenless_cost_contributions(&mut graph);
+
+        assert_eq!(
+            graph.contributions[0].totals.cost_provenance,
+            Some(tokscale_core::CostProvenance::provider_reported())
+        );
+        assert_eq!(
+            graph.summary.cost_provenance(),
+            tokscale_core::CostProvenance::provider_reported()
+        );
     }
 
     #[test]
@@ -9690,6 +9869,86 @@ mod tests {
     }
 
     #[test]
+    fn submit_payload_serializes_cost_provenance_on_all_aggregates() {
+        let mut day1 = daily_contribution("2026-12-30", 100, 1.50, "claude", "claude-sonnet-4-5");
+        day1.totals.cost_provenance = Some(tokscale_core::CostProvenance::provider_reported());
+        day1.clients[0].cost_provenance = Some(tokscale_core::CostProvenance::provider_reported());
+
+        let mut day2 = daily_contribution("2026-12-31", 200, 2.00, "codex", "gpt-5");
+        day2.totals.cost_provenance = Some(tokscale_core::CostProvenance::estimated(
+            tokscale_core::EstimateSource::Catalog,
+        ));
+        day2.clients[0].cost_provenance = Some(tokscale_core::CostProvenance::estimated(
+            tokscale_core::EstimateSource::Catalog,
+        ));
+
+        let mut graph = graph_result_with_contributions(vec![day1, day2]);
+        graph.summary.cost_provenance = Some(tokscale_core::CostProvenance::mixed(None));
+        graph.years[0].cost_provenance = Some(tokscale_core::CostProvenance::mixed(None));
+
+        let payload = to_ts_token_contribution_data(&graph, None, None);
+        let json = serde_json::to_value(&payload).unwrap();
+
+        // summary
+        assert_eq!(
+            json.pointer("/summary/costProvenance"),
+            Some(&serde_json::json!({ "kind": "mixed" }))
+        );
+
+        // years
+        assert_eq!(
+            json.pointer("/years/0/costProvenance"),
+            Some(&serde_json::json!({ "kind": "mixed" }))
+        );
+
+        // contributions[0].totals and clients[0]
+        assert_eq!(
+            json.pointer("/contributions/0/totals/costProvenance"),
+            Some(&serde_json::json!({ "kind": "providerReported" }))
+        );
+        assert_eq!(
+            json.pointer("/contributions/0/clients/0/costProvenance"),
+            Some(&serde_json::json!({ "kind": "providerReported" }))
+        );
+
+        // contributions[1].totals and clients[0]
+        assert_eq!(
+            json.pointer("/contributions/1/totals/costProvenance"),
+            Some(&serde_json::json!({ "kind": "estimated", "estimateSource": "catalog" }))
+        );
+        assert_eq!(
+            json.pointer("/contributions/1/clients/0/costProvenance"),
+            Some(&serde_json::json!({ "kind": "estimated", "estimateSource": "catalog" }))
+        );
+
+        // existing fields preserved
+        assert_eq!(
+            json.pointer("/summary/totalCost"),
+            Some(&serde_json::json!(3.5))
+        );
+        assert_eq!(
+            json.pointer("/contributions/0/totals/cost"),
+            Some(&serde_json::json!(1.5))
+        );
+        assert_eq!(
+            json.pointer("/contributions/0/clients/0/cost"),
+            Some(&serde_json::json!(1.5))
+        );
+    }
+
+    /// Both payload builders call `discover_mcp_server_names(None)`, which falls
+    /// back to `dirs::home_dir()` and reads the developer's own
+    /// `~/.claude/.mcp.json`. That made the `mcpServers` assertion below depend
+    /// on ambient state: on a machine with configured MCP servers the two
+    /// payloads were compared while a *concurrent* test swapped `HOME` between
+    /// the two calls, so the lists disagreed and the test failed — while
+    /// passing alone and under a clean `HOME`.
+    ///
+    /// `serial_test` plus an isolated `HOME` makes the list empty and stable on
+    /// every machine, which is what the assertion actually wants: the two
+    /// payloads agree, whatever the list is.
+    #[test]
+    #[serial_test::serial]
     fn imported_graph_submits_as_backfill_without_device_or_scope() {
         let graph = graph_result_with_contributions(vec![daily_contribution(
             "2026-05-01",
@@ -9698,6 +9957,22 @@ mod tests {
             "claude",
             "claude-opus-4-8",
         )]);
+
+        struct HomeRestore(Option<std::ffi::OsString>);
+        impl Drop for HomeRestore {
+            fn drop(&mut self) {
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var("HOME", value),
+                        None => std::env::remove_var("HOME"),
+                    }
+                }
+            }
+        }
+
+        let home = tempfile::TempDir::new().unwrap();
+        let _restore = HomeRestore(std::env::var_os("HOME"));
+        unsafe { std::env::set_var("HOME", home.path()) };
 
         let json = serde_json::to_value(backfill_payload(&graph, "ccusage")).unwrap();
         assert_eq!(
@@ -9720,6 +9995,15 @@ mod tests {
             serde_json::to_value(to_ts_token_contribution_data(&graph, None, None)).unwrap();
         assert!(scanned.get("provenance").is_none());
         assert_eq!(json.get("mcpServers"), scanned.get("mcpServers"));
+        // The isolated home configures no MCP servers, so the agreed-on value
+        // is absent rather than whatever this machine happens to have. Asserting
+        // it pins the isolation itself: a future `HOME` leak shows up here
+        // instead of as an intermittent inequality above.
+        assert!(
+            json.get("mcpServers").is_none(),
+            "mcpServers leaked from outside the isolated HOME: {:?}",
+            json.get("mcpServers")
+        );
     }
 
     #[test]
@@ -10413,5 +10697,100 @@ mod tests {
             &None,
             &group_by,
         );
+    }
+
+    #[test]
+    fn submit_payload_populates_retention_floors_for_full_history_clients() {
+        let graph = graph_result_with_contributions(vec![
+            day_with_clients(
+                "2026-08-07",
+                200,
+                vec![
+                    client_contribution("antigravity-cli", "gemini-3-pro", "google", 100, 0.1, 1),
+                    client_contribution("amp", "claude-sonnet-4", "anthropic", 100, 0.1, 1),
+                ],
+            ),
+            day_with_clients(
+                "2026-08-05",
+                100,
+                vec![client_contribution(
+                    "antigravity-cli",
+                    "gemini-3-pro",
+                    "google",
+                    100,
+                    0.1,
+                    1,
+                )],
+            ),
+        ]);
+        let clients = vec!["antigravity-cli".to_string(), "amp".to_string()];
+
+        let full_scope = submit_scan_scope(Some(&clients), true, true);
+        let full_payload = to_ts_token_contribution_data(&graph, None, full_scope);
+        let floors = full_payload
+            .scan_scope
+            .as_ref()
+            .and_then(|s| s.retention_floors.as_ref())
+            .expect("retention floors populated for full history");
+        assert_eq!(
+            floors.get("antigravity-cli").map(String::as_str),
+            Some("2026-08-05")
+        );
+        assert_eq!(floors.get("amp").map(String::as_str), Some("2026-08-07"));
+
+        let partial_amp_scope = submit_scan_scope(Some(&clients), true, false);
+        let partial_amp_payload = to_ts_token_contribution_data(&graph, None, partial_amp_scope);
+        let partial_floors = partial_amp_payload
+            .scan_scope
+            .as_ref()
+            .and_then(|s| s.retention_floors.as_ref())
+            .expect("retention floors populated for full_history_clients");
+        assert_eq!(
+            partial_floors.get("antigravity-cli").map(String::as_str),
+            Some("2026-08-05")
+        );
+        assert!(!partial_floors.contains_key("amp"));
+
+        let bounded_scope = submit_scan_scope(Some(&clients), false, true);
+        let bounded_payload = to_ts_token_contribution_data(&graph, None, bounded_scope);
+        assert!(bounded_payload
+            .scan_scope
+            .as_ref()
+            .and_then(|s| s.retention_floors.as_ref())
+            .is_none());
+    }
+
+    #[test]
+    fn submit_metrics_deserializes_total_tokens_and_rejects_overflow() {
+        let from_int: SubmitMetrics =
+            serde_json::from_str(r#"{"totalTokens":240000,"totalCost":1.5}"#).unwrap();
+        assert_eq!(from_int.total_tokens, Some(240_000));
+
+        let from_str: SubmitMetrics =
+            serde_json::from_str(r#"{"totalTokens":"240000","totalCost":1.5}"#).unwrap();
+        assert_eq!(from_str.total_tokens, Some(240_000));
+
+        let from_float: SubmitMetrics =
+            serde_json::from_str(r#"{"totalTokens":240000.0,"totalCost":1.5}"#).unwrap();
+        assert_eq!(from_float.total_tokens, Some(240_000));
+
+        let from_null: SubmitMetrics =
+            serde_json::from_str(r#"{"totalTokens":null,"totalCost":1.5}"#).unwrap();
+        assert_eq!(from_null.total_tokens, None);
+
+        let from_omitted: SubmitMetrics = serde_json::from_str(r#"{"totalCost":1.5}"#).unwrap();
+        assert_eq!(from_omitted.total_tokens, None);
+
+        // u64::MAX must not silently wrap to -1
+        assert!(serde_json::from_str::<SubmitMetrics>(
+            r#"{"totalTokens":18446744073709551615,"totalCost":1.5}"#
+        )
+        .is_err());
+
+        // Non-integral floats must be rejected
+        assert!(serde_json::from_str::<SubmitMetrics>(
+            r#"{"totalTokens":240000.5,"totalCost":1.5}"#
+        )
+        .is_err());
     }
 }
