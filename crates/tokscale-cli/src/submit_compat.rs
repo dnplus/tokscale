@@ -7,9 +7,28 @@ use anyhow::{Context, Result};
 use reqwest::StatusCode;
 
 use crate::{
-    DateRange, TsDataSummary, TsTokenContributionData, TsYearSummary,
+    DateRange, TsDataSummary, TsSourceContribution, TsTokenContributionData, TsYearSummary,
     CURSOR_SUBMISSION_PARSER_VERSION, GROK_BOT_SUBMISSION_PARSER_VERSION,
 };
+
+/// Rebuild cost provenance from the retained rows, using the same participation
+/// rule the report aggregates use, so removed family rows stop contributing.
+fn retained_provenance<'a>(
+    cells: impl IntoIterator<Item = &'a TsSourceContribution>,
+) -> tokscale_core::CostProvenance {
+    let mut provenance = tokscale_core::CostProvenanceAccumulator::default();
+    for cell in cells {
+        let tokens = cell
+            .tokens
+            .input
+            .saturating_add(cell.tokens.output)
+            .saturating_add(cell.tokens.cache_read)
+            .saturating_add(cell.tokens.cache_write)
+            .saturating_add(cell.tokens.reasoning);
+        provenance.add_usage(tokens, cell.cost, &cell.cost_provenance.unwrap_or_default());
+    }
+    provenance.finish()
+}
 
 fn is_family(client: &str) -> bool {
     matches!(client, "cursor" | "grok-bot")
@@ -195,10 +214,26 @@ fn prepare_for_capability(
         max_cost_in_single_day: summary.max_cost_in_single_day,
         clients: summary.clients,
         models: summary.models,
+        cost_provenance: filtered.summary.cost_provenance.map(|_| {
+            retained_provenance(filtered.contributions.iter().flat_map(|day| &day.clients))
+        }),
     };
+    let had_year_provenance = filtered
+        .years
+        .iter()
+        .any(|year| year.cost_provenance.is_some());
     filtered.years = tokscale_core::calculate_years(&days)
         .into_iter()
         .map(|year| TsYearSummary {
+            cost_provenance: had_year_provenance.then(|| {
+                retained_provenance(
+                    filtered
+                        .contributions
+                        .iter()
+                        .filter(|day| day.date.starts_with(&year.year))
+                        .flat_map(|day| &day.clients),
+                )
+            }),
             year: year.year,
             total_tokens: year.total_tokens,
             total_cost: year.total_cost,
@@ -212,6 +247,9 @@ fn prepare_for_capability(
         target.totals.tokens = day.totals.tokens;
         target.totals.cost = day.totals.cost;
         target.totals.messages = day.totals.messages;
+        if target.totals.cost_provenance.is_some() {
+            target.totals.cost_provenance = Some(retained_provenance(&target.clients));
+        }
         // Keep incomplete-pricing evidence conservative after removing clients.
         target.intensity = day.intensity;
         target.token_breakdown = crate::TsTokenBreakdown {
@@ -264,6 +302,7 @@ mod tests {
                 max_cost_in_single_day: 0.0,
                 clients: clients.iter().map(|c| c.to_string()).collect(),
                 models: vec![],
+                cost_provenance: None,
             },
             years: vec![],
             contributions: vec![],
@@ -289,6 +328,7 @@ mod tests {
                     cost: 1.0,
                     messages: 1,
                     cost_is_complete: Some(false),
+                    cost_provenance: None,
                 },
                 intensity: 4,
                 token_breakdown: TsTokenBreakdown {
@@ -311,6 +351,7 @@ mod tests {
                     },
                     cost: 1.0,
                     messages: 1,
+                    cost_provenance: None,
                 }],
                 active_time_ms: Some(100),
             });

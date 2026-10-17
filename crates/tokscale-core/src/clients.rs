@@ -1093,8 +1093,40 @@ define_clients!(
         parse_local: true,
         submit_default: true
     },
+    Aside = 56 => {
+        id: "aside",
+        display: "Aside",
+        logo: Some("https://raw.githubusercontent.com/junhoyeo/tokscale/main/.github/assets/client-aside.png"),
+        root: PathRoot::Home,
+        relative: ".aside/u",
+        // Documentation only: `scanner::scan_aside_accounts` owns this
+        // client's discovery and ignores the pattern, because the generic
+        // walker would both follow a transcript-shaped symlink out of the
+        // account tree and admit `messages.jsonl` at the wrong depth.
+        pattern: "messages.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    // Mistral Vibe: terminal coding agent by Mistral AI.
+    // Logs session metadata and message history under `~/.vibe/logs/session/`
+    // (configurable via VIBE_HOME).
+    Vibe = 57 => {
+        id: "vibe",
+        display: "Mistral Vibe",
+        logo: None,
+        root: PathRoot::EnvVar {
+            var: "VIBE_HOME",
+            fallback_relative: ".vibe",
+        },
+        relative: "logs/session",
+        pattern: "vibe-session",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
     // Attribution surface sharing Cursor's cache, not a second physical source.
-    GrokBot = 56 => {
+    GrokBot = 58 => {
         id: "grok-bot",
         display: "Grok Bot",
         logo: None,
@@ -1219,7 +1251,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 57);
+        assert_eq!(ClientId::COUNT, 59);
     }
 
     #[test]
@@ -2350,6 +2382,16 @@ mod tests {
         assert_eq!(client.data().pattern, "*.db");
         assert!(client.parse_local());
         assert!(client.submit_default());
+    }
+
+    #[test]
+    fn test_vibe_client_registered_as_local_session_source() {
+        let client = ClientId::from_str("vibe").expect("vibe client should be registered");
+        assert_eq!(client.data().relative_path, "logs/session");
+        assert_eq!(client.data().pattern, "vibe-session");
+        assert!(client.data().parse_local);
+        assert!(client.data().submit_default);
+        assert!(!client.data().headless);
     }
 
     #[test]

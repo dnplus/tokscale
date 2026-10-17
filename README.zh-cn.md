@@ -87,7 +87,7 @@
 | <img width="48px" src=".github/assets/client-kilocode.png" alt="Kilo CLI" /> | [Kilo CLI](https://github.com/nicepkg/kilo) | `~/.local/share/kilo/kilo.db` |
 | <img width="48px" src=".github/assets/client-mux.png" alt="Mux" /> | [Mux](https://github.com/coder/mux) | `~/.mux/sessions/` |
 | <img width="48px" src=".github/assets/client-crush.png" alt="Crush" /> | [Crush](https://crush.ai/) | `$XDG_DATA_HOME/crush/projects.json`（项目注册表；回退路径：`~/.local/share/crush/projects.json`） |
-| <img width="48px" src=".github/assets/client-goose.png" alt="Goose" /> | [Goose](https://github.com/aaif-goose/goose) | `~/.local/share/goose/sessions/sessions.db`（+ macOS Application Support、旧版 Block/goose 路径；可通过 `GOOSE_PATH_ROOT` 覆盖） |
+| <img width="48px" src=".github/assets/client-goose.png" alt="Goose" /> | [Goose](https://github.com/aaif-goose/goose) | `~/.local/share/goose/sessions/sessions.db` / `%APPDATA%\Block\goose\data\sessions\sessions.db`（+ macOS Application Support、旧版 Block/goose 路径；可通过 `GOOSE_PATH_ROOT` 覆盖） |
 | <img width="48px" src=".github/assets/client-antigravity.png" alt="Antigravity" /> | [Google Antigravity](https://antigravity.google/) | 通过 `tokscale antigravity sync` 缓存到 `~/.config/tokscale/antigravity-cache/sessions/*.jsonl`（使用本地语言服务器 RPC） |
 | <img width="48px" src=".github/assets/client-antigravity.png" alt="Antigravity CLI" /> | [Antigravity CLI](https://antigravity.google/) | `~/.gemini/antigravity-cli/conversations/*.db`（可通过 `GEMINI_CLI_HOME` 覆盖 Gemini 主目录；本地 SQLite，直接读取 — 无需 `antigravity sync`） |
 | <img width="48px" src=".github/assets/client-antigravity.png" alt="Antigravity IDE Extension" /> | [Antigravity IDE Extension](https://www.antigravity.google/docs/ide/extensions/) | `~/.gemini/antigravity/conversations/*.db`（直接读取本地 SQLite） |
@@ -118,6 +118,8 @@
 | <img width="48px" src="https://github.com/deepseek-ai.png" alt="DeepSeek Harness" /> | [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeek-Harness) | `~/.dsh/sessions/**/session.jsonl.zstd`（未压缩写出时为 `session.jsonl`，带版本号的 `session.v<N>.jsonl[.zstd]` 拼写也会读取；可通过 `DSH_HOME` 覆盖） |
 | <img width="48px" src=".github/assets/client-fx.png" alt="Fx" /> | [fx](https://github.com/vercel-labs/fx) | `~/.fx/sessions/<sessionId>/usage-v2.json` (按会话聚合) |
 | <img width="48px" src="https://github.com/meta-models.png" alt="Muse Code" /> | [Muse Code](https://dev.meta.ai/docs/muse-code) | `~/.local/share/muse/sessions/**/session.jsonl`（Windows 通用 XDG 路径，含 `subagent/<uuid>/` 子代理记录） |
+| <img width="48px" src=".github/assets/client-aside.png" alt="Aside" /> | [Aside](https://asidehq.com) | `~/.aside/u/<account>/sessions/<session>/messages.jsonl` |
+| <img width="48px" src="https://github.com/mistralai.png" alt="Mistral Vibe" /> | [Mistral Vibe](https://github.com/mistralai/mistral-vibe) | `~/.vibe/logs/session/<session-dir>/meta.json`（Windows 通用路径；可用 `VIBE_HOME` 覆盖根目录） |
 
 使用 [🚅 LiteLLM 的价格数据](https://github.com/BerriAI/litellm)提供实时价格计算，支持分层定价模型和缓存 Token 折扣。
 
@@ -190,7 +192,7 @@
   - 支持可配置颜色主题的 GitHub 风格贡献图
   - 实时筛选和排序
   - 零闪烁渲染
-- **多平台支持** - 跟踪 OpenCode、Claude Code、Codex CLI、Prime Agent、Copilot CLI、Cursor IDE、Gemini CLI、Amp、Codebuff、Droid、OpenClaw、Hermes Agent、Pi、Kimchi Coding、Reasonix、Kimi CLI、Kimi Work、Qwen CLI、Roo Code、Kilo、Mux、Kilo CLI、Crush、Goose、Antigravity、Antigravity CLI、Antigravity IDE Extension、Zed、Kiro、Trae、Warp/Oz、Cline、Gajae-Code、Grok Build、Jcode、MiMo Code、Xiaomi MiMo AI、Command Code、Junie、ZCode、OpenCodeReview、CodeBuddy、WorkBuddy、Devin CLI、Devin Desktop、Augment Code、Synthetic、Cherry Studio、LM Studio、Unsloth Studio、Hindsight、fx、Oh My Pi 和 Muse Code 的使用情况
+- **多平台支持** - 跟踪 OpenCode、Claude Code、Codex CLI、Prime Agent、Copilot CLI、Cursor IDE、Gemini CLI、Amp、Codebuff、Droid、OpenClaw、Hermes Agent、Pi、Kimchi Coding、Reasonix、Kimi CLI、Kimi Work、Qwen CLI、Roo Code、Kilo、Mux、Kilo CLI、Crush、Goose、Antigravity、Antigravity CLI、Antigravity IDE Extension、Zed、Kiro、Trae、Warp/Oz、Cline、Gajae-Code、Grok Build、Jcode、MiMo Code、Xiaomi MiMo AI、Command Code、Junie、ZCode、OpenCodeReview、CodeBuddy、WorkBuddy、Devin CLI、Devin Desktop、Augment Code、Synthetic、Cherry Studio、LM Studio、Unsloth Studio、Hindsight、fx、Oh My Pi、Muse Code、Aside 和 Mistral Vibe 的使用情况
 - **实时定价** - 从 LiteLLM 获取当前价格，带 1 小时磁盘缓存；OpenRouter 自动回退和新模型的 Cursor 定价支持
 - **详细分解** - 输入、输出、缓存读写和推理 Token 跟踪
 - **原生 Rust 核心** - 所有解析和聚合在 Rust 中完成，处理速度提升 10 倍
@@ -426,7 +428,7 @@ tokscale --client synthetic
 tokscale --client opencode,claude --week --json
 ```
 
-可用值：`opencode`、`claude`、`codex`、`copilot`、`gemini`、`cursor`、`amp`、`codebuff`、`droid`、`openclaw`、`hermes`、`pi`、`prime-agent`、`kimchi`、`kimi`、`qwen`、`roocode`、`kilocode`、`kilo`、`mux`、`crush`、`goose`、`antigravity`、`antigravity-cli`、`antigravity-extension`、`zed`、`kiro`、`trae`、`warp`、`cline`、`gjc`、`grok`、`jcode`、`micode`、`micode-desktop`、`commandcode`、`junie`、`zcode`、`opencodereview`、`codebuddy`、`augment`、`synthetic`、`cherrystudio`、`lmstudio`、`unsloth`、`hindsight`、`muse`。
+可用值：`opencode`、`claude`、`codex`、`copilot`、`gemini`、`cursor`、`amp`、`codebuff`、`droid`、`openclaw`、`hermes`、`pi`、`prime-agent`、`kimchi`、`kimi`、`qwen`、`roocode`、`kilocode`、`kilo`、`mux`、`crush`、`goose`、`antigravity`、`antigravity-cli`、`antigravity-extension`、`zed`、`kiro`、`trae`、`warp`、`cline`、`gjc`、`grok`、`jcode`、`micode`、`micode-desktop`、`commandcode`、`junie`、`zcode`、`opencodereview`、`codebuddy`、`augment`、`synthetic`、`cherrystudio`、`lmstudio`、`unsloth`、`hindsight`、`muse`、`aside` 和 `vibe`。
 
 > **破坏性变更（v4.0.0）**：单客户端布尔选项（`--opencode`、`--claude`、`--codex` 等）已被移除，现在会直接报错。请改用规范的 `--client`/`-c` 选项——例如 `tokscale --client opencode,claude`。
 
@@ -1123,7 +1125,7 @@ tokscale sources --json
 - **交互式提示**：悬停查看详细的每日分解
 - **每日分解面板**：点击查看每个来源和模型的详情
 - **年份筛选**：在年份之间导航
-- **来源筛选**：按平台筛选（OpenCode、Claude、Codex、Copilot、Cursor、Gemini、Amp、Codebuff、Droid、OpenClaw、Hermes Agent、Pi、Prime Agent、Kimi、Qwen、Roo Code、Kilo、Mux、Kilo CLI、Crush、Goose、Antigravity、Antigravity CLI、Antigravity IDE Extension、Zed、Kiro、Trae、Warp、Cline、Gajae-Code、Grok Build、Jcode、MiMo Code、Xiaomi MiMo AI、Command Code、Junie、ZCode、OpenCodeReview、CodeBuddy、WorkBuddy、Devin CLI、Devin Desktop、Augment Code、Synthetic、Cherry Studio、LM Studio、Unsloth、Hindsight、Muse Code）
+- **来源筛选**：按平台筛选（OpenCode、Claude、Codex、Copilot、Cursor、Gemini、Amp、Codebuff、Droid、OpenClaw、Hermes Agent、Pi、Prime Agent、Kimi、Qwen、Roo Code、Kilo、Mux、Kilo CLI、Crush、Goose、Antigravity、Antigravity CLI、Antigravity IDE Extension、Zed、Kiro、Trae、Warp、Cline、Gajae-Code、Grok Build、Jcode、MiMo Code、Xiaomi MiMo AI、Command Code、Junie、ZCode、OpenCodeReview、CodeBuddy、WorkBuddy、Devin CLI、Devin Desktop、Augment Code、Synthetic、Cherry Studio、LM Studio、Unsloth、Hindsight、Muse Code、Aside 和 Mistral Vibe）
 - **统计面板**：总成本、Token、活跃天数、连续记录
 - **FOUC 防护**：在 React 水合前应用主题（无闪烁）
 
@@ -1520,7 +1522,7 @@ AI 编程工具将会话数据存储在跨平台位置。大多数工具在所�
 | Codebuff | `~/.config/manicode/projects/`（+ `manicode-dev`、`manicode-staging`） | `%USERPROFILE%\.config\manicode\projects\` | 通过 `CODEBUFF_DATA_DIR` 环境变量覆盖 |
 | Kilo CLI | `~/.local/share/kilo/` | `%USERPROFILE%\.local\share\kilo\` | 与 OpenCode 一样使用 `xdg-basedir` |
 | Crush | `$XDG_DATA_HOME/crush/`（回退路径：`~/.local/share/crush/`） | `%USERPROFILE%\.local\share\crush\`（如果设置了 `%XDG_DATA_HOME%`，则为 `%XDG_DATA_HOME%\crush\`） | 使用带回退路径的 XDG 数据目录 |
-| Goose | `~/.local/share/goose/sessions/`（+ macOS Application Support、旧版 Block 路径） | `%USERPROFILE%\.local\share\goose\sessions\` | 可通过 `GOOSE_PATH_ROOT` 环境变量配置 |
+| Goose | `~/.local/share/goose/sessions/`（+ macOS Application Support、旧版 Block 路径） | `%APPDATA%\Block\goose\data\sessions`（回退路径：`%USERPROFILE%\.local\share\goose\sessions\` 和旧版 `Block` 路径） | 可通过 `GOOSE_PATH_ROOT` 环境变量配置 |
 | Antigravity | `~/.config/tokscale/antigravity-cache/sessions/` | — | `tokscale antigravity sync` 目前仅支持 macOS / Linux |
 | Antigravity IDE Extension | `~/.gemini/antigravity/conversations/` | `%USERPROFILE%\.gemini\antigravity\conversations\` | 所有平台使用相同路径 |
 | Zed Agent | `~/.local/share/zed/threads/threads.db` | `%LOCALAPPDATA%\Zed\threads\threads.db` | 仅限托管 Zed 模型的使用量；不含外部 ACP 代理 |
@@ -1544,10 +1546,12 @@ AI 编程工具将会话数据存储在跨平台位置。大多数工具在所�
 | Synthetic | 从其他来源重归属 | 从其他来源重归属 | 检测 `hf:` 模型前缀 + `synthetic` provider |
 | Hindsight | `$HINDSIGHT_HOME/usage/`（回退：`~/.hindsight/usage/`） | `%HINDSIGHT_HOME%\usage\`（回退：`%USERPROFILE%\.hindsight\usage\`） | 通过 `tokscale hindsight sync` 进行 API 同步；Hindsight 本身不保留本地会话日志，数据从 LLM 追踪 API 同步到仅追加的 JSONL 缓存中 |
 | Muse Code | `~/.local/share/muse/sessions/` | `%USERPROFILE%\.local\share\muse\sessions\` | 全平台通用 XDG 路径；解析 `session.jsonl` 的 `model_completed` 用量事件及 `subagent/` 记录 |
+| Aside | `~/.aside/u/<account>/sessions/<session>/messages.jsonl` | `%USERPROFILE%\.aside\u\<account>\sessions\<session>\messages.jsonl` | 按账户读取原生浏览器用量；仅扫描 `messages.jsonl`，排除 artifacts、memory 和 passwords。 |
+| Mistral Vibe | `$VIBE_HOME/logs/session/`（默认：`~/.vibe/logs/session/`） | `%VIBE_HOME%\logs\session\`（默认：`%USERPROFILE%\.vibe\logs\session\`） | 全平台通用 `~/.vibe` 根目录；仅读取各会话目录的 `meta.json` 累计 `stats`，不读取 `messages.jsonl` 对话内容 |
 
 > **Devin Desktop 代理支持**：本地用量解析适用于会在 NDJSON 流中发出 `usage_update` 事件的 ACP 连接代理（例如 Cascade/Windsurf、claude-code、opencode）。默认的 **devin-cloud** 代理不会发出本地 `usage_update` 事件——其用量仍保留在服务器端，tokscale 无法在没有账号级 API 的情况下跟踪它。
 
-> **注意**：在 Windows 上，`~` 扩展为 `%USERPROFILE%`（例如 `C:\Users\用户名`）。这些工具故意使用 Unix 风格的路径（如 `.local/share`）而不是 Windows 原生路径（如 `%APPDATA%`），以实现跨平台一致性。
+> **注意**：在 Windows 上，`~` 扩展为 `%USERPROFILE%`（例如 `C:\Users\用户名`）。部分工具使用 Unix 风格的路径（如 `.local/share`）以保持跨平台一致性，另一些工具（包括 Goose）则使用上表列出的 Windows 原生路径（如 `%APPDATA%`）。
 
 #### Windows 特定配置
 
@@ -1979,6 +1983,8 @@ Crush 在项目级 SQLite 数据库（`crush.db`）中存储使用量。由于 C
 
 位置：`~/.local/share/goose/sessions/sessions.db`（同时扫描 `~/Library/Application Support/goose/`、`~/Library/Application Support/Block/goose/`、`~/.local/share/Block/goose/`；可通过 `GOOSE_PATH_ROOT` 覆盖）
 
+原生 Windows 扫描先检查 `%APPDATA%\Block\goose\data\sessions\sessions.db`，再检查 XDG 和旧版位置。`APPDATA` 未设置或为空时，先检查系统 Roaming 目录，再检查桌面版的 `<HOME>/AppData/Roaming` 后备目录。`--home` 扫描忽略 `GOOSE_PATH_ROOT` 和进程环境决定的 Windows 位置，并检查 `<home>/AppData/Roaming/Block/goose/data/sessions/sessions.db`。未指定 `--home` 时，绝对路径 `GOOSE_PATH_ROOT` 始终优先，即使其数据库尚不存在也不回退；相对路径值会被忽略。移动可执行文件不会改变数据库位置。
+
 Goose 在 SQLite 的 `sessions.db` 中按会话保存使用量。Tokscale 从 `model_config_json` 提取模型，从 `provider_name` 提取提供商，并按会话累加输入/输出 Token 总数。当推理 Token 列有数据时也会被推断出来。
 
 ### Codebuff
@@ -2037,6 +2043,10 @@ WHERE json_extract(m.data, '$.role') = 'assistant'
 ```
 Tokscale 使用时间戳、模型、provider、token 计数、成本和 agent 名称的指纹对跨 fork 会话的消息进行去重。
 
+### Aside
+
+Aside 的扁平 assistant 用量记录位于 `~/.aside/u/<account>/sessions/<session>/messages.jsonl`。Tokscale 保留原始时间戳、模型信息以及独立的缓存输入分项（含 1 小时 TTL 的缓存写入部分）。reasoning 从 output 中拆分，因此总量和估算费用仅计算一次。Aside 的 `provider` 字段记录的是路由而非供应商，因此 Claude Code 路由归为 Anthropic，通用网关路由则依据模型系列推断；显式的供应商 ID 仍然优先。同一提供商的重复 response ID 跨会话和账户去重，没有 ID 的调用分别保留。正数记录费用予以保留，费用为 0 或缺失时使用现有定价。可通过 `tokscale --no-spinner --client aside` 筛选。尚未验证 Windows 执行。
+
 ### Muse Code
 
 位置：`~/.local/share/muse/sessions/YYYY/MM/DD/<session-uuid>/session.jsonl`（全平台通用 XDG 路径，Windows 亦然；同时扫描 `subagent/<uuid>/` 子代理记录）
@@ -2044,6 +2054,14 @@ Tokscale 使用时间戳、模型、provider、token 计数、成本和 agent �
 Muse Code 为每个会话写入一份事件溯源式 JSONL 记录。Tokscale 读取其中的 `model_completed` 事件，该事件包含模型 ID（`muse-spark-*`）、Responses 形状的 `usage` 对象（`input_tokens`、`output_tokens`、`cached_tokens`/`cache_read_tokens`、`cache_write_tokens`、`reasoning_tokens`）以及本次调用的 `duration_ms`；`recorded_at` 单位为微秒。`cached_tokens` 是 `input_tokens` 的子集，reasoning 包含在 `output_tokens` 内，因此两者都会在计价与聚合前拆分出来。父会话中的 `workflow_child_lifecycle` 用量汇总是子记录的重复汇总（子记录会单独扫描），会被跳过。工作区标签来自文件中的 `runtime.session.metadata` 记录。
 
 Muse Spark 模型按上游数据集计价——LiteLLM 和 models.dev 均收录了 Meta 公布费率的 `meta/muse-spark-*` 条目，因此 Muse 用量开箱即有成本（Standard：输入/输出每百万 token $1.25/$4.25，缓存输入 $0.15；Contributor：$0.10/$0.20，缓存输入 $0.002。参见[价格与速率限制](https://dev.meta.ai/docs/pricing-rate-limits)）。
+
+### Mistral Vibe
+
+位置：`~/.vibe/logs/session/<prefix>_<YYYYMMDD_HHMMSS>_<short-id>/meta.json`（macOS、Linux 与 Windows 使用相同的 `~/.vibe` 根目录——Vibe 不使用 XDG 或 `%APPDATA%` 路径；可用 `VIBE_HOME` 覆盖根目录，或用 `session_logging.save_dir` 覆盖会话目录）
+
+Vibe 为每个会话创建一个目录，存放 `meta.json` 与 `messages.jsonl` 对话记录。用量是会话粒度的：对话记录不含逐条消息的模型、时间戳或 token 数，因此 Tokscale 只读取 `meta.json` 中的累计 `stats` 块（`session_prompt_tokens`、`session_completion_tokens`、`session_cached_tokens`），不读取对话内容。`session_cached_tokens` 是 `session_prompt_tokens` 的*子集*而非额外项，因此计价前会把缓存读取从输入 token 中拆出——与 Vibe 自身的成本显示采用相同算法。所以每个会话一条消息已是该格式能支持的最细粒度：`steps` 作为消息数，`end_time`（ISO-8601，缺失时用 `start_time`）作为时间戳。2.0 之前的会话把相同字段放在 `metadata` 键下，存为扁平的 `<prefix>_*.json` 文件，这种格式仍会被读取。
+
+模型取自 `meta.json` 的 `config.active_model`，即会话固定的别名。从未固定过的会话会记录空字符串——这是 Vibe 文档中「沿用所配置的默认值」的哨兵值——因此 Tokscale 不会把用量归到空模型，而是先从会话自身的 `config.models` 表解析，再退回 Mistral 公布的默认别名。注意别名（`mistral-medium-3.5`）并非实际请求 ID：Vibe 发送的是公开价格数据集中不存在的 CLI 专用端点名（`mistral-vibe-cli-latest`），所以计价按别名匹配。工作区标签来自 `environment.working_directory`，缺失时回退到 `origin_directory`。
 
 ## 定价
 

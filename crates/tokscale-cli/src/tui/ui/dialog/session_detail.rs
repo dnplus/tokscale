@@ -12,13 +12,13 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::tui::data::SessionUsage;
-use crate::tui::i18n::{tr, MessageKey, TuiLanguage};
+use crate::tui::i18n::{tr, tr_with_glyphs, MessageKey, TuiLanguage};
 use crate::tui::themes::Theme;
 use crate::tui::ui::widgets::{
-    ambient_stable_scrollbar, format_cache_hit_rate, format_cost, format_cost_per_million,
-    format_tokens_with_commas, get_client_display_name, viewport_scrollbar_state,
-    AMBIENT_STABLE_BORDER_SET,
+    format_cache_hit_rate, format_cost, format_cost_per_million, format_tokens_with_commas,
+    get_client_display_name, viewport_scrollbar_state,
 };
+use crate::ui_glyphs::Glyphs;
 
 use super::{DialogContent, DialogResult};
 
@@ -48,7 +48,7 @@ impl SessionDetailDialog {
         self.scroll_offset.get()
     }
 
-    fn build_lines(&self, theme: &Theme, inner_width: u16) -> Vec<Line<'static>> {
+    fn build_lines(&self, theme: &Theme, inner_width: u16, glyphs: Glyphs) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let avail_width = inner_width as usize;
 
@@ -57,6 +57,7 @@ impl SessionDetailDialog {
             tr(self.lang, MessageKey::SessionDetailSectionOverview),
             theme,
             inner_width,
+            glyphs.axis_horizontal,
         ));
 
         lines.push(kv_line(
@@ -102,7 +103,7 @@ impl SessionDetailDialog {
         } else {
             lines.push(kv_line(
                 tr(self.lang, MessageKey::SessionDetailDirectory),
-                Span::styled("\u{2014}", Style::default().fg(theme.muted)),
+                Span::styled(glyphs.missing, Style::default().fg(theme.muted)),
                 theme,
             ));
         }
@@ -110,7 +111,7 @@ impl SessionDetailDialog {
         if self.session.models.is_empty() {
             lines.push(kv_line(
                 tr(self.lang, MessageKey::ColModels),
-                Span::styled("\u{2014}", Style::default().fg(theme.muted)),
+                Span::styled(glyphs.missing, Style::default().fg(theme.muted)),
                 theme,
             ));
         } else if self.session.models.len() == 1 {
@@ -175,12 +176,13 @@ impl SessionDetailDialog {
             tr(self.lang, MessageKey::SessionDetailSectionActivity),
             theme,
             inner_width,
+            glyphs.axis_horizontal,
         ));
 
         let turn_count = if self.session.turn_count > 0 {
             format_tokens_with_commas(self.session.turn_count as u64)
         } else {
-            "\u{2014}".to_string()
+            glyphs.missing.to_string()
         };
         lines.push(kv_line(
             tr(self.lang, MessageKey::ColTurn),
@@ -200,7 +202,11 @@ impl SessionDetailDialog {
         lines.push(kv_line(
             tr(self.lang, MessageKey::ColDuration),
             Span::styled(
-                format_duration(self.session.first_active_ms, self.session.last_active_ms),
+                format_duration(
+                    self.session.first_active_ms,
+                    self.session.last_active_ms,
+                    glyphs,
+                ),
                 theme.hint_key_style(),
             ),
             theme,
@@ -208,7 +214,7 @@ impl SessionDetailDialog {
 
         let first_active_str = ms_to_local_naive(self.session.first_active_ms)
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_else(|| "\u{2014}".to_string());
+            .unwrap_or_else(|| glyphs.missing.to_string());
         lines.push(kv_line(
             tr(self.lang, MessageKey::SessionDetailFirstActive),
             Span::styled(first_active_str, Style::default().fg(theme.muted)),
@@ -217,7 +223,7 @@ impl SessionDetailDialog {
 
         let last_active_str = ms_to_local_naive(self.session.last_active_ms)
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_else(|| "\u{2014}".to_string());
+            .unwrap_or_else(|| glyphs.missing.to_string());
         lines.push(kv_line(
             tr(self.lang, MessageKey::ColLastActive),
             Span::styled(last_active_str, Style::default().fg(theme.muted)),
@@ -230,6 +236,7 @@ impl SessionDetailDialog {
             tr(self.lang, MessageKey::SessionDetailSectionTokens),
             theme,
             inner_width,
+            glyphs.axis_horizontal,
         ));
 
         lines.push(kv_line(
@@ -246,7 +253,7 @@ impl SessionDetailDialog {
         lines.push(kv_line(
             tr(self.lang, MessageKey::ColCostPer1M),
             Span::styled(
-                format_cost_per_million(self.session.cost, self.session.tokens.total()),
+                format_cost_per_million(self.session.cost, self.session.tokens.total(), glyphs),
                 Style::default().fg(Color::Rgb(150, 200, 150)),
             ),
             theme,
@@ -315,6 +322,7 @@ impl SessionDetailDialog {
                     self.session.tokens.cache_read,
                     self.session.tokens.input,
                     self.session.tokens.cache_write,
+                    glyphs,
                 ),
                 theme.count_style(),
             ),
@@ -332,11 +340,11 @@ impl DialogContent for SessionDetailDialog {
         (width, height)
     }
 
-    fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme, glyphs: Glyphs) {
         let block = Block::default()
             .title(tr(self.lang, MessageKey::SessionDetailDialogTitle))
             .borders(Borders::ALL)
-            .border_set(AMBIENT_STABLE_BORDER_SET)
+            .border_set(glyphs.border)
             .border_style(Style::default().fg(theme.accent));
 
         let inner = block.inner(area);
@@ -354,7 +362,7 @@ impl DialogContent for SessionDetailDialog {
         let content_area = chunks[0];
         let footer_area = chunks[1];
 
-        let lines = self.build_lines(theme, content_area.width);
+        let lines = self.build_lines(theme, content_area.width, glyphs);
         let total_lines = lines.len();
         let visible_height = content_area.height as usize;
 
@@ -369,13 +377,13 @@ impl DialogContent for SessionDetailDialog {
         frame.render_widget(paragraph, content_area);
 
         if total_lines > visible_height {
-            let scrollbar = ambient_stable_scrollbar();
+            let scrollbar = glyphs.scrollbar();
             let mut scrollbar_state =
                 viewport_scrollbar_state(total_lines, effective_scroll, visible_height);
             frame.render_stateful_widget(scrollbar, content_area, &mut scrollbar_state);
         }
 
-        let hint = tr(self.lang, MessageKey::SessionDetailDialogHint);
+        let hint = tr_with_glyphs(self.lang, MessageKey::SessionDetailDialogHint, glyphs);
         let footer_para = Paragraph::new(Line::from(vec![Span::styled(
             hint,
             Style::default().fg(theme.muted),
@@ -460,13 +468,16 @@ impl DialogContent for SessionDetailDialog {
     }
 }
 
-fn section_header(title: &str, theme: &Theme, inner_width: u16) -> Line<'static> {
+fn section_header(title: &str, theme: &Theme, inner_width: u16, horizontal: char) -> Line<'static> {
     let title_width = UnicodeWidthStr::width(title);
     let dashes = (inner_width as usize)
         .saturating_sub(title_width + 4)
         .max(3);
     Line::from(vec![
-        Span::styled("── ", Style::default().fg(theme.border)),
+        Span::styled(
+            format!("{horizontal}{horizontal} "),
+            Style::default().fg(theme.border),
+        ),
         Span::styled(
             title.to_string(),
             Style::default()
@@ -474,7 +485,10 @@ fn section_header(title: &str, theme: &Theme, inner_width: u16) -> Line<'static>
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" ", Style::default()),
-        Span::styled("─".repeat(dashes), Style::default().fg(theme.border)),
+        Span::styled(
+            horizontal.to_string().repeat(dashes),
+            Style::default().fg(theme.border),
+        ),
     ])
 }
 
@@ -593,9 +607,9 @@ fn ms_to_local_naive(ms: i64) -> Option<NaiveDateTime> {
     }
 }
 
-fn format_duration(first_ms: i64, last_ms: i64) -> String {
+fn format_duration(first_ms: i64, last_ms: i64, glyphs: Glyphs) -> String {
     if first_ms <= 0 || last_ms <= 0 || last_ms < first_ms {
-        return "\u{2014}".to_string();
+        return glyphs.missing.to_string();
     }
     let secs = (last_ms - first_ms) / 1000;
     if secs <= 0 {
@@ -686,7 +700,7 @@ mod tests {
         let mut session = test_session();
         session.turn_count = 0;
         let dialog = SessionDetailDialog::new(session, TuiLanguage::En);
-        let lines = dialog.build_lines(&test_theme(), 76);
+        let lines = dialog.build_lines(&test_theme(), 76, Glyphs::unicode());
         let turn_line = lines
             .iter()
             .find(|line| {
@@ -839,7 +853,7 @@ mod tests {
 
         terminal
             .draw(|f| {
-                dialog.render(f, Rect::new(0, 0, 80, 30), &theme);
+                dialog.render(f, Rect::new(0, 0, 80, 30), &theme, Glyphs::unicode());
             })
             .unwrap();
 
@@ -870,7 +884,7 @@ mod tests {
 
         terminal
             .draw(|f| {
-                dialog.render(f, Rect::new(0, 0, 80, 20), &theme);
+                dialog.render(f, Rect::new(0, 0, 80, 20), &theme, Glyphs::unicode());
             })
             .unwrap();
 
@@ -894,7 +908,7 @@ mod tests {
 
         terminal
             .draw(|f| {
-                dialog.render(f, Rect::new(0, 0, 25, 20), &theme);
+                dialog.render(f, Rect::new(0, 0, 25, 20), &theme, Glyphs::unicode());
             })
             .unwrap();
 
@@ -915,7 +929,7 @@ mod tests {
 
             terminal
                 .draw(|f| {
-                    dialog.render(f, Rect::new(0, 0, 80, 30), &theme);
+                    dialog.render(f, Rect::new(0, 0, 80, 30), &theme, Glyphs::unicode());
                 })
                 .unwrap();
         }

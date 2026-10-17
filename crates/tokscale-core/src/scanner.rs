@@ -436,6 +436,56 @@ fn is_openclaw_compaction_checkpoint(file_name: &str) -> bool {
     !session_id.is_empty() && is_uuid(checkpoint_id)
 }
 
+/// Discover `<account>/sessions/<session>/messages.jsonl` under `~/.aside/u`.
+///
+/// Deliberately NOT `scan_directory`, and not expressible as a pattern there,
+/// for two reasons that are both load-bearing:
+///
+/// 1. `scan_directory` admits a symlinked file (`file_type.is_symlink() &&
+///    path.is_file()`) and walks with `WalkDir`'s default link-following off
+///    only for directories it has already entered. An Aside account tree sits
+///    beside `memory/`, `password-manager/`, `accounts.json` and per-site
+///    caches, so a transcript-shaped symlink is enough to read a credential
+///    file through the scanner. `symlink_metadata` refuses the link itself,
+///    which is why the checks below never follow one — see
+///    `aside_discovery_does_not_follow_account_or_transcript_symlinks`.
+/// 2. The layout has to be pinned at every level, not just by filename. A
+///    session's sibling `artifacts/` and `tmp/` directories hold downloads and
+///    screenshots, and only the exact
+///    `<account>/sessions/<session>/messages.jsonl` depth carries usage.
+///
+/// `ClientId::Aside`'s declared `pattern` is therefore inert: this function
+/// ignores it, and the generic walker is never asked for this client.
+fn scan_aside_accounts(root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let Ok(accounts) = std::fs::read_dir(root) else {
+        return paths;
+    };
+    for account in accounts.flatten() {
+        if !account.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let sessions = account.path().join("sessions");
+        if !std::fs::symlink_metadata(&sessions).is_ok_and(|meta| meta.is_dir()) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(sessions) else {
+            continue;
+        };
+        for session in entries.flatten() {
+            if !session.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let transcript = session.path().join("messages.jsonl");
+            if std::fs::symlink_metadata(&transcript).is_ok_and(|meta| meta.is_file()) {
+                paths.push(transcript);
+            }
+        }
+    }
+    paths.sort_unstable();
+    paths
+}
+
 /// Scan a single directory for session files
 pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
     if !std::path::Path::new(root).exists() {
@@ -634,6 +684,34 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
                             .unwrap_or(false)
                 }
                 "sessions.json" => file_name == "sessions.json",
+                // Mistral Vibe (CLI): session directories contain `meta.json`
+                // with cumulative token counts and session metadata. Legacy
+                // Vibe 1.x stored one flat `<prefix>_*.json` per session, where
+                // the prefix is configurable (`session_logging.session_prefix`,
+                // default `session`) and is the agent name for a subagent, so
+                // the suffix rather than the prefix is what identifies these.
+                //
+                // Two sibling files share the directory and must not be parsed
+                // as sessions: the shared index `.session_index.json` and the
+                // atomic-write temporaries, which `NamedTemporaryFile` names
+                // `tmp<random>.json.tmp` / `.session_index.<random>.tmp`. Both
+                // are excluded by leading dot and by suffix rather than by a
+                // `session_` prefix they never carry.
+                "vibe-session" => {
+                    if file_name == "meta.json" {
+                        true
+                    } else {
+                        // Upstream's own migration globs the save directory
+                        // non-recursively (`Path(save_dir).glob("<prefix>_*.json")`),
+                        // so a legacy session is a direct child of the root and
+                        // never nested. Requiring that keeps per-session
+                        // `attachments/` snapshots out of the scan.
+                        file_name.ends_with(".json")
+                            && !file_name.starts_with('.')
+                            && !file_name.ends_with(".json.tmp")
+                            && path.parent() == Some(Path::new(root))
+                    }
+                }
                 // DeepSeek Harness: one JSONL transcript per session at any
                 // depth under `~/.dsh/sessions/`. The `.zstd` suffix marks the
                 // physical encoding only — a backend configured with
@@ -1571,6 +1649,37 @@ fn devin_cli_additional_roots(home_dir: &str, use_env_roots: bool) -> Vec<PathBu
 
     roots.push(PathBuf::from(home_dir).join("AppData/Roaming/devin/cli"));
     roots
+}
+
+// Goose CLI uses the native roaming directory; Desktop synthesizes APPDATA
+// from HOME when it is absent. Keep selection independent of the system lookup
+// so both layouts can be tested without fixtures in the real Windows profile.
+//
+// `desktop_home` is deliberately the raw `HOME`/profile value rather than
+// `paths::home_dir()`'s validated redirect: this candidate exists only to
+// mirror what Goose Desktop itself computes (`APPDATA = process.env.APPDATA ||
+// join(process.env.HOME || os.homedir(), 'AppData', 'Roaming')` in
+// `ui/desktop/src/gooseServe.ts`), and Desktop applies no absoluteness check.
+// A POSIX-shaped or drive-relative `HOME` therefore reaches this probe, which
+// `paths::home_dir` would have rejected (#997). That is safe because the only
+// use is a read-only `is_file()` test on a path Goose Desktop would have used:
+// nothing is written, and a non-matching candidate is simply skipped.
+#[cfg(any(target_os = "windows", test))]
+fn discover_goose_windows_db(
+    app_data: Option<PathBuf>,
+    native_roaming: Option<PathBuf>,
+    desktop_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let desktop_roaming = if app_data.is_none() {
+        desktop_home.map(|home| home.join("AppData").join("Roaming"))
+    } else {
+        None
+    };
+    [app_data.or(native_roaming), desktop_roaming]
+        .into_iter()
+        .flatten()
+        .map(|root| join_native_path(&root, "Block/goose/data/sessions/sessions.db"))
+        .find(|db| db.is_file())
 }
 
 fn supports_extra_dir_scanning(client_id: ClientId) -> bool {
@@ -2577,51 +2686,82 @@ fn scan_all_clients_with_env_strategy_inner(
     }
 
     if enabled.contains(&ClientId::Goose) {
-        if use_env_roots {
-            if let Ok(custom_root) = std::env::var("GOOSE_PATH_ROOT") {
-                let trimmed = custom_root.trim();
-                if !trimmed.is_empty() {
-                    let custom_path = PathBuf::from(trimmed).join("data/sessions/sessions.db");
-                    if custom_path.is_file() {
-                        result.goose_db = Some(custom_path);
-                    }
+        let custom_root = if use_env_roots {
+            std::env::var_os("GOOSE_PATH_ROOT")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+        } else {
+            None
+        };
+        if let Some(custom_root) = custom_root {
+            // Goose treats a valid override as authoritative even before its DB exists.
+            let custom_path = custom_root.join("data/sessions/sessions.db");
+            if custom_path.is_file() {
+                result.goose_db = Some(custom_path);
+            }
+        } else {
+            #[cfg(target_os = "windows")]
+            if use_env_roots && result.goose_db.is_none() {
+                let app_data = std::env::var_os("APPDATA")
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from);
+                let profile_home = std::env::home_dir();
+                // Match Goose's etcetera strategy, not Tokscale's HOME redirect.
+                let native_roaming = dirs::data_dir().or_else(|| {
+                    profile_home
+                        .as_ref()
+                        .map(|home| home.join("AppData").join("Roaming"))
+                });
+                let desktop_home = std::env::var_os("HOME")
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+                    .or(profile_home);
+                result.goose_db = discover_goose_windows_db(app_data, native_roaming, desktop_home);
+            }
+            if !use_env_roots && result.goose_db.is_none() {
+                let windows_path = join_native_path(
+                    Path::new(home_dir),
+                    "AppData/Roaming/Block/goose/data/sessions/sessions.db",
+                );
+                if windows_path.is_file() {
+                    result.goose_db = Some(windows_path);
                 }
             }
-        }
-        if result.goose_db.is_none() {
-            let xdg_path = ClientId::Goose
-                .data()
-                .resolve_path_with_env_strategy(home_dir, use_env_roots);
-            let xdg = PathBuf::from(xdg_path);
-            if xdg.is_file() {
-                result.goose_db = Some(xdg);
+            if result.goose_db.is_none() {
+                let xdg_path = ClientId::Goose
+                    .data()
+                    .resolve_path_with_env_strategy(home_dir, use_env_roots);
+                let xdg = PathBuf::from(xdg_path);
+                if xdg.is_file() {
+                    result.goose_db = Some(xdg);
+                }
             }
-        }
-        if result.goose_db.is_none() {
-            let macos_path = PathBuf::from(format!(
-                "{}/Library/Application Support/goose/sessions/sessions.db",
-                home_dir
-            ));
-            if macos_path.is_file() {
-                result.goose_db = Some(macos_path);
+            if result.goose_db.is_none() {
+                let macos_path = PathBuf::from(format!(
+                    "{}/Library/Application Support/goose/sessions/sessions.db",
+                    home_dir
+                ));
+                if macos_path.is_file() {
+                    result.goose_db = Some(macos_path);
+                }
             }
-        }
-        if result.goose_db.is_none() {
-            let legacy_macos_path = PathBuf::from(format!(
-                "{}/Library/Application Support/Block/goose/sessions/sessions.db",
-                home_dir
-            ));
-            if legacy_macos_path.is_file() {
-                result.goose_db = Some(legacy_macos_path);
+            if result.goose_db.is_none() {
+                let legacy_macos_path = PathBuf::from(format!(
+                    "{}/Library/Application Support/Block/goose/sessions/sessions.db",
+                    home_dir
+                ));
+                if legacy_macos_path.is_file() {
+                    result.goose_db = Some(legacy_macos_path);
+                }
             }
-        }
-        if result.goose_db.is_none() {
-            let legacy_xdg_path = PathBuf::from(format!(
-                "{}/.local/share/Block/goose/sessions/sessions.db",
-                home_dir
-            ));
-            if legacy_xdg_path.is_file() {
-                result.goose_db = Some(legacy_xdg_path);
+            if result.goose_db.is_none() {
+                let legacy_xdg_path = PathBuf::from(format!(
+                    "{}/.local/share/Block/goose/sessions/sessions.db",
+                    home_dir
+                ));
+                if legacy_xdg_path.is_file() {
+                    result.goose_db = Some(legacy_xdg_path);
+                }
             }
         }
     }
@@ -2923,7 +3063,14 @@ fn scan_all_clients_with_env_strategy_inner(
         tasks
             .into_par_iter()
             .map(|(client_id, path, pattern)| {
-                let files = scan_directory(&path, pattern);
+                // Aside needs a layout- and symlink-aware walk that no
+                // `scan_directory` pattern can express; see
+                // `scan_aside_accounts` for why its declared pattern is inert.
+                let files = if client_id == ClientId::Aside {
+                    scan_aside_accounts(Path::new(&path))
+                } else {
+                    scan_directory(&path, pattern)
+                };
                 (client_id, path, files)
             })
             .collect()
@@ -3125,6 +3272,219 @@ mod tests {
     use std::fs::{self, File};
     use std::io::Write;
     use tempfile::TempDir;
+
+    fn write_db(db: PathBuf) -> PathBuf {
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        File::create(&db).unwrap();
+        db
+    }
+
+    fn mock_goose_windows_db(roaming: &Path) -> PathBuf {
+        write_db(roaming.join("Block/goose/data/sessions/sessions.db"))
+    }
+
+    fn scan_goose(home: &Path, use_env_roots: bool) -> Option<PathBuf> {
+        scan_all_clients_with_env_strategy(home.to_str().unwrap(), &["goose".into()], use_env_roots)
+            .goose_db
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_goose_explicit_home_ignores_host_roots() {
+        let home = TempDir::new().unwrap();
+        let host = TempDir::new().unwrap();
+        let root = home.path();
+        let custom = host.path().join("custom");
+        let host_xdg = host.path().join("xdg");
+        let host_appdata = host.path().join("appdata");
+        write_db(custom.join("data/sessions/sessions.db"));
+        write_db(host_xdg.join("goose/sessions/sessions.db"));
+        mock_goose_windows_db(&host_appdata);
+        let appdata_db = mock_goose_windows_db(&root.join("AppData/Roaming"));
+        let xdg_db = write_db(root.join(".local/share/goose/sessions/sessions.db"));
+        let mut env = EnvGuard::capture(&["GOOSE_PATH_ROOT", "XDG_DATA_HOME", "APPDATA", "HOME"]);
+        env.set("GOOSE_PATH_ROOT", &custom);
+        env.set("XDG_DATA_HOME", &host_xdg);
+        env.set("APPDATA", &host_appdata);
+        let scan = || scan_goose(root, false);
+        assert_eq!(scan(), Some(appdata_db.clone()), "prefers supplied AppData");
+        fs::remove_file(&appdata_db).unwrap();
+        assert_eq!(scan(), Some(xdg_db.clone()), "falls back to supplied XDG");
+        fs::remove_file(xdg_db).unwrap();
+        assert_eq!(scan(), None, "does not fall back to host roots");
+        #[cfg(target_os = "windows")]
+        {
+            mock_goose_windows_db(&host.path().join("desktop/AppData/Roaming"));
+            env.remove("APPDATA");
+            env.set("HOME", host.path().join("desktop"));
+            assert_eq!(scan(), None, "--home ignores a Desktop HOME database");
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[serial]
+    fn test_scan_goose_prefers_native_windows_database_to_legacy() {
+        let home = TempDir::new().unwrap();
+        let root = home.path();
+        let app_data = root.join("appdata");
+        let native_db = mock_goose_windows_db(&app_data);
+        write_db(root.join("xdg/goose/sessions/sessions.db"));
+        let mut env = EnvGuard::capture(&["GOOSE_PATH_ROOT", "XDG_DATA_HOME", "APPDATA"]);
+        env.remove("GOOSE_PATH_ROOT");
+        env.set("XDG_DATA_HOME", root.join("xdg"));
+        env.set("APPDATA", &app_data);
+        let scan = || scan_goose(root, true);
+        assert_eq!(scan().as_ref(), Some(&native_db), "native beats stale XDG");
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_goose_preserves_compatibility_database_precedence() {
+        let home = TempDir::new().unwrap();
+        let root = home.path();
+        let empty_appdata = root.join("empty-appdata");
+        fs::create_dir_all(&empty_appdata).unwrap();
+        let mut env = EnvGuard::capture(&["GOOSE_PATH_ROOT", "XDG_DATA_HOME", "APPDATA"]);
+        env.remove("GOOSE_PATH_ROOT");
+        env.set("XDG_DATA_HOME", root.join("xdg"));
+        env.set("APPDATA", &empty_appdata);
+        let scan = || scan_goose(root, true);
+        let dbs = [
+            "xdg/goose/sessions/sessions.db",
+            "Library/Application Support/goose/sessions/sessions.db",
+            "Library/Application Support/Block/goose/sessions/sessions.db",
+            ".local/share/Block/goose/sessions/sessions.db",
+        ]
+        .map(|rel| write_db(root.join(rel)));
+        for db in &dbs {
+            assert_eq!(scan().as_ref(), Some(db), "legacy databases stay in order");
+            fs::remove_file(db).unwrap();
+        }
+        assert_eq!(scan(), None, "legacy chain ends empty");
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_goose_path_root_is_absolute_and_authoritative() {
+        let cwd = std::env::current_dir().unwrap();
+        let home = TempDir::new_in(&cwd).unwrap();
+        let root = home.path();
+        let custom = root.join("custom");
+        let custom_db = write_db(custom.join("data/sessions/sessions.db"));
+        let xdg_db = write_db(root.join("xdg/goose/sessions/sessions.db"));
+        let native_db = mock_goose_windows_db(&root.join("appdata"));
+        let mut env = EnvGuard::capture(&["GOOSE_PATH_ROOT", "XDG_DATA_HOME", "APPDATA"]);
+        env.set("XDG_DATA_HOME", root.join("xdg"));
+        env.set("APPDATA", root.join("appdata"));
+        env.set("GOOSE_PATH_ROOT", &custom);
+        let scan = || scan_goose(root, true);
+        assert_eq!(scan(), Some(custom_db.clone()), "absolute override used");
+        fs::remove_file(&custom_db).unwrap();
+        assert_eq!(scan(), None, "override does not fall through");
+        File::create(&custom_db).unwrap();
+        let fallback = if cfg!(target_os = "windows") {
+            native_db
+        } else {
+            xdg_db
+        };
+        env.set("GOOSE_PATH_ROOT", custom.strip_prefix(&cwd).unwrap());
+        assert_eq!(scan(), Some(fallback.clone()), "relative override ignored");
+        env.set("GOOSE_PATH_ROOT", format!(" {}", custom.display()));
+        assert_eq!(scan(), Some(fallback), "leading space is not trimmed");
+    }
+
+    #[test]
+    #[serial]
+    fn test_goose_windows_db_prefers_appdata_then_native_then_desktop() {
+        let dir = TempDir::new().unwrap();
+        let app_data = dir.path().join("appdata");
+        let native = dir.path().join("native");
+        let desktop = dir.path().join("desktop");
+        let native_db = mock_goose_windows_db(&native);
+        let desktop_db = mock_goose_windows_db(&desktop.join("AppData/Roaming"));
+        assert_eq!(
+            discover_goose_windows_db(
+                Some(app_data.clone()),
+                Some(native.clone()),
+                Some(desktop.clone()),
+            ),
+            None,
+            "APPDATA without a database hides native and Desktop"
+        );
+        let app_db = mock_goose_windows_db(&app_data);
+        assert_eq!(
+            discover_goose_windows_db(Some(app_data), Some(native.clone()), Some(desktop.clone())),
+            Some(app_db),
+            "APPDATA database is selected alone"
+        );
+        assert_eq!(
+            discover_goose_windows_db(None, Some(native.clone()), Some(desktop.clone())),
+            Some(native_db.clone()),
+            "native wins when both databases exist"
+        );
+        fs::remove_file(&native_db).unwrap();
+        assert_eq!(
+            discover_goose_windows_db(None, Some(native), Some(desktop)),
+            Some(desktop_db),
+            "Desktop is used when native has no database"
+        );
+        // Keep the path cwd-relative; canonicalizing it would not exercise relative HOME.
+        let cwd = std::env::current_dir().unwrap();
+        let rel_dir = TempDir::new_in(&cwd).unwrap();
+        mock_goose_windows_db(&rel_dir.path().join("AppData/Roaming"));
+        let relative_home = rel_dir.path().strip_prefix(&cwd).unwrap().to_path_buf();
+        assert_eq!(
+            discover_goose_windows_db(None, None, Some(relative_home.clone())),
+            Some(relative_home.join("AppData/Roaming/Block/goose/data/sessions/sessions.db")),
+            "relative HOME resolves the Desktop database"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[serial]
+    fn test_goose_windows_db_paths_use_native_separators() {
+        // `Path::join` only normalizes the junction, so a `/`-joined relative
+        // literal survives untouched on Windows and yields a mixed-separator
+        // path (#1048). `goose_db` reaches `clients --json` and the canonical
+        // dedup keys, so both Goose Windows joins must be native throughout.
+        let dir = TempDir::new().unwrap();
+        let native = dir.path().join("native");
+        mock_goose_windows_db(&native);
+        let discovered = discover_goose_windows_db(None, Some(native), None)
+            .expect("the native database must be discovered");
+        assert!(
+            !discovered.to_string_lossy().contains('/'),
+            "discovered Windows database must not contain non-native separators: {}",
+            discovered.display()
+        );
+
+        let home = TempDir::new().unwrap();
+        let root = home.path();
+        mock_goose_windows_db(&root.join("AppData/Roaming"));
+        let supplied = scan_goose(root, false).expect("the supplied-home database must be found");
+        assert!(
+            !supplied.to_string_lossy().contains('/'),
+            "supplied-home database must not contain non-native separators: {}",
+            supplied.display()
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    #[serial]
+    fn test_scan_goose_does_not_follow_windows_appdata_off_windows() {
+        let home = TempDir::new().unwrap();
+        let root = home.path();
+        mock_goose_windows_db(&root.join("appdata"));
+        mock_goose_windows_db(&root.join("AppData/Roaming"));
+        let mut env = EnvGuard::capture(&["GOOSE_PATH_ROOT", "XDG_DATA_HOME", "APPDATA"]);
+        env.remove("GOOSE_PATH_ROOT");
+        env.set("XDG_DATA_HOME", root.join("xdg"));
+        env.set("APPDATA", root.join("appdata"));
+        assert_eq!(scan_goose(root, true), None, "ignores AppData off Windows");
+    }
 
     fn scan_without_extra_dirs(home_dir: &str, clients: &[String]) -> ScanResult {
         let mut extra = EnvGuard::capture(&["TOKSCALE_EXTRA_DIRS", "TOKSCALE_HEADLESS_DIR"]);

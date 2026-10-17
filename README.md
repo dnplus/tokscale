@@ -123,7 +123,7 @@ tokscale autosubmit status
 | <img width="48px" src=".github/assets/client-kilocode.png" alt="Kilo CLI" /> | [Kilo CLI](https://github.com/nicepkg/kilo) | `~/.local/share/kilo/kilo.db` |
 | <img width="48px" src=".github/assets/client-mux.png" alt="Mux" /> | [Mux](https://github.com/coder/mux) | `~/.mux/sessions/` |
 | <img width="48px" src=".github/assets/client-crush.png" alt="Crush" /> | [Crush](https://crush.ai/) | `$XDG_DATA_HOME/crush/projects.json` (project registry; fallback: `~/.local/share/crush/projects.json`) |
-| <img width="48px" src=".github/assets/client-goose.png" alt="Goose" /> | [Goose](https://github.com/aaif-goose/goose) | `~/.local/share/goose/sessions/sessions.db` (+ macOS Application Support, legacy Block/goose paths; override via `GOOSE_PATH_ROOT`) |
+| <img width="48px" src=".github/assets/client-goose.png" alt="Goose" /> | [Goose](https://github.com/aaif-goose/goose) | `~/.local/share/goose/sessions/sessions.db` / `%APPDATA%\Block\goose\data\sessions\sessions.db` (+ macOS Application Support, legacy Block/goose paths; override via `GOOSE_PATH_ROOT`) |
 | <img width="48px" src=".github/assets/client-antigravity.png" alt="Antigravity" /> | [Google Antigravity](https://antigravity.google/) | Cached via `tokscale antigravity sync` to `~/.config/tokscale/antigravity-cache/sessions/*.jsonl` (live RPC against the local language server) |
 | <img width="48px" src=".github/assets/client-antigravity.png" alt="Antigravity CLI" /> | [Antigravity CLI](https://antigravity.google/) | `~/.gemini/antigravity-cli/conversations/*.db` (override the Gemini home via `GEMINI_CLI_HOME`; local SQLite, read directly — no `antigravity sync` needed) |
 | <img width="48px" src=".github/assets/client-antigravity.png" alt="Antigravity IDE Extension" /> | [Antigravity IDE Extension](https://www.antigravity.google/docs/ide/extensions/) | `~/.gemini/antigravity/conversations/*.db` (local SQLite, read directly) |
@@ -155,6 +155,8 @@ tokscale autosubmit status
 | <img width="48px" src="https://github.com/MiniMax-AI.png" alt="MiniMax Code" /> | [MiniMax Code](https://github.com/MiniMax-AI) | `~/.config/tokscale/headless/mcode/*.jsonl` (headless capture of `mcode exec --output-format stream-json`; override via `TOKSCALE_HEADLESS_DIR`) |
 | <img width="48px" src=".github/assets/client-fx.png" alt="Fx" /> | [fx](https://github.com/vercel-labs/fx) | `~/.fx/sessions/<sessionId>/usage-v2.json` (per-session aggregates) |
 | <img width="48px" src="https://github.com/meta-models.png" alt="Muse Code" /> | [Muse Code](https://dev.meta.ai/docs/muse-code) | `~/.local/share/muse/sessions/**/session.jsonl` (same XDG-style path on Windows; subagent transcripts under `subagent/<uuid>/` included) |
+| <img width="48px" src=".github/assets/client-aside.png" alt="Aside" /> | [Aside](https://asidehq.com) | `~/.aside/u/<account>/sessions/<session>/messages.jsonl` |
+| <img width="48px" src="https://github.com/mistralai.png" alt="Mistral Vibe" /> | [Mistral Vibe](https://github.com/mistralai/mistral-vibe) | `~/.vibe/logs/session/<session-dir>/meta.json` (same path on Windows; override the root via `VIBE_HOME`) |
 
 Get real-time pricing calculations using [🚅 LiteLLM's pricing data](https://github.com/BerriAI/litellm), with support for tiered pricing models and cache token discounts.
 
@@ -227,7 +229,7 @@ In the age of AI-assisted development, **tokens are the new energy**. They power
   - GitHub-style contribution graph with configurable color themes
   - Real-time filtering and sorting
   - Zero flicker rendering
-- **Multi-platform support** - Track usage across OpenCode, Claude Code, Codex CLI, Prime Agent, Copilot CLI, Cursor IDE, Gemini CLI, Amp, Codebuff, Droid, OpenClaw, Hermes Agent, Pi, Kimchi Coding, Reasonix, Kimi CLI, Kimi Work, Qwen CLI, Roo Code, Kilo, Mux, Kilo CLI, Crush, Goose, Antigravity, Antigravity CLI, Antigravity IDE Extension, Zed, Kiro, Trae, Warp/Oz, Cline, Gajae-Code, Grok Build, Jcode, MiMo Code, Xiaomi MiMo AI, Command Code, Junie, ZCode, OpenCodeReview, CodeBuddy, WorkBuddy, Devin CLI, Devin Desktop, Augment Code, Synthetic, Cherry Studio, LM Studio, Unsloth Studio, Hindsight, fx, Oh My Pi, and Muse Code
+- **Multi-platform support** - Track usage across OpenCode, Claude Code, Codex CLI, Prime Agent, Copilot CLI, Cursor IDE, Gemini CLI, Amp, Codebuff, Droid, OpenClaw, Hermes Agent, Pi, Kimchi Coding, Reasonix, Kimi CLI, Kimi Work, Qwen CLI, Roo Code, Kilo, Mux, Kilo CLI, Crush, Goose, Antigravity, Antigravity CLI, Antigravity IDE Extension, Zed, Kiro, Trae, Warp/Oz, Cline, Gajae-Code, Grok Build, Jcode, MiMo Code, Xiaomi MiMo AI, Command Code, Junie, ZCode, OpenCodeReview, CodeBuddy, WorkBuddy, Devin CLI, Devin Desktop, Augment Code, Synthetic, Cherry Studio, LM Studio, Unsloth Studio, Hindsight, fx, Oh My Pi, Muse Code, Aside, and Mistral Vibe
 - **Real-time pricing** - Fetches current pricing from LiteLLM with 1-hour disk cache; automatic OpenRouter fallback and Cursor model pricing for newly released models
 - **Detailed breakdowns** - Input, output, cache read/write, and reasoning token tracking
 - **Native Rust core** - All parsing and aggregation done in Rust for 10x faster processing
@@ -464,7 +466,7 @@ tokscale --client synthetic
 tokscale --client opencode,claude --week --json
 ```
 
-Possible values: `opencode`, `claude`, `codex`, `copilot`, `gemini`, `cursor`, `amp`, `codebuff`, `droid`, `openclaw`, `hermes`, `pi`, `prime-agent`, `kimchi`, `kimi`, `qwen`, `roocode`, `kilocode`, `kilo`, `mux`, `crush`, `goose`, `antigravity`, `antigravity-cli`, `antigravity-extension`, `zed`, `kiro`, `trae`, `warp`, `cline`, `gjc`, `grok`, `jcode`, `micode`, `micode-desktop`, `commandcode`, `junie`, `zcode`, `opencodereview`, `codebuddy`, `augment`, `synthetic`, `cherrystudio`, `lmstudio`, `unsloth`, `hindsight`, `muse`.
+Possible values: `opencode`, `claude`, `codex`, `copilot`, `gemini`, `cursor`, `amp`, `codebuff`, `droid`, `openclaw`, `hermes`, `pi`, `prime-agent`, `kimchi`, `kimi`, `qwen`, `roocode`, `kilocode`, `kilo`, `mux`, `crush`, `goose`, `antigravity`, `antigravity-cli`, `antigravity-extension`, `zed`, `kiro`, `trae`, `warp`, `cline`, `gjc`, `grok`, `jcode`, `micode`, `micode-desktop`, `commandcode`, `junie`, `zcode`, `opencodereview`, `codebuddy`, `augment`, `synthetic`, `cherrystudio`, `lmstudio`, `unsloth`, `hindsight`, `muse`, `aside`, `vibe`.
 
 > **Breaking change (v4.0.0):** The per-client boolean flags (`--opencode`, `--claude`, `--codex`, etc.) have been removed and now error. Use the canonical `--client`/`-c` flag instead — e.g. `tokscale --client opencode,claude`.
 
@@ -708,7 +710,9 @@ tokscale cursor logout --all
 tokscale cursor logout --all --purge-cache
 ```
 
-By default, Tokscale aggregates usage across all saved Cursor accounts by reading `cursor-cache/usage*.json`. The active account syncs to `usage.json`; additional accounts sync to `usage.<account>.json`. Legacy CSV caches from older Tokscale versions (`usage.csv`, `usage.<account>.csv`) are still read for an account that has no JSON cache yet. The next successful sync of that account writes its JSON cache and moves the CSV to `cursor-cache/archive/`.
+By default, Tokscale aggregates usage across all saved Cursor accounts by reading `cursor-cache/usage*.json`. The active account syncs to `usage.json`; additional accounts use `usage.account-<sha256-of-exact-account-id>.json`. Each new cache records its account owner, so different IDs cannot share cached history or incremental sync progress merely because their sanitized names match.
+
+On the first sync or account change after upgrading, unmarked legacy JSON and CSV caches cannot prove which account owns their history. Tokscale preserves their original bytes and filenames in unique directories under `cursor-cache/archive/`, then fetches each account independently from the beginning. These backups are excluded from reports to avoid attributing ambiguous history to the wrong account. If a fetch fails, the backup remains recoverable; reauthenticate that account and sync again. Offline reports can still read legacy caches until this upgrade step runs. A backup failure stops the sync or account change before any cache is overwritten.
 
 When you log out, Tokscale moves cached usage to `cursor-cache/archive/` so it is no longer aggregated. Use `--purge-cache` to delete cached usage instead.
 
@@ -721,6 +725,8 @@ When you log out, Tokscale moves cached usage to `cursor-cache/archive/` so it i
   }
 }
 ```
+
+When an account has a JSON cache, Cursor sync fetches new usage plus the hour before that account's newest cached event. This bounded overlap refreshes recent billing corrections without downloading the full history on every report. Corrections older than this one-hour window remain as cached; older cached events are preserved, and a first sync without a usable cache still fetches the full history. Each account uses its own cache to determine the window. Only rows accepted by the report parser with positive timestamps no more than five minutes ahead of the sync's start time can set that window or stop pagination; other raw rows are preserved without advancing sync progress. A timed-out delta leaves the cache unchanged so the next sync cannot skip an incomplete interval.
 
 ### Antigravity Commands
 
@@ -1000,6 +1006,7 @@ Tokscale stores settings in `settings.json` in its config directory. By default 
 ```json
 {
   "colorPalette": "blue",
+  "glyphs": "auto",
   "includeUnusedModels": false,
   "defaultClients": ["opencode", "claude"],
   "usage": {
@@ -1023,6 +1030,7 @@ Tokscale stores settings in `settings.json` in its config directory. By default 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `colorPalette` | string | `"blue"` | TUI color theme (green, halloween, teal, blue, pink, purple, orange, monochrome, ylgnbu, graphite, lagoon, dusk, tokyo-night, catppuccin, solarized, gruvbox, gruvbox-material, one-dark) |
+| `glyphs` | `"auto"` \| `"unicode"` \| `"ascii"` | `"auto"` | TUI glyph policy. `auto` probes the terminal's ambiguous-character width at startup; use `unicode` or `ascii` to override detection for terminals that do not answer the probe correctly. Invalid values safely fall back to `auto`. |
 | `includeUnusedModels` | boolean | `false` | Show models with zero tokens in reports |
 | `autoRefreshEnabled` | boolean | `false` | Enable auto-refresh in TUI |
 | `autoRefreshMs` | number | `60000` | Auto-refresh interval (30000-3600000ms) |
@@ -1214,7 +1222,7 @@ The frontend provides a GitHub-style contribution graph visualization:
 - **Interactive tooltips**: Hover for detailed daily breakdowns
 - **Day breakdown panel**: Click to see per-source and per-model details
 - **Year filtering**: Navigate between years
-- **Source filtering**: Filter by platform (OpenCode, Claude, Codex, MiniMax Code, Copilot, Cursor, Gemini, Amp, Codebuff, Droid, OpenClaw, Hermes Agent, Pi, Prime Agent, Kimi, Qwen, Roo Code, Kilo, Mux, Kilo CLI, Crush, Goose, Antigravity, Antigravity CLI, Antigravity IDE Extension, Zed, Kiro, Trae, Warp, Cline, Gajae-Code, Grok Build, Jcode, MiMo Code, Xiaomi MiMo AI, Command Code, Junie, ZCode, OpenCodeReview, CodeBuddy, WorkBuddy, Devin CLI, Devin Desktop, Augment Code, Synthetic, Cherry Studio, LM Studio, Unsloth, Hindsight, Muse Code)
+- **Source filtering**: Filter by platform (OpenCode, Claude, Codex, MiniMax Code, Copilot, Cursor, Gemini, Amp, Codebuff, Droid, OpenClaw, Hermes Agent, Pi, Prime Agent, Kimi, Qwen, Roo Code, Kilo, Mux, Kilo CLI, Crush, Goose, Antigravity, Antigravity CLI, Antigravity IDE Extension, Zed, Kiro, Trae, Warp, Cline, Gajae-Code, Grok Build, Jcode, MiMo Code, Xiaomi MiMo AI, Command Code, Junie, ZCode, OpenCodeReview, CodeBuddy, WorkBuddy, Devin CLI, Devin Desktop, Augment Code, Synthetic, Cherry Studio, LM Studio, Unsloth, Hindsight, Muse Code, Aside, Mistral Vibe)
 - **Stats panel**: Total cost, tokens, active days, streaks
 - **FOUC prevention**: Theme applied before React hydrates (no flash)
 
@@ -1617,7 +1625,7 @@ AI coding tools store their session data in cross-platform locations. Most tools
 | Codebuff | `~/.config/manicode/projects/` (+ `manicode-dev`, `manicode-staging`) | `%USERPROFILE%\.config\manicode\projects\` | Override via `CODEBUFF_DATA_DIR` env var |
 | Kilo CLI | `~/.local/share/kilo/` | `%USERPROFILE%\.local\share\kilo\` | Uses `xdg-basedir` like OpenCode |
 | Crush | `$XDG_DATA_HOME/crush/` (fallback: `~/.local/share/crush/`) | `%USERPROFILE%\.local\share\crush\` (or `%XDG_DATA_HOME%\crush\` if set) | Uses XDG data directory with fallback |
-| Goose | `~/.local/share/goose/sessions/` (+ macOS Application Support, legacy Block paths) | `%USERPROFILE%\.local\share\goose\sessions\` | Configurable via `GOOSE_PATH_ROOT` env var |
+| Goose | `~/.local/share/goose/sessions/` (+ macOS Application Support, legacy Block paths) | `%APPDATA%\Block\goose\data\sessions` (fallback: `%USERPROFILE%\.local\share\goose\sessions\` and the legacy `Block` paths) | Configurable via `GOOSE_PATH_ROOT` env var |
 | Antigravity | `~/.config/tokscale/antigravity-cache/sessions/` | — | `tokscale antigravity sync` is currently supported on macOS/Linux only |
 | Antigravity CLI | `~/.gemini/antigravity-cli/conversations/` | `%USERPROFILE%\.gemini\antigravity-cli\conversations\` | Configurable via `GEMINI_CLI_HOME` env var |
 | Antigravity IDE Extension | `~/.gemini/antigravity/conversations/` | `%USERPROFILE%\.gemini\antigravity\conversations\` | Same path on all platforms |
@@ -1643,11 +1651,13 @@ AI coding tools store their session data in cross-platform locations. Most tools
 | Unsloth Studio | `$UNSLOTH_STUDIO_HOME/studio.db` (fallback: `~/.unsloth/studio/studio.db`) | `%UNSLOTH_STUDIO_HOME%\studio.db` (fallback: `%USERPROFILE%\.unsloth\studio\studio.db`) | Reads exact inference counters from internal assistant metadata and the content-free authenticated API usage table; never selects prompts or responses; excludes training metrics |
 | Hindsight | `$HINDSIGHT_HOME/usage/` (fallback: `~/.hindsight/usage/`) | `%HINDSIGHT_HOME%\usage\` (fallback: `%USERPROFILE%\.hindsight\usage\`) | API sync via `tokscale hindsight sync`; Hindsight writes no local session logs of its own, so data is synced from the LLM trace API into an append-only JSONL cache |
 | Muse Code | `~/.local/share/muse/sessions/` | `%USERPROFILE%\.local\share\muse\sessions\` | Same XDG-style path on all platforms; parses `session.jsonl` `model_completed` usage events plus `subagent/` transcripts |
+| Aside | `~/.aside/u/<account>/sessions/<session>/messages.jsonl` | `%USERPROFILE%\.aside\u\<account>\sessions\<session>\messages.jsonl` | Native browser session usage across accounts; only `messages.jsonl`, excluding artifacts, memory and passwords. |
+| Mistral Vibe | `$VIBE_HOME/logs/session/` (fallback: `~/.vibe/logs/session/`) | `%VIBE_HOME%\logs\session\` (fallback: `%USERPROFILE%\.vibe\logs\session\`) | Same `~/.vibe` root on all platforms; reads each session directory's `meta.json` cumulative `stats`, never the `messages.jsonl` transcript |
 | MiniMax Code | `~/.config/tokscale/headless/mcode/` | `%APPDATA%\tokscale\headless\mcode\` | Headless capture only; Tokscale reads its own capture directory rather than MiniMax Code's shared Desktop/Runtime store, which does not identify the originating surface. Override the root with `TOKSCALE_HEADLESS_DIR` |
 
 > **Devin Desktop agent support**: Local usage parsing works for ACP-connected agents (e.g. Cascade/Windsurf, claude-code, opencode) that emit `usage_update` events in the NDJSON stream. The default **devin-cloud** agent does not emit local `usage_update` events — its usage stays server-side and cannot be tracked by tokscale without an account-level API.
 
-> **Note**: On Windows, `~` expands to `%USERPROFILE%` (e.g., `C:\Users\YourName`). These tools intentionally use Unix-style paths (like `.local/share`) even on Windows for cross-platform consistency, rather than Windows-native paths like `%APPDATA%`.
+> **Note**: On Windows, `~` expands to `%USERPROFILE%` (e.g., `C:\Users\YourName`). Some tools use Unix-style paths (like `.local/share`) for cross-platform consistency, while others, including Goose, use Windows-native paths like `%APPDATA%`, as listed above.
 
 #### Windows-Specific Configuration
 
@@ -1847,6 +1857,10 @@ $env:COPILOT_OTEL_FILE_EXPORTER_PATH = Join-Path $otelDir ("copilot-otel-{0}.jso
 ```
 
 Using a timestamped filename is recommended so each Copilot session writes to a fresh file instead of accumulating into one huge OTEL log.
+
+Repeated OTEL span snapshots are merged across files only when they carry a complete trace/span identity and compatible attribution and timestamps. Missing model, session, or agent context is filled from a matching richer snapshot; conflicting populated values remain separate. Records with a span ID but no trace ID can still merge within one file; they remain separate across files. The local parser cache is rebuilt when the parser generation changes.
+
+This local deduplication does not immediately lower already-uploaded historical totals. The hosted high-water policy retains the previous maximum until corrected usage exceeds it: incoming totals of `200 → 100 → 150 → 200 → 250` retain hosted totals of `200 → 200 → 200 → 200 → 250`. Later growth is still counted; repairing previously inflated hosted days requires a separate safe historical-correction mechanism. The local cache parser generation is independent of the submission wire generation, which is unchanged by this fix.
 
 Tokscale treats `chat` spans as the source of truth for token accounting and ignores tool spans plus cumulative metrics in phase 1:
 
@@ -2098,6 +2112,8 @@ Crush stores usage in per-project SQLite databases (`crush.db`). Tokscale import
 
 Location: `~/.local/share/goose/sessions/sessions.db` (also scans `~/Library/Application Support/goose/`, `~/Library/Application Support/Block/goose/`, `~/.local/share/Block/goose/`; override via `GOOSE_PATH_ROOT`)
 
+Native Windows scans check `%APPDATA%\Block\goose\data\sessions\sessions.db` before XDG and legacy locations. With `APPDATA` unset or empty, the native roaming directory is checked before Desktop's `<HOME>/AppData/Roaming` fallback. `--home` scans ignore `GOOSE_PATH_ROOT` and process-specific Windows locations, and also check `<home>/AppData/Roaming/Block/goose/data/sessions/sessions.db`. Without `--home`, an absolute `GOOSE_PATH_ROOT` is authoritative even when its database is absent; relative values are ignored. Moving the executable does not relocate the database.
+
 Goose stores per-session usage in a SQLite `sessions.db`. Tokscale extracts the model from `model_config_json`, the provider from `provider_name`, and accumulated input/output token totals per session. Reasoning tokens are inferred when the column is populated.
 
 ### Codebuff
@@ -2158,6 +2174,10 @@ The `data` column is a JSON blob with the following token-relevant fields:
 
 Tokscale deduplicates messages across forked sessions using a fingerprint of timestamps, model, provider, token counts, cost, and agent name.
 
+### Aside
+
+Aside stores flat assistant usage at `~/.aside/u/<account>/sessions/<session>/messages.jsonl`. Tokscale preserves native timestamps, model metadata and separate cached-input buckets, including the 1-hour-TTL subset of cache writes. Reasoning is split out of output, so totals and estimated cost count it once. Aside's `provider` field records the route rather than the vendor, so a Claude Code route is reported as Anthropic and a generic gateway route defers to model-family inference; explicit vendor ids stay authoritative. Repeated provider-scoped response IDs are counted once across sessions/accounts; calls without an ID remain separate. Positive recorded costs are retained; zero or absent costs use standard pricing. Use `tokscale --no-spinner --client aside` to filter usage. Windows execution has not been verified.
+
 ### Muse Code
 
 Location: `~/.local/share/muse/sessions/YYYY/MM/DD/<session-uuid>/session.jsonl` (same XDG-style path on all platforms, including Windows; subagent transcripts under `subagent/<uuid>/` are scanned too)
@@ -2165,6 +2185,14 @@ Location: `~/.local/share/muse/sessions/YYYY/MM/DD/<session-uuid>/session.jsonl`
 Muse Code writes one event-sourced JSONL transcript per session. Tokscale reads `model_completed` events, which carry the model id (`muse-spark-*`), a Responses-shaped `usage` object (`input_tokens`, `output_tokens`, `cached_tokens`/`cache_read_tokens`, `cache_write_tokens`, `reasoning_tokens`) and the call's `duration_ms`; `recorded_at` is in microseconds. `cached_tokens` is a subset of `input_tokens` and reasoning rides inside `output_tokens`, so both are split out before pricing and aggregation. The parent session's `workflow_child_lifecycle` usage aggregates are skipped because the child transcripts they summarize are scanned separately. Workspace labels come from the file's `runtime.session.metadata` record.
 
 Muse Spark models are priced from upstream datasets — LiteLLM and models.dev carry `meta/muse-spark-*` rows at Meta's published rates — so Muse usage is costed out of the box (Standard: $1.25/$4.25 per 1M input/output tokens, $0.15 cached input; Contributor: $0.10/$0.20, $0.002 cached input — see [pricing and rate limits](https://dev.meta.ai/docs/pricing-rate-limits)).
+
+### Mistral Vibe
+
+Location: `~/.vibe/logs/session/<prefix>_<YYYYMMDD_HHMMSS>_<short-id>/meta.json` (same `~/.vibe` root on macOS, Linux and Windows — Vibe uses no XDG or `%APPDATA%` location; override the root with `VIBE_HOME`, or the session directory itself with `session_logging.save_dir`)
+
+Vibe writes a directory per session holding `meta.json` and a `messages.jsonl` transcript. Usage is session-granular: the transcript carries no per-message model, timestamp, or token counts, so Tokscale reads only the cumulative `stats` block in `meta.json` (`session_prompt_tokens`, `session_completion_tokens`, `session_cached_tokens`) and never the conversation content. `session_cached_tokens` is a *subset* of `session_prompt_tokens` rather than an addition to it, so cached reads are split out of the input count before pricing — the same arithmetic Vibe's own cost display uses. One message per session is therefore the finest row the format supports; `steps` becomes the session's message count, and `end_time` (ISO-8601, falling back to `start_time`) its timestamp. Pre-2.0 sessions stored one flat `<prefix>_*.json` per session with the same fields under a `metadata` key; those are still read.
+
+The model comes from `config.active_model` in `meta.json`, which holds the alias the session was pinned to. A session that was never pinned records the empty string — Vibe's documented "follow the configured default" sentinel — so Tokscale resolves it from the session's own `config.models` table, then from Mistral's published default alias, rather than attributing the usage to a blank model. Note that the alias (`mistral-medium-3.5`) is not the wire id: Vibe sends a CLI-routed endpoint name (`mistral-vibe-cli-latest`) that no public pricing dataset carries, so the alias is what pricing resolves against. Workspace labels come from `environment.working_directory`, falling back to `origin_directory`.
 
 ## Pricing
 
