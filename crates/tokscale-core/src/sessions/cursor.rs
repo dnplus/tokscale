@@ -2,7 +2,9 @@
 //!
 //! Parses usage files cached locally at ~/.config/tokscale/cursor-cache/.
 //! The active account's cache is `usage.json` (or legacy `usage.csv`);
-//! additional accounts use `usage.<account>.json` (or legacy `usage.<account>.csv`).
+//! additional accounts use `usage.account-<sha256>.json` with exact-owner metadata.
+//! Unmarked legacy JSON/CSV caches remain readable until the CLI preserves them
+//! in archive/ and independently refetches the saved accounts.
 //!
 //! JSON (preferred) comes from the dashboard `get-filtered-usage-events`
 //! endpoint. Each event carries a real `conversationId`, so sessions are keyed
@@ -188,6 +190,38 @@ fn de_automation_id<'de, D: serde::Deserializer<'de>>(
         .map(str::to_owned))
 }
 
+impl CursorUsageEvent {
+    fn normalized_model(&self) -> Option<&str> {
+        self.model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+    }
+
+    fn normalized_conversation_id(&self) -> Option<&str> {
+        self.conversation_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+    }
+
+    fn usable_timestamp(&self) -> Option<i64> {
+        self.normalized_model()?;
+        let timestamp = self.timestamp.as_ref().map(parse_ms_timestamp).unwrap_or(0);
+        (timestamp != 0).then_some(timestamp)
+    }
+}
+
+/// Return a row's timestamp only when the Cursor report parser accepts the row.
+///
+/// This shares the full row deserializer and model/timestamp checks with reports.
+/// Callers using the timestamp for sync progress must also check plausibility.
+pub fn parse_cursor_usage_event_timestamp(value: &serde_json::Value) -> Option<i64> {
+    CursorUsageEvent::deserialize(value)
+        .ok()?
+        .usable_timestamp()
+}
+
 /// The per-event token breakdown. `cacheWriteTokens` is absent on many events.
 /// Counts are coerced leniently so a single float (e.g. `10.0`) or numeric
 /// string doesn't fail the whole row.
@@ -227,6 +261,47 @@ struct CursorTokenUsage {
         deserialize_with = "de_opt_f64_lenient"
     )]
     total_cents: Option<f64>,
+}
+
+impl CursorTokenUsage {
+    fn token_breakdown(&self) -> TokenBreakdown {
+        TokenBreakdown {
+            input: self.input_tokens.unwrap_or(0).max(0),
+            output: self.output_tokens.unwrap_or(0).max(0),
+            cache_read: self.cache_read_tokens.unwrap_or(0).max(0),
+            cache_write: self.cache_write_tokens.unwrap_or(0).max(0),
+            cache_write_1h: 0,
+            reasoning: 0,
+        }
+    }
+}
+
+/// Immutable recognized fields used to match accepted Cursor usage rows.
+/// Billing values are deliberately excluded so an incoming correction replaces
+/// the cached row. An absent conversation id denotes the synthetic-session
+/// fallback within the account's cache; explicit ids remain distinct from it.
+#[derive(Debug)]
+pub struct CursorUsageEventIdentity {
+    pub conversation_id: Option<String>,
+    pub model: String,
+    pub timestamp: i64,
+    pub tokens: TokenBreakdown,
+}
+
+/// Project a row using the report parser's full deserializer and normalization.
+/// Rejected rows return `None` so callers can retain their original identity.
+/// Unknown fields are not part of this projection and must be preserved by the
+/// caller when matching raw events.
+pub fn parse_cursor_usage_event_identity(
+    value: &serde_json::Value,
+) -> Option<CursorUsageEventIdentity> {
+    let event = CursorUsageEvent::deserialize(value).ok()?;
+    Some(CursorUsageEventIdentity {
+        timestamp: event.usable_timestamp()?,
+        model: event.normalized_model()?.to_string(),
+        conversation_id: event.normalized_conversation_id().map(str::to_string),
+        tokens: event.token_usage.unwrap_or_default().token_breakdown(),
+    })
 }
 
 /// Coerce a JSON number/string into `i64`, tolerating floats and numeric
@@ -455,27 +530,17 @@ pub fn parse_cursor_usage_records(content: &str, account_id: &str) -> Vec<Cursor
             Err(_) => continue,
         };
 
-        let model = event.model.unwrap_or_default();
-        let model = model.trim();
-        if model.is_empty() {
+        let Some(timestamp) = event.usable_timestamp() else {
             continue;
-        }
-
-        let timestamp = event
-            .timestamp
-            .as_ref()
-            .map(parse_ms_timestamp)
-            .unwrap_or(0);
-        if timestamp == 0 {
-            continue;
-        }
+        };
+        let model = event.normalized_model().expect("usable model");
 
         // Prefer the real Cursor session UUID; fall back to the legacy synthetic
         // per-day id only when the event carries no usable conversation id, so
         // its cost still lands in the account's totals.
-        let session_id = match event.conversation_id.as_deref().map(str::trim) {
-            Some(id) if !id.is_empty() => id.to_string(),
-            _ => format!(
+        let session_id = match event.normalized_conversation_id() {
+            Some(id) => id.to_string(),
+            None => format!(
                 "cursor-{}-{}",
                 account_id,
                 timestamp_to_date_with_timezone(timestamp, &chrono::Utc)
@@ -483,7 +548,8 @@ pub fn parse_cursor_usage_records(content: &str, account_id: &str) -> Vec<Cursor
         };
 
         let has_token_usage = event.token_usage.is_some();
-        let token_usage = event.token_usage.unwrap_or_default();
+        let default_usage = CursorTokenUsage::default();
+        let token_usage = event.token_usage.as_ref().unwrap_or(&default_usage);
 
         let metered_cost_usd =
             finite_non_negative_cents(token_usage.total_cents).map(|c| c / 100.0);
@@ -498,14 +564,7 @@ pub fn parse_cursor_usage_records(content: &str, account_id: &str) -> Vec<Cursor
             infer_provider(model),
             session_id,
             timestamp,
-            TokenBreakdown {
-                input: token_usage.input_tokens.unwrap_or(0).max(0),
-                output: token_usage.output_tokens.unwrap_or(0).max(0),
-                cache_read: token_usage.cache_read_tokens.unwrap_or(0).max(0),
-                cache_write: token_usage.cache_write_tokens.unwrap_or(0).max(0),
-                cache_write_1h: 0,
-                reasoning: 0,
-            },
+            token_usage.token_breakdown(),
             cost.unwrap_or(0.0).max(0.0),
         );
         if cost.is_some() {

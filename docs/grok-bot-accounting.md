@@ -29,3 +29,11 @@ The existing `usage --bots` command is a separate quota-oriented report and stil
 `usage --bots` retains the provider's metered token cost, wallet charge, and Cursor token fee separately when those fields are present. Each `cost_breakdown` amount has a `known_usd` sum and `reported_calls` count. A count of zero means unknown, not a free event. A smaller count than `calls` means the sum covers only part of the report.
 
 The existing `cost_usd`, weekly cost, and share fields keep their original accounting rule: prefer metered cost and fall back to wallet charge. The token fee is a separate reported component and is never added to the wallet charge again. Included usage can have nonzero metered cost with a zero wallet charge. This local report does not change submitted cost totals or claim that every Cursor endpoint exposes fees.
+
+## Quota forecasts
+
+`usage --bots` reports the observed weekly quota and local event costs separately. Its JSON `burn_rate` is `null`, with `burn_rate_unavailable_reason` explaining why a forecast is unavailable. Bot event costs do not establish the consumption rate of a quota pool shared with Cursor and Grok, and the local cache does not prove full coverage of that pool.
+
+A future forecast needs provider-confirmed account and pool identity, reset boundaries, and successive quota observations from that same pool. Do not infer pool identity from a plan name or email alone. Samples spanning a reset or a change in entitlement cannot form one consumption rate. The current private API response has not been verified for every unified and legacy subscription variant.
+
+See the [official Cursor subscription documentation](https://cursor.com/docs/models-and-pricing) for shared weekly pools, separate prepaid usage, and legacy monthly plans.
