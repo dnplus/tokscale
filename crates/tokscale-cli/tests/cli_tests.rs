@@ -7391,14 +7391,187 @@ fn test_codex_compressed_session_reports_usage() {
     }
 }
 
+/// One request seen by an [`UploadFixture`].
+#[derive(Debug, Clone)]
+struct FixtureRequest {
+    path: String,
+    authorization: Option<String>,
+}
+
+/// Loopback HTTP receiver for upload tests: one request per connection,
+/// answered by `respond(path, body) -> (status, body)`.
+struct UploadFixture {
+    url: String,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<FixtureRequest>>>,
+    stop: std::sync::mpsc::Sender<()>,
+    server: std::thread::JoinHandle<()>,
+}
+
+impl UploadFixture {
+    fn start(respond: impl Fn(&str, &[u8]) -> (u16, String) + Send + 'static) -> Self {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received = std::sync::Arc::clone(&requests);
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            while stopped.try_recv().is_err() {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                };
+                // Windows hands out accepted sockets that inherit the
+                // listener's nonblocking mode; reads would fail with WouldBlock.
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 8192];
+                let header_end = loop {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
+                let path = headers
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_owned();
+                let header = |wanted: &str| {
+                    headers.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case(wanted)
+                            .then(|| value.trim().to_owned())
+                    })
+                };
+                let length = header("content-length")
+                    .map(|value| value.parse::<usize>().unwrap())
+                    .unwrap_or(0);
+                while request.len() < header_end + length {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                received.lock().unwrap().push(FixtureRequest {
+                    path: path.clone(),
+                    authorization: header("authorization"),
+                });
+                let (status, body) = respond(&path, &request[header_end..]);
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        Self {
+            url,
+            requests,
+            stop,
+            server,
+        }
+    }
+
+    /// Accepts submits and quota readings, and validates tokens as `username`.
+    fn accepting(username: &'static str) -> Self {
+        Self::start(move |path, body| default_upload_response(path, body, username))
+    }
+
+    fn finish(self) -> Vec<FixtureRequest> {
+        self.stop.send(()).unwrap();
+        self.server.join().unwrap();
+        let requests = self.requests.lock().unwrap().clone();
+        requests
+    }
+}
+
+fn default_upload_response(path: &str, body: &[u8], username: &str) -> (u16, String) {
+    match path {
+        "/api/quota" => {
+            let json: serde_json::Value = serde_json::from_slice(body).unwrap();
+            assert!(json.is_array(), "quota must match usage --json");
+            (200, "{}".to_string())
+        }
+        "/api/auth/token" => (200, format!(r#"{{"user":{{"username":"{username}"}}}}"#)),
+        _ => (
+            200,
+            r#"{"submissionId":"fixture","metrics":{}}"#.to_string(),
+        ),
+    }
+}
+
+fn count_path(requests: &[FixtureRequest], path: &str) -> usize {
+    requests
+        .iter()
+        .filter(|request| request.path == path)
+        .count()
+}
+
+/// A loopback URL that refuses connections on every platform.
+fn refused_url() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    url
+}
+
+/// `cmd_with_home` with the primary server pointed at `primary_url`.
+fn upload_cmd(home: &Path, primary_url: &str) -> Command {
+    let mut command = cmd_with_home(home);
+    command
+        .env("TOKSCALE_API_URL", primary_url)
+        .env("TOKSCALE_API_TOKEN", "fixture-token")
+        .env("NO_PROXY", "127.0.0.1")
+        .env("no_proxy", "127.0.0.1")
+        .arg("--no-spinner");
+    command
+}
+
+/// Saved next to `credentials.json`, which is where scheduled runs read it.
+fn write_extra_target(home: &Path, name: &str, api_url: &str, enabled: bool) {
+    let dir = home.join(".config").join("tokscale");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("targets.json");
+    let mut file: serde_json::Value = fs::read(&path)
+        .ok()
+        .map(|raw| serde_json::from_slice(&raw).unwrap())
+        .unwrap_or_else(|| serde_json::json!({ "targets": [] }));
+    file["targets"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "name": name,
+            "apiUrl": api_url,
+            "token": format!("tt_{name}_secret"),
+            "username": "pa-user",
+            "enabled": enabled,
+            "createdAt": "2026-10-17T00:00:00Z",
+        }));
+    fs::write(path, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+}
+
+fn extra_target_state(home: &Path, name: &str) -> serde_json::Value {
+    let raw = fs::read(home.join(".config/tokscale/targets-state.json")).unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    state["targets"][name].clone()
+}
+
 /// Exercise both command entry points against the same receiver, including
 /// quota errors after a successful usage upload.
 #[test]
 fn test_submit_and_autosubmit_share_default_quota_upload() {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::sync::{Arc, Mutex};
-
     for (automatic, no_quota, quota_status) in [
         (false, false, 200),
         (true, false, 200),
@@ -7415,84 +7588,14 @@ fn test_submit_and_autosubmit_share_default_quota_upload() {
                 r#"{"autosubmit":{"enabled":true,"clients":["opencode"]}}"#,
             );
         }
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        listener.set_nonblocking(true).unwrap();
-        let paths = Arc::new(Mutex::new(Vec::new()));
-        let received = Arc::clone(&paths);
-        let (stop, stopped) = std::sync::mpsc::channel();
-        let server = std::thread::spawn(move || {
-            while stopped.try_recv().is_err() {
-                let (mut stream, _) = match listener.accept() {
-                    Ok(connection) => connection,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-                    Err(error) => panic!("accept: {error}"),
-                };
-                stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(10)))
-                    .unwrap();
-                let mut request = Vec::new();
-                let mut buffer = [0; 8192];
-                let header_end = loop {
-                    let count = stream.read(&mut buffer).unwrap();
-                    assert!(count > 0);
-                    request.extend_from_slice(&buffer[..count]);
-                    if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-                        break end + 4;
-                    }
-                };
-                let headers = String::from_utf8_lossy(&request[..header_end]);
-                let path = headers
-                    .lines()
-                    .next()
-                    .unwrap()
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap()
-                    .to_owned();
-                let length = headers
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().unwrap())
-                    })
-                    .unwrap_or(0);
-                while request.len() < header_end + length {
-                    let count = stream.read(&mut buffer).unwrap();
-                    assert!(count > 0);
-                    request.extend_from_slice(&buffer[..count]);
-                }
-                received.lock().unwrap().push(path.clone());
-                let (status, body) = if path == "/api/quota" {
-                    let json: serde_json::Value =
-                        serde_json::from_slice(&request[header_end..]).unwrap();
-                    assert!(json.is_array(), "quota must match usage --json");
-                    (
-                        quota_status,
-                        if quota_status == 200 {
-                            "{}"
-                        } else {
-                            r#"{"error":"quota unavailable"}"#
-                        },
-                    )
-                } else {
-                    (200, r#"{"submissionId":"fixture","metrics":{}}"#)
-                };
-                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        let server = UploadFixture::start(move |path, body| {
+            if path == "/api/quota" && quota_status != 200 {
+                (quota_status, r#"{"error":"quota unavailable"}"#.to_string())
+            } else {
+                default_upload_response(path, body, "fixture")
             }
         });
-        let mut command = cmd_with_home(tmp.path());
-        command
-            .env("TOKSCALE_API_URL", url)
-            .env("TOKSCALE_API_TOKEN", "fixture-token")
-            .env("NO_PROXY", "127.0.0.1")
-            .env("no_proxy", "127.0.0.1")
-            .arg("--no-spinner");
+        let mut command = upload_cmd(tmp.path(), &server.url);
         if automatic {
             command.args(["autosubmit", "run", "--force"]);
         } else {
@@ -7502,23 +7605,15 @@ fn test_submit_and_autosubmit_share_default_quota_upload() {
             command.arg("--no-quota");
         }
         let output = command.output().unwrap();
-        stop.send(()).unwrap();
-        server.join().unwrap();
+        let requests = server.finish();
         assert!(
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("Successfully submitted!"));
-        let paths = paths.lock().unwrap();
-        assert_eq!(
-            paths.iter().filter(|path| *path == "/api/submit").count(),
-            1
-        );
-        assert_eq!(
-            paths.iter().filter(|path| *path == "/api/quota").count(),
-            usize::from(!no_quota)
-        );
+        assert_eq!(count_path(&requests, "/api/submit"), 1);
+        assert_eq!(count_path(&requests, "/api/quota"), usize::from(!no_quota));
         assert_eq!(
             String::from_utf8_lossy(&output.stderr).contains("Warning: quota upload failed"),
             quota_status == 502
@@ -7532,4 +7627,319 @@ fn test_submit_and_autosubmit_share_default_quota_upload() {
             assert!(settings["autosubmit"]["lastError"].is_null());
         }
     }
+}
+
+#[test]
+fn test_target_add_validates_the_token_and_list_hides_it() {
+    let tmp = create_temp_fixture_dir();
+    let server = UploadFixture::accepting("pa-user");
+    let added = upload_cmd(tmp.path(), "http://127.0.0.1:9")
+        .args(["target", "add", "pa", "--api-url"])
+        .arg(format!("{}/", server.url))
+        .args(["--token", "tt_pa_secret"])
+        .output()
+        .unwrap();
+    let listed = upload_cmd(tmp.path(), "http://127.0.0.1:9")
+        .args(["target", "list", "--json"])
+        .output()
+        .unwrap();
+    let url = server.url.clone();
+    let requests = server.finish();
+
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/api/auth/token");
+    assert_eq!(
+        requests[0].authorization.as_deref(),
+        Some("Bearer tt_pa_secret")
+    );
+    let saved: serde_json::Value = serde_json::from_slice(
+        &fs::read(tmp.path().join(".config/tokscale/targets.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["targets"][0]["apiUrl"], url.as_str());
+    assert_eq!(saved["targets"][0]["token"], "tt_pa_secret");
+    assert_eq!(saved["targets"][0]["enabled"], true);
+
+    assert!(listed.status.success());
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(!stdout.contains("tt_pa_secret"), "{stdout}");
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed[0]["name"], "pa");
+    assert_eq!(listed[0]["username"], "pa-user");
+}
+
+#[test]
+fn test_target_add_rejects_a_token_the_server_refuses() {
+    let tmp = create_temp_fixture_dir();
+    let server = UploadFixture::start(|_, _| (401, r#"{"error":"Invalid token"}"#.to_string()));
+    let output = upload_cmd(tmp.path(), "http://127.0.0.1:9")
+        .args(["target", "add", "pa", "--api-url"])
+        .arg(&server.url)
+        .args(["--token", "tt_pa_secret"])
+        .output()
+        .unwrap();
+    server.finish();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("Invalid token"), "{stderr}");
+    assert!(!stderr.contains("tt_pa_secret"), "{stderr}");
+    assert!(!tmp.path().join(".config/tokscale/targets.json").exists());
+}
+
+/// Both entry points upload the same submission, and the quota reading, to the
+/// logged-in server and to every enabled extra target, each with its own token.
+#[test]
+fn test_submit_and_autosubmit_upload_to_extra_targets() {
+    for automatic in [false, true] {
+        let tmp = create_temp_fixture_dir();
+        prime_pricing_cache_with_a_priced_model(tmp.path());
+        if automatic {
+            write_settings_json(
+                tmp.path(),
+                r#"{"autosubmit":{"enabled":true,"clients":["opencode"]}}"#,
+            );
+        }
+        let primary = UploadFixture::accepting("fixture");
+        let extra = UploadFixture::accepting("pa-user");
+        let disabled = UploadFixture::accepting("off-user");
+        write_extra_target(tmp.path(), "pa", &extra.url, true);
+        write_extra_target(tmp.path(), "off", &disabled.url, false);
+
+        let mut command = upload_cmd(tmp.path(), &primary.url);
+        if automatic {
+            command.args(["autosubmit", "run", "--force"]);
+        } else {
+            command.args(["submit", "--client", "opencode"]);
+        }
+        let output = command.output().unwrap();
+        let primary = primary.finish();
+        let extra = extra.finish();
+        let disabled = disabled.finish();
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("Submitted to extra target pa."), "{stdout}");
+        for (requests, token) in [(&primary, "fixture-token"), (&extra, "tt_pa_secret")] {
+            assert_eq!(count_path(requests, "/api/submit"), 1);
+            assert_eq!(count_path(requests, "/api/quota"), 1);
+            let expected = format!("Bearer {token}");
+            assert!(requests
+                .iter()
+                .all(|request| request.authorization.as_deref() == Some(expected.as_str())));
+        }
+        assert!(disabled.is_empty(), "a disabled target must be skipped");
+        let state = extra_target_state(tmp.path(), "pa");
+        assert!(state["lastSuccessAtMs"].is_number());
+        assert!(state["lastError"].is_null());
+    }
+}
+
+/// A failing extra target is reported and recorded, while the logged-in
+/// server still receives the submission and the command succeeds.
+#[test]
+fn test_extra_target_failure_does_not_fail_the_primary_upload() {
+    for refused in [false, true] {
+        let tmp = create_temp_fixture_dir();
+        prime_pricing_cache_with_a_priced_model(tmp.path());
+        let primary = UploadFixture::accepting("fixture");
+        let failing =
+            UploadFixture::start(|_, _| (502, r#"{"error":"receiver unavailable"}"#.to_string()));
+        let extra_url = if refused {
+            refused_url()
+        } else {
+            failing.url.clone()
+        };
+        write_extra_target(tmp.path(), "pa", &extra_url, true);
+
+        let output = upload_cmd(tmp.path(), &primary.url)
+            .args(["submit", "--client", "opencode"])
+            .output()
+            .unwrap();
+        let primary = primary.finish();
+        let failing = failing.finish();
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("Successfully submitted!"), "{stdout}");
+        assert!(
+            stderr.contains("Warning: extra target pa upload failed"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("tt_pa_secret"), "{stderr}");
+        assert_eq!(count_path(&primary, "/api/submit"), 1);
+        assert_eq!(count_path(&primary, "/api/quota"), 1);
+        if refused {
+            assert!(failing.is_empty());
+        } else {
+            assert!(stderr.contains("receiver unavailable"), "{stderr}");
+            assert_eq!(count_path(&failing, "/api/submit"), 1);
+            assert_eq!(count_path(&failing, "/api/quota"), 0);
+        }
+        let state = extra_target_state(tmp.path(), "pa");
+        assert!(state["lastError"].is_string(), "{state}");
+        assert!(state["lastSuccessAtMs"].is_null());
+    }
+}
+
+/// The extra target is uploaded first, so a primary failure, which ends an
+/// interactive submit, cannot skip it.
+#[test]
+fn test_primary_failure_still_uploads_to_extra_targets() {
+    let tmp = create_temp_fixture_dir();
+    prime_pricing_cache_with_a_priced_model(tmp.path());
+    let primary = UploadFixture::start(|_, _| (500, r#"{"error":"primary down"}"#.to_string()));
+    let extra = UploadFixture::accepting("pa-user");
+    write_extra_target(tmp.path(), "pa", &extra.url, true);
+
+    let output = upload_cmd(tmp.path(), &primary.url)
+        .args(["submit", "--client", "opencode"])
+        .output()
+        .unwrap();
+    let primary = primary.finish();
+    let extra = extra.finish();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("primary down"), "{stderr}");
+    assert_eq!(count_path(&primary, "/api/submit"), 1);
+    assert_eq!(count_path(&extra, "/api/submit"), 1);
+    assert_eq!(count_path(&extra, "/api/quota"), 1);
+    assert!(extra_target_state(tmp.path(), "pa")["lastSuccessAtMs"].is_number());
+}
+
+#[test]
+fn test_extra_target_flags_select_targets_per_run() {
+    // --no-extra-targets skips saved targets.
+    let tmp = create_temp_fixture_dir();
+    prime_pricing_cache_with_a_priced_model(tmp.path());
+    let primary = UploadFixture::accepting("fixture");
+    let extra = UploadFixture::accepting("pa-user");
+    write_extra_target(tmp.path(), "pa", &extra.url, true);
+    let output = upload_cmd(tmp.path(), &primary.url)
+        .args(["submit", "--client", "opencode", "--no-extra-targets"])
+        .output()
+        .unwrap();
+    let primary = primary.finish();
+    let extra = extra.finish();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(count_path(&primary, "/api/submit"), 1);
+    assert!(extra.is_empty());
+
+    // --extra-target names a disabled target for this run only.
+    let tmp = create_temp_fixture_dir();
+    prime_pricing_cache_with_a_priced_model(tmp.path());
+    let primary = UploadFixture::accepting("fixture");
+    let extra = UploadFixture::accepting("pa-user");
+    write_extra_target(tmp.path(), "pa", &extra.url, false);
+    let output = upload_cmd(tmp.path(), &primary.url)
+        .args(["submit", "--client", "opencode", "--extra-target", "pa"])
+        .output()
+        .unwrap();
+    primary.finish();
+    let extra = extra.finish();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(count_path(&extra, "/api/submit"), 1);
+
+    // An unknown name fails before anything is uploaded.
+    let tmp = create_temp_fixture_dir();
+    prime_pricing_cache_with_a_priced_model(tmp.path());
+    let primary = UploadFixture::accepting("fixture");
+    let output = upload_cmd(tmp.path(), &primary.url)
+        .args(["submit", "--client", "opencode", "--extra-target", "nope"])
+        .output()
+        .unwrap();
+    let primary = primary.finish();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("Unknown extra target `nope`"), "{stderr}");
+    assert!(primary.is_empty());
+}
+
+/// A corrupt `targets.json` must not stop the logged-in server from getting
+/// usage, but naming a target explicitly still fails, and status says why.
+#[test]
+fn test_unreadable_targets_file_keeps_the_primary_upload() {
+    let tmp = create_temp_fixture_dir();
+    prime_pricing_cache_with_a_priced_model(tmp.path());
+    let dir = tmp.path().join(".config/tokscale");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("targets.json"), r#"{"targets":[{"token":"tt_leak"#).unwrap();
+
+    let primary = UploadFixture::accepting("fixture");
+    let output = upload_cmd(tmp.path(), &primary.url)
+        .args(["submit", "--client", "opencode"])
+        .output()
+        .unwrap();
+    let named = upload_cmd(tmp.path(), &primary.url)
+        .args(["submit", "--client", "opencode", "--extra-target", "pa"])
+        .output()
+        .unwrap();
+    let primary = primary.finish();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Warning: skipping extra targets"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("tt_leak"), "{stderr}");
+    assert!(!named.status.success());
+    assert_eq!(count_path(&primary, "/api/submit"), 1);
+
+    let status = upload_cmd(tmp.path(), "http://127.0.0.1:9")
+        .args(["autosubmit", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(status["extraTargetsError"].is_string(), "{status}");
+    let listed = upload_cmd(tmp.path(), "http://127.0.0.1:9")
+        .args(["target", "list"])
+        .output()
+        .unwrap();
+    assert!(!listed.status.success());
+}
+
+/// A hand-edited target URL that `target add` would refuse never receives the
+/// token.
+#[test]
+fn test_extra_target_with_an_unsafe_url_is_skipped() {
+    let tmp = create_temp_fixture_dir();
+    prime_pricing_cache_with_a_priced_model(tmp.path());
+    write_extra_target(tmp.path(), "pa", "http://pa.example.invalid", true);
+    let primary = UploadFixture::accepting("fixture");
+    let output = upload_cmd(tmp.path(), &primary.url)
+        .args(["submit", "--client", "opencode"])
+        .output()
+        .unwrap();
+    let primary = primary.finish();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("Skipping extra target pa"), "{stderr}");
+    assert!(
+        !stdout.contains("Submitting to extra target pa"),
+        "{stdout}"
+    );
+    assert_eq!(count_path(&primary, "/api/submit"), 1);
+    assert!(!tmp
+        .path()
+        .join(".config/tokscale/targets-state.json")
+        .exists());
 }
