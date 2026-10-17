@@ -3099,7 +3099,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn test_read_access_token_from_state_vscdb() -> Result<()> {
         let temp_dir = TempDir::new()?;
