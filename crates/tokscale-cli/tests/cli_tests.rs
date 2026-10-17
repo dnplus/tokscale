@@ -7869,3 +7869,77 @@ fn test_extra_target_flags_select_targets_per_run() {
     assert!(stderr.contains("Unknown extra target `nope`"), "{stderr}");
     assert!(primary.is_empty());
 }
+
+/// A corrupt `targets.json` must not stop the logged-in server from getting
+/// usage, but naming a target explicitly still fails, and status says why.
+#[test]
+fn test_unreadable_targets_file_keeps_the_primary_upload() {
+    let tmp = create_temp_fixture_dir();
+    prime_pricing_cache_with_a_priced_model(tmp.path());
+    let dir = tmp.path().join(".config/tokscale");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("targets.json"), r#"{"targets":[{"token":"tt_leak"#).unwrap();
+
+    let primary = UploadFixture::accepting("fixture");
+    let output = upload_cmd(tmp.path(), &primary.url)
+        .args(["submit", "--client", "opencode"])
+        .output()
+        .unwrap();
+    let named = upload_cmd(tmp.path(), &primary.url)
+        .args(["submit", "--client", "opencode", "--extra-target", "pa"])
+        .output()
+        .unwrap();
+    let primary = primary.finish();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Warning: skipping extra targets"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("tt_leak"), "{stderr}");
+    assert!(!named.status.success());
+    assert_eq!(count_path(&primary, "/api/submit"), 1);
+
+    let status = upload_cmd(tmp.path(), "http://127.0.0.1:9")
+        .args(["autosubmit", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(status["extraTargetsError"].is_string(), "{status}");
+    let listed = upload_cmd(tmp.path(), "http://127.0.0.1:9")
+        .args(["target", "list"])
+        .output()
+        .unwrap();
+    assert!(!listed.status.success());
+}
+
+/// A hand-edited target URL that `target add` would refuse never receives the
+/// token.
+#[test]
+fn test_extra_target_with_an_unsafe_url_is_skipped() {
+    let tmp = create_temp_fixture_dir();
+    prime_pricing_cache_with_a_priced_model(tmp.path());
+    write_extra_target(tmp.path(), "pa", "http://pa.example.invalid", true);
+    let primary = UploadFixture::accepting("fixture");
+    let output = upload_cmd(tmp.path(), &primary.url)
+        .args(["submit", "--client", "opencode"])
+        .output()
+        .unwrap();
+    let primary = primary.finish();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("Skipping extra target pa"), "{stderr}");
+    assert!(
+        !stdout.contains("Submitting to extra target pa"),
+        "{stdout}"
+    );
+    assert_eq!(count_path(&primary, "/api/submit"), 1);
+    assert!(!tmp
+        .path()
+        .join(".config/tokscale/targets-state.json")
+        .exists());
+}

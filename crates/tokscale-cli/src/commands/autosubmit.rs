@@ -198,6 +198,8 @@ struct StatusOutput {
     last_quota_at_ms: Option<i64>,
     last_quota_error: Option<String>,
     extra_targets: Vec<crate::extra_targets::TargetStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extra_targets_error: Option<String>,
 }
 
 pub fn enable(args: AutosubmitEnableArgs) -> Result<()> {
@@ -394,14 +396,18 @@ fn print_scheduled_target_notice(no_quota: bool) {
             );
         }
     }
-    for target in crate::extra_targets::statuses()
-        .iter()
-        .filter(|target| target.enabled)
-    {
-        println!(
-            "  Scheduled runs also submit to extra target {} ({}).",
-            target.name, target.api_url
-        );
+    match crate::extra_targets::statuses() {
+        Ok(targets) => {
+            for target in targets.iter().filter(|target| target.enabled) {
+                println!(
+                    "  Scheduled runs also submit to extra target {} ({}).",
+                    target.name, target.api_url
+                );
+            }
+        }
+        Err(error) => eprintln!(
+            "Warning: extra targets are unreadable, so scheduled runs submit to the server above only: {error:#}"
+        ),
     }
 }
 
@@ -464,12 +470,15 @@ pub fn status(json: bool) -> Result<()> {
     if let Some(error) = autosubmit.last_quota_error {
         println!("  Last quota error: {error}");
     }
-    let extra_targets = crate::extra_targets::statuses();
-    if !extra_targets.is_empty() {
-        println!("  Extra targets:");
-        for target in &extra_targets {
-            crate::extra_targets::print_status_line(target);
+    match crate::extra_targets::statuses() {
+        Ok(extra_targets) if !extra_targets.is_empty() => {
+            println!("  Extra targets:");
+            for target in &extra_targets {
+                crate::extra_targets::print_status_line(target);
+            }
         }
+        Ok(_) => {}
+        Err(error) => println!("  Extra targets: unreadable ({error:#})"),
     }
     Ok(())
 }
@@ -556,8 +565,10 @@ pub fn record_quota_result(now_ms: i64, result: &Result<()>) -> Result<()> {
     settings.save_with_origin(origin)
 }
 
-/// POST the `tokscale usage --json` document to `<api-url>/api/quota` with the
-/// same token, and the same origin check, that submit uses.
+/// POST the `tokscale usage --json` document to `<api-url>/api/quota` with
+/// `auth`'s token. This performs no origin check: callers pass the URL already
+/// paired with the token (`auth::api_url_for` for the logged-in server, the
+/// saved URL for an extra target).
 pub fn upload_quota(auth: &crate::auth::ApiTokenAuth, api_url: &str) -> Result<()> {
     let body = quota_body()?;
     let rt = tokio::runtime::Runtime::new()?;
@@ -802,6 +813,10 @@ fn running_executable_is(path: &str) -> bool {
 }
 
 fn status_output(settings: &AutosubmitSettings) -> StatusOutput {
+    let (extra_targets, extra_targets_error) = match crate::extra_targets::statuses() {
+        Ok(targets) => (targets, None),
+        Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+    };
     StatusOutput {
         enabled: settings.enabled,
         interval_minutes: settings.interval_minutes,
@@ -823,7 +838,8 @@ fn status_output(settings: &AutosubmitSettings) -> StatusOutput {
         no_quota: settings.no_quota,
         last_quota_at_ms: settings.last_quota_at_ms,
         last_quota_error: settings.last_quota_error.clone(),
-        extra_targets: crate::extra_targets::statuses(),
+        extra_targets,
+        extra_targets_error,
     }
 }
 

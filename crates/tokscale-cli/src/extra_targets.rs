@@ -151,9 +151,25 @@ fn load_targets_from(dir: &Path) -> Result<Vec<Target>> {
     Ok(file.targets)
 }
 
+/// Create the config directory private to the user, as `auth` does for
+/// `credentials.json`. An existing directory is left as it is.
+fn ensure_private_dir(dir: &Path) -> Result<()> {
+    if dir.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("Could not create {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 /// Written only by the `target` subcommands, never by a submit, so a scheduled
 /// run cannot race a token rewrite.
 fn save_targets_to(dir: &Path, targets: &[Target]) -> Result<()> {
+    ensure_private_dir(dir)?;
     let json = serde_json::to_string_pretty(&TargetsFile {
         targets: targets.to_vec(),
     })?;
@@ -170,6 +186,7 @@ fn load_state_from(dir: &Path) -> BTreeMap<String, TargetState> {
 }
 
 fn save_state_to(dir: &Path, targets: BTreeMap<String, TargetState>) -> Result<()> {
+    ensure_private_dir(dir)?;
     let json = serde_json::to_string_pretty(&StateFile { targets })?;
     crate::commands::usage::helpers::atomic_write_secret(&dir.join(STATE_FILE), json.as_bytes())?;
     Ok(())
@@ -204,11 +221,10 @@ fn redact(text: &str, token: &str) -> String {
     }
 }
 
-pub fn statuses() -> Vec<TargetStatus> {
-    let Ok(dir) = config_dir() else {
-        return Vec::new();
-    };
-    statuses_in(&dir).unwrap_or_default()
+/// Saved targets with their last results. An unreadable `targets.json` is an
+/// error, so callers can say so instead of showing no targets.
+pub fn statuses() -> Result<Vec<TargetStatus>> {
+    statuses_in(&config_dir()?)
 }
 
 fn statuses_in(dir: &Path) -> Result<Vec<TargetStatus>> {
@@ -256,6 +272,16 @@ fn select(
         if !wanted {
             continue;
         }
+        // `targets.json` can be edited by hand; never send a token to a URL
+        // `target add` would have refused, such as plain http off localhost.
+        let api_url = match crate::auth::normalize_api_url(&target.api_url) {
+            Ok(api_url) => api_url,
+            Err(error) => {
+                notices.push(format!("Skipping extra target {}: {error:#}", target.name));
+                continue;
+            }
+        };
+        let target = Target { api_url, ..target };
         if origin(&target.api_url) == primary_origin {
             notices.push(format!(
                 "Skipping extra target {}: it is the server this submit already uploads to.",
@@ -275,11 +301,20 @@ pub struct Plan {
 
 impl Plan {
     /// Resolve before scanning, so an unknown `--extra-target` fails early.
+    /// An unreadable `targets.json` only fails the run when targets were named
+    /// explicitly; otherwise the logged-in server still gets the submission.
     pub fn resolve(flags: &ExtraTargetFlags, primary_url: &str) -> Result<Self> {
         let targets = if flags.no_extra_targets {
             Vec::new()
         } else {
-            load_targets_from(&config_dir()?)?
+            match config_dir().and_then(|dir| load_targets_from(&dir)) {
+                Ok(targets) => targets,
+                Err(error) if flags.names.is_empty() => {
+                    eprintln!("  Warning: skipping extra targets: {error:#}");
+                    Vec::new()
+                }
+                Err(error) => return Err(error),
+            }
         };
         let (targets, notices) = select(targets, flags, primary_url)?;
         for notice in notices {
@@ -761,6 +796,32 @@ mod tests {
             select(targets, &flags(&[], false), "https://pa.example.com").unwrap();
         assert!(selected.is_empty());
         assert_eq!(notices.len(), 1);
+    }
+
+    #[test]
+    fn targets_with_an_unsafe_saved_url_are_skipped() {
+        let targets = vec![
+            target("plain", "http://pa.example.com", true),
+            target("local", "http://127.0.0.1:8080/", true),
+        ];
+        let (selected, notices) =
+            select(targets, &flags(&[], false), "https://tokscale.ai").unwrap();
+        assert_eq!(names(&selected), ["local"]);
+        assert_eq!(selected[0].api_url, "http://127.0.0.1:8080");
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("plain"), "{}", notices[0]);
+        assert!(!notices[0].contains("tt_plain"), "{}", notices[0]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_config_dir_is_private_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("tokscale");
+        save_targets_to(&dir, &[target("pa", "https://pa.example.com", true)]).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     #[test]
