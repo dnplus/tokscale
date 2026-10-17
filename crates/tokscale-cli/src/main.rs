@@ -5,6 +5,7 @@ mod claude_diagnostics;
 mod commands;
 mod cursor;
 mod device;
+mod extra_targets;
 mod hindsight;
 mod paths;
 mod process_liveness;
@@ -311,6 +312,13 @@ enum Commands {
             help = "Disable automatic quota upload after a successful submit"
         )]
         no_quota: bool,
+        #[command(flatten)]
+        extra_targets: extra_targets::ExtraTargetFlags,
+    },
+    #[command(about = "Manage extra servers that submit also uploads to")]
+    Target {
+        #[command(subcommand)]
+        subcommand: extra_targets::TargetSubcommand,
     },
     #[command(about = "Manage periodic usage submission")]
     Autosubmit {
@@ -936,6 +944,7 @@ fn main() -> Result<()> {
             date,
             dry_run,
             no_quota,
+            extra_targets,
         }) => {
             reject_unsupported_home_override(&cli.home, "submit")?;
             let (since, until) = build_date_filter(&date, &cli.home);
@@ -953,8 +962,13 @@ fn main() -> Result<()> {
                 year,
                 dry_run,
                 no_quota,
+                &extra_targets,
                 SubmitMode::Interactive,
             )
+        }
+        Some(Commands::Target { subcommand }) => {
+            reject_unsupported_home_override(&cli.home, "target")?;
+            extra_targets::run(subcommand)
         }
         Some(Commands::Autosubmit { subcommand }) => {
             reject_unsupported_home_override(&cli.home, "autosubmit")?;
@@ -1912,26 +1926,36 @@ fn auto_sync_cursor_before_tui(
 fn emit_cursor_sync_warning(
     sync: Option<&cursor::SyncCursorResult>,
     had_cursor_cache: bool,
-    explicit_cursor_filter: bool,
+    _explicit_cursor_filter: bool,
 ) {
-    let Some(sync) = sync else {
-        return;
-    };
-    let Some(error) = sync.error.as_ref() else {
-        return;
-    };
-    if sync.synced || had_cursor_cache || explicit_cursor_filter {
+    if let Some(warning) = cursor_sync_warning(sync, had_cursor_cache) {
         use colored::Colorize;
-        let prefix = if sync.synced {
-            "Cursor sync warning"
-        } else if had_cursor_cache {
-            "Cursor sync failed; using cached data"
-        } else {
-            "Cursor sync failed"
-        };
-        eprintln!("{}", format!("  {}: {}", prefix, error).yellow());
+        eprintln!("{}", format!("  {}", warning).yellow());
     }
 }
+
+/// Without a cache, a failed implicit sync leaves Cursor out of the report
+/// entirely, so it is always surfaced with a pointer to the explicit sync,
+/// whose time budget scales with the account's history.
+fn cursor_sync_warning(
+    sync: Option<&cursor::SyncCursorResult>,
+    had_cursor_cache: bool,
+) -> Option<String> {
+    let sync = sync?;
+    let error = sync.error.as_ref()?;
+    Some(if sync.synced {
+        format!("Cursor sync warning: {}", error)
+    } else if had_cursor_cache {
+        format!("Cursor sync failed; using cached data: {}", error)
+    } else {
+        format!(
+            "Cursor sync failed: {}; {}",
+            error, CURSOR_EXPLICIT_SYNC_HINT
+        )
+    })
+}
+
+const CURSOR_EXPLICIT_SYNC_HINT: &str = "run `tokscale cursor sync` to retry with a longer timeout";
 
 fn default_submit_clients() -> Vec<String> {
     let mut clients: Vec<String> = tokscale_core::ClientId::iter()
@@ -6661,7 +6685,11 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
         AutosubmitSubcommand::Enable(args) => commands::autosubmit::enable(args),
         AutosubmitSubcommand::Status { json } => commands::autosubmit::status(json),
         AutosubmitSubcommand::Disable => commands::autosubmit::disable(),
-        AutosubmitSubcommand::Run { force, no_quota } => {
+        AutosubmitSubcommand::Run {
+            force,
+            no_quota,
+            extra_targets,
+        } => {
             let now_ms = chrono::Utc::now().timestamp_millis();
             let (settings, decision) = commands::autosubmit::load_run_config(force, now_ms)?;
             match decision {
@@ -6692,6 +6720,7 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
                 year,
                 false,
                 no_quota || settings.no_quota,
+                &extra_targets,
                 SubmitMode::Autosubmit,
             ) {
                 Ok(()) => {
@@ -6710,6 +6739,7 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_submit_command(
     clients: Option<Vec<String>>,
     since: Option<String>,
@@ -6717,6 +6747,7 @@ fn run_submit_command(
     year: Option<String>,
     dry_run: bool,
     no_quota: bool,
+    extra_target_flags: &extra_targets::ExtraTargetFlags,
     mode: SubmitMode,
 ) -> Result<()> {
     use colored::Colorize;
@@ -6741,7 +6772,8 @@ fn run_submit_command(
         }
     };
     // Fail before scanning when the saved token belongs to another server.
-    auth::api_url_for(&auth_token)?;
+    let primary_url = auth::api_url_for(&auth_token)?;
+    let extra_plan = extra_targets::Plan::resolve(extra_target_flags, &primary_url)?;
 
     if mode == SubmitMode::Interactive
         && auth_token.source == auth::ApiTokenSource::StoredCredentials
@@ -6776,13 +6808,8 @@ fn run_submit_command(
                 "{}",
                 format!("  Cursor: {} usage events synced", sync_result.rows).bright_black()
             );
-        } else if let Some(err) = sync_result.error {
-            if has_cursor_cache {
-                println!(
-                    "{}",
-                    format!("  Cursor sync failed; using cached data: {}", err).yellow()
-                );
-            }
+        } else if let Some(warning) = cursor_sync_warning(Some(&sync_result), has_cursor_cache) {
+            println!("{}", format!("  {}", warning).yellow());
         }
     }
 
@@ -7004,6 +7031,7 @@ fn run_submit_command(
     }
 
     if dry_run {
+        extra_plan.print_dry_run();
         println!("{}", "  Dry run - not submitting data.\n".yellow());
         return Ok(());
     }
@@ -7013,6 +7041,8 @@ fn run_submit_command(
     let submit_device = device::resolve_submit_device()?;
     let submit_payload =
         to_ts_token_contribution_data(&graph_result, Some(&submit_device), scan_scope);
+    // Before the primary upload, which exits the process when it fails.
+    extra_plan.submit_all(&rt, &submit_payload, no_quota);
     post_submission(&rt, &auth_token, &submit_payload, mode)?;
     let api_url = auth::api_url_for(&auth_token)?;
     if let Some(result) = commands::autosubmit::after_submit_quota(
@@ -8929,7 +8959,8 @@ mod tests {
             Some(Commands::Autosubmit {
                 subcommand: commands::autosubmit::AutosubmitSubcommand::Run {
                     force: true,
-                    no_quota: false
+                    no_quota: false,
+                    ..
                 }
             })
         ));
@@ -8940,7 +8971,8 @@ mod tests {
             Some(Commands::Autosubmit {
                 subcommand: commands::autosubmit::AutosubmitSubcommand::Run {
                     force: false,
-                    no_quota: true
+                    no_quota: true,
+                    ..
                 }
             })
         ));
@@ -10599,6 +10631,30 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("runtime unavailable")));
+    }
+
+    #[test]
+    fn cursor_sync_failure_without_cache_points_to_explicit_sync() {
+        let failed = cursor::SyncCursorResult {
+            synced: false,
+            rows: 0,
+            error: Some("request timed out".to_string()),
+        };
+        let warning = cursor_sync_warning(Some(&failed), false).unwrap();
+        assert!(warning.contains("request timed out"), "{warning}");
+        assert!(warning.contains("tokscale cursor sync"), "{warning}");
+
+        let warning = cursor_sync_warning(Some(&failed), true).unwrap();
+        assert!(warning.contains("using cached data"), "{warning}");
+        assert!(!warning.contains("tokscale cursor sync"), "{warning}");
+
+        let ok = cursor::SyncCursorResult {
+            synced: true,
+            rows: 1,
+            error: None,
+        };
+        assert!(cursor_sync_warning(Some(&ok), false).is_none());
+        assert!(cursor_sync_warning(None, false).is_none());
     }
 
     #[test]

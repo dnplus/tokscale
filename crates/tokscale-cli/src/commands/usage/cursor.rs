@@ -63,6 +63,7 @@ struct LocalCursorAuth {
     access_token: String,
     refresh_token: Option<String>,
     email: Option<String>,
+    credential_source: &'static str,
 }
 
 pub fn has_credentials() -> bool {
@@ -115,7 +116,7 @@ pub fn fetch() -> Result<UsageOutput> {
         Ok(UsageOutput {
             provider: PROVIDER.to_string(),
             account: None,
-            credential_source: Some("desktop".into()),
+            credential_source: Some(auth.credential_source.into()),
             plan: plan_name,
             email: auth.email,
             metrics,
@@ -201,7 +202,7 @@ fn fetch_grok_bot_desktop() -> Result<UsageOutput> {
         Ok(UsageOutput {
             provider: GROK_BOT_PROVIDER.to_string(),
             account: None,
-            credential_source: Some("desktop".into()),
+            credential_source: Some(auth.credential_source.into()),
             plan: parsed.plan,
             email: auth.email,
             metrics: vec![parsed.metric],
@@ -532,38 +533,69 @@ fn resolve_local_auth() -> Result<LocalCursorAuth> {
         (None, None, None)
     };
 
+    select_local_auth(
+        db_access.as_deref(),
+        db_refresh.as_deref(),
+        db_email.as_deref(),
+        || {
+            #[cfg(target_os = "macos")]
+            {
+                let access = super::helpers::read_keychain(ACCESS_SERVICE).ok();
+                let refresh = access
+                    .as_deref()
+                    .filter(|token| access_token_usable(token.trim()))
+                    .and_then(|_| super::helpers::read_keychain(REFRESH_SERVICE).ok());
+                (access, refresh)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                (None, None)
+            }
+        },
+        crate::cursor::load_active_credentials,
+    )
+}
+
+fn select_local_auth(
+    db_access: Option<&str>,
+    db_refresh: Option<&str>,
+    db_email: Option<&str>,
+    keychain: impl FnOnce() -> (Option<String>, Option<String>),
+    stored: impl FnOnce() -> Option<crate::cursor::CursorCredentials>,
+) -> Result<LocalCursorAuth> {
     if let Some(access) = db_access
+        .map(str::trim)
+        .filter(|token| access_token_usable(token))
+    {
+        return Ok(LocalCursorAuth {
+            access_token: access.to_string(),
+            refresh_token: nonempty(db_refresh),
+            email: account_label(db_email),
+            credential_source: "desktop",
+        });
+    }
+
+    let (access, refresh) = keychain();
+    if let Some(access) = access
         .as_deref()
         .map(str::trim)
         .filter(|token| access_token_usable(token))
     {
         return Ok(LocalCursorAuth {
             access_token: access.to_string(),
-            refresh_token: nonempty(db_refresh.as_deref()),
-            email: account_label(db_email.as_deref()),
+            refresh_token: nonempty(refresh.as_deref()),
+            email: None,
+            credential_source: "keychain",
         });
     }
 
-    #[cfg(target_os = "macos")]
-    if let Ok(access) = super::helpers::read_keychain(ACCESS_SERVICE) {
-        let access = access.trim();
-        if access_token_usable(access) {
-            let refresh = super::helpers::read_keychain(REFRESH_SERVICE).ok();
-            return Ok(LocalCursorAuth {
-                access_token: access.to_string(),
-                refresh_token: nonempty(refresh.as_deref())
-                    .or_else(|| nonempty(db_refresh.as_deref())),
-                email: account_label(db_email.as_deref()),
-            });
-        }
-    }
-
-    if let Some(creds) = crate::cursor::load_active_credentials() {
+    if let Some(creds) = stored() {
         if let Some(access) = jwt_from_session_token(&creds.session_token) {
             return Ok(LocalCursorAuth {
                 access_token: access,
                 refresh_token: None,
-                email: account_label(db_email.as_deref()),
+                email: account_label(creds.email.as_deref()),
+                credential_source: "stored",
             });
         }
     }
@@ -870,6 +902,81 @@ mod tests {
         let report = grok_bot_account_report([(bot_account("one", true), sand_fixture())]);
         assert_eq!(report.outputs.len(), 1);
         assert!(report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn stored_auth_keeps_its_identity_when_desktop_has_another_account() {
+        let stored = serde_json::from_value(json!({
+            "sessionToken": "user-b::header.payload.signature",
+            "createdAt": "2026-10-17T00:00:00Z",
+            "email": "b@example.com"
+        }))
+        .unwrap();
+        let auth = select_local_auth(
+            Some("invalid-desktop-token"),
+            Some("desktop-a-refresh"),
+            Some("a@example.com"),
+            || (None, None),
+            || Some(stored),
+        )
+        .unwrap();
+        assert_eq!(auth.access_token, "header.payload.signature");
+        assert_eq!(auth.email.as_deref(), Some("b@example.com"));
+        assert_eq!(auth.credential_source, "stored");
+        assert!(auth.refresh_token.is_none());
+    }
+
+    #[test]
+    fn stored_auth_without_email_does_not_borrow_desktop_identity() {
+        let stored = serde_json::from_value(json!({
+            "sessionToken": "user-b::header.payload.signature",
+            "createdAt": "2026-10-17T00:00:00Z"
+        }))
+        .unwrap();
+        let auth = select_local_auth(
+            None,
+            None,
+            Some("a@example.com"),
+            || (None, None),
+            || Some(stored),
+        )
+        .unwrap();
+        assert!(auth.email.is_none());
+        assert_eq!(auth.credential_source, "stored");
+    }
+
+    #[test]
+    fn desktop_auth_keeps_matching_identity_and_skips_fallbacks() {
+        let auth = select_local_auth(
+            Some(" desktop.payload.signature "),
+            Some(" desktop-refresh "),
+            Some(" a@example.com "),
+            || panic!("desktop auth should not read Keychain"),
+            || panic!("desktop auth should not read stored credentials"),
+        )
+        .unwrap();
+        assert_eq!(auth.access_token, "desktop.payload.signature");
+        assert_eq!(auth.email.as_deref(), Some("a@example.com"));
+        assert_eq!(auth.refresh_token.as_deref(), Some("desktop-refresh"));
+        assert_eq!(auth.credential_source, "desktop");
+    }
+
+    #[test]
+    fn keychain_auth_does_not_borrow_desktop_email_or_refresh_token() {
+        for refresh in [None, Some(" keychain-refresh ".to_string())] {
+            let auth = select_local_auth(
+                None,
+                Some("desktop-a-refresh"),
+                Some("a@example.com"),
+                || (Some("keychain.payload.signature".into()), refresh.clone()),
+                || panic!("Keychain auth should not read stored credentials"),
+            )
+            .unwrap();
+            assert_eq!(auth.access_token, "keychain.payload.signature");
+            assert!(auth.email.is_none());
+            assert_eq!(auth.refresh_token, nonempty(refresh.as_deref()));
+            assert_eq!(auth.credential_source, "keychain");
+        }
     }
 
     #[test]

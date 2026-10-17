@@ -1019,7 +1019,7 @@ fn sanitize_account_id_for_filename(account_id: &str) -> String {
 
 /// Hash the exact ID, including case and whitespace. Sanitized names cannot
 /// distinguish accounts and are retained only for human-readable archive labels.
-fn cursor_account_cache_stem(account_id: &str) -> String {
+pub(crate) fn cursor_account_cache_stem(account_id: &str) -> String {
     format!("account-{:x}", Sha256::digest(account_id.as_bytes()))
 }
 
