@@ -1145,6 +1145,39 @@ struct FlushContext<'a> {
     timezone: Option<bucket_tz::BucketTimezone>,
 }
 
+fn matches_flush_filter(message: &UnifiedMessage, context: &FlushContext<'_>) -> bool {
+    context.include_all
+        || retain_for_requested_clients(
+            &message.client,
+            &message.model_id,
+            &message.provider_id,
+            &context.requested,
+        )
+}
+
+/// Apply the post-filter parse tail to a message whose source eligibility has
+/// already been decided. The OpenCodex overlay can alter model/provider without
+/// changing the original client or Synthetic selection.
+fn flush_retained_message<S: MessageSink>(
+    mut message: UnifiedMessage,
+    context: &FlushContext<'_>,
+    sink: &mut S,
+    estimate_source: Option<EstimateSource>,
+) {
+    if context.include_synthetic {
+        sessions::synthetic::normalize_synthetic_gateway_fields(
+            &mut message.model_id,
+            &mut message.provider_id,
+        );
+    }
+
+    if let Some(timezone) = &context.timezone {
+        message.rebucket_date(timezone);
+    }
+
+    sink.accept_with_estimate_source(message, estimate_source);
+}
+
 /// Drain `buffer` into `sink`, applying the tail passes to each message.
 ///
 /// The order is load-bearing and matches the original tail: filter BEFORE
@@ -1163,12 +1196,30 @@ fn flush_lane<S: MessageSink>(
     }
 }
 
+/// Drain a lane whose original model/provider eligibility was already checked.
+/// Later physical-model attribution must not change the selection decision.
+fn flush_retained_lane<S: MessageSink>(
+    buffer: &mut Vec<UnifiedMessage>,
+    context: &FlushContext<'_>,
+    sink: &mut S,
+) {
+    for message in buffer.drain(..) {
+        let estimate_source = context
+            .pricing
+            .and_then(|pricing| pricing.take_cost_estimate_source(&message));
+        flush_retained_message(message, context, sink, estimate_source);
+    }
+    if let Some(pricing) = context.pricing {
+        pricing.clear_cost_estimate_sources();
+    }
+}
+
 /// Apply the parse tail to one message and release it into the consumer.
 ///
 /// Most parsers still hand back a lane buffer, but sources with their own
 /// streaming boundary can call this directly without rebuilding that buffer.
 fn flush_message<S: MessageSink>(
-    mut message: UnifiedMessage,
+    message: UnifiedMessage,
     context: &FlushContext<'_>,
     sink: &mut S,
 ) {
@@ -1177,29 +1228,11 @@ fn flush_message<S: MessageSink>(
     let estimate_source = context
         .pricing
         .and_then(|pricing| pricing.take_cost_estimate_source(&message));
-    if !context.include_all
-        && !retain_for_requested_clients(
-            &message.client,
-            &message.model_id,
-            &message.provider_id,
-            &context.requested,
-        )
-    {
+    if !matches_flush_filter(&message, context) {
         return;
     }
 
-    if context.include_synthetic {
-        sessions::synthetic::normalize_synthetic_gateway_fields(
-            &mut message.model_id,
-            &mut message.provider_id,
-        );
-    }
-
-    if let Some(timezone) = &context.timezone {
-        message.rebucket_date(timezone);
-    }
-
-    sink.accept_with_estimate_source(message, estimate_source);
+    flush_retained_message(message, context, sink, estimate_source);
 }
 
 fn parse_all_messages_with_pricing_with_cache_policy(
@@ -1292,6 +1325,14 @@ fn codex_missing_usage_warning(missing_files: usize, inspected_files: usize) -> 
     })
 }
 
+fn format_codex_archive_limit_label(limit_bytes: u64) -> String {
+    if limit_bytes.is_multiple_of(1024 * 1024) {
+        format!("{} MiB", limit_bytes / (1024 * 1024))
+    } else {
+        format!("{limit_bytes}-byte")
+    }
+}
+
 fn codex_archive_failure_warning(
     mut failures: Vec<sessions::codex::CodexArchiveFailure>,
 ) -> Option<String> {
@@ -1327,9 +1368,10 @@ fn codex_archive_failure_warning(
         ));
     }
     if size_limit_failures > 0 {
-        let limit_mib = sessions::codex::MAX_CODEX_ARCHIVE_BYTES / (1024 * 1024);
+        let limit_label =
+            format_codex_archive_limit_label(sessions::codex::max_codex_archive_bytes());
         categories.push(format!(
-            "{size_limit_failures} exceeded the {limit_mib} MiB decoded-size limit"
+            "{size_limit_failures} exceeded the {limit_label} decoded-size limit"
         ));
     }
     if open_failures > 0 {
@@ -1517,7 +1559,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         state: sessions::codex::CodexParseState,
         fallback_timestamp_indices: Vec<usize>,
     ) -> Option<message_cache::CachedSourceEntry> {
-        let fingerprint = message_cache::SourceFingerprint::from_path(path)?;
+        let fingerprint = message_cache::SourceFingerprint::from_codex_path(path)?;
         let codex_incremental = if sessions::utils::is_zst_path(path) {
             message_cache::CodexIncrementalCache {
                 state,
@@ -2434,7 +2476,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
             // only to discard that digest before parsing it.
             return parse_full_log_source(path, pricing, is_headless);
         }
-        let Some(fingerprint_status) = message_cache::SourceFingerprint::check_path(
+        let Some(fingerprint_status) = message_cache::SourceFingerprint::check_codex_path(
             path,
             cached.as_ref().map(|entry| &entry.fingerprint),
         ) else {
@@ -2863,11 +2905,21 @@ fn parse_all_messages_streaming<S: MessageSink>(
         }
     }
 
-    // Release Codex before Copilot. This has to sit ahead of the Copilot
-    // lane rather than after it: the desktop/vscode blocks below scan
-    // `all_messages` for `client == "copilot"` to dedup against OTEL rows, so
-    // copilot's own messages must still be buffered when they run.
-    flush_lane(&mut all_messages, &flush_context, sink);
+    // Source-filter Codex before a physical-target overlay changes its
+    // model/provider. Re-filtering afterwards could drop a Synthetic-eligible
+    // virtual combo or include an originally ineligible row.
+    all_messages.retain(|message| matches_flush_filter(message, &flush_context));
+
+    // Correlate successful Responses-only OpenCodex combo attempts with
+    // physical models. This changes attribution, never token-counted rows.
+    if sessions::opencodex::attribute_codex_messages(home_dir, use_env_roots, &mut all_messages) > 0
+    {
+        apply_pricing_to_messages(&mut all_messages, pricing);
+    }
+
+    // Codex must flush before Copilot for its cross-source dedup, but the
+    // prefiltered lane must not re-evaluate the rewritten model/provider.
+    flush_retained_lane(&mut all_messages, &flush_context, sink);
 
     // Price once after merging snapshots, including on warm cache hits.
     parse_cached_lane(
@@ -7846,6 +7898,7 @@ mod tests {
     // is edited by nearly every PR that touches this file, and sharing it made
     // this branch conflict on every single upstream merge.
     use super::{aggregate_model_usage_entries_with_rollup, WorktreeRollup};
+    use super::{flush_retained_lane, matches_flush_filter, FlushContext};
     use serial_test::serial;
     use std::collections::{BTreeSet, HashMap, HashSet};
     use std::io::Write;
@@ -9361,6 +9414,15 @@ mod tests {
             1,
             "the TUI warning must stay on one line"
         );
+        assert_eq!(
+            super::format_codex_archive_limit_label(1024 * 1024 * 1024),
+            "1024 MiB"
+        );
+        assert_eq!(
+            super::format_codex_archive_limit_label(2 * 1024 * 1024 * 1024),
+            "2048 MiB"
+        );
+        assert_eq!(super::format_codex_archive_limit_label(64), "64-byte");
     }
 
     #[test]
@@ -11414,6 +11476,42 @@ mod tests {
             "anthropic",
             &requested
         ));
+    }
+
+    #[test]
+    fn test_codex_prefilter_survives_physical_attribution_for_synthetic_request() {
+        let context = FlushContext {
+            pricing: None,
+            include_all: false,
+            requested: HashSet::from(["synthetic"]),
+            include_synthetic: true,
+            timezone: None,
+        };
+        let mut message = UnifiedMessage::new(
+            "codex",
+            "combo/aggregate-fixture",
+            "synthetic",
+            "session",
+            1,
+            TokenBreakdown::default(),
+            0.0,
+        );
+
+        assert!(matches_flush_filter(&message, &context));
+
+        // A physical target can have different gateway identity, but the
+        // client filter must retain the selected source Codex row.
+        message.model_id = "served-model-fixture".to_string();
+        message.provider_id = "openai".to_string();
+        assert!(!matches_flush_filter(&message, &context));
+
+        let mut buffer = vec![message];
+        let mut sink = Vec::new();
+        flush_retained_lane(&mut buffer, &context, &mut sink);
+
+        assert_eq!(sink.len(), 1);
+        assert_eq!(sink[0].model_id, "served-model-fixture");
+        assert_eq!(sink[0].provider_id, "openai");
     }
 
     #[test]
@@ -16969,6 +17067,148 @@ mod tests {
                     .sum::<i64>(),
                 4,
             );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn opencodex_overlay_preserves_cold_warm_codex_cache_and_json_aggregation() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let home = source_home.path();
+        write_codex_twin_token_count_fixture(home);
+        let rollout = home.join(".codex/sessions/twin-deltas.jsonl");
+        let transcript = std::fs::read_to_string(&rollout).unwrap();
+        std::fs::write(
+            &rollout,
+            transcript
+                .replace("gpt-5.2", "combo/aggregate-fixture")
+                .replace("2026-04-30T11:00:03Z", "2026-04-30T11:00:10Z"),
+        )
+        .unwrap();
+
+        let pricing = pricing::PricingService::new(
+            HashMap::from([
+                (
+                    "combo/aggregate-fixture".to_string(),
+                    pricing::ModelPricing {
+                        input_cost_per_token: Some(0.01),
+                        output_cost_per_token: Some(0.01),
+                        cache_read_input_token_cost: Some(0.01),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "served-model-fixture".to_string(),
+                    pricing::ModelPricing {
+                        input_cost_per_token: Some(0.001),
+                        output_cost_per_token: Some(0.001),
+                        cache_read_input_token_cost: Some(0.001),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            HashMap::new(),
+        );
+        let home_str = home.to_str().unwrap();
+        let clients = ["codex".to_string()];
+        let original = parse_all_messages_with_pricing(home_str, &clients, Some(&pricing));
+        assert_eq!(original.len(), 2);
+        assert!(original
+            .iter()
+            .all(|msg| msg.model_id == "combo/aggregate-fixture"));
+        let selected = original.iter().min_by_key(|msg| msg.timestamp).unwrap();
+        assert!(selected.cost > 0.0);
+        assert!(
+            message_cache::SourceMessageCache::load()
+                .get(
+                    message_cache::CacheIdentity::for_client(ClientId::Codex),
+                    &rollout
+                )
+                .is_some(),
+            "the original Codex rollout should be cached before attribution"
+        );
+        let original_tokens: i64 = original.iter().map(|msg| msg.tokens.total()).sum();
+        let raw_input = selected.tokens.input + selected.tokens.cache_read;
+        let raw_output = selected.tokens.output + selected.tokens.reasoning;
+        let ledger = serde_json::json!({
+            "provider": "combo",
+            "model": "combo/aggregate-fixture",
+            "requestedModel": "combo/aggregate-fixture",
+            "servedModel": "served-model-fixture",
+            "inboundProtocol": "responses",
+            "timestamp": selected.timestamp,
+            "durationMs": selected.duration_ms.unwrap_or(0),
+            "status": 200,
+            "attempts": [{
+                "ordinal": 1,
+                "provider": "openai",
+                "model": "wire-model-fixture",
+                "adapter": "fixture-responses",
+                "status": 200,
+                "durationMs": selected.duration_ms.unwrap_or(0),
+                "sendCount": 1,
+                "recoveryKinds": [],
+                "usageStatus": "reported",
+                "usage": {
+                    "inputTokens": raw_input,
+                    "outputTokens": raw_output,
+                    "totalTokens": raw_input + raw_output,
+                    "cachedInputTokens": selected.tokens.cache_read,
+                    "reasoningOutputTokens": selected.tokens.reasoning
+                }
+            }]
+        });
+        let ledger_dir = home.join(".opencodex");
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        std::fs::write(ledger_dir.join("usage.jsonl"), format!("{ledger}\n")).unwrap();
+
+        for _ in 0..2 {
+            let actual = parse_all_messages_with_pricing(home_str, &clients, Some(&pricing));
+            assert_eq!(actual.len(), 2);
+            assert_eq!(
+                actual.iter().map(|msg| msg.tokens.total()).sum::<i64>(),
+                original_tokens
+            );
+            let physical: Vec<_> = actual
+                .iter()
+                .filter(|msg| msg.model_id == "served-model-fixture")
+                .collect();
+            assert_eq!(physical.len(), 1);
+            assert_eq!(physical[0].provider_id, "openai");
+            assert!(physical[0].cost > 0.0);
+            assert!(physical[0].cost < selected.cost);
+            assert_eq!(physical[0].cost_source, sessions::CostSource::Estimated);
+            assert_eq!(
+                actual
+                    .iter()
+                    .filter(|msg| msg.model_id == "combo/aggregate-fixture")
+                    .count(),
+                1
+            );
+
+            let groups = aggregate_model_usage_entries(actual, &GroupBy::ClientProviderModel);
+            assert_eq!(groups.len(), 2);
+            let json = serde_json::to_value(&groups).unwrap();
+            let entries = json.as_array().unwrap();
+            assert!(entries
+                .iter()
+                .any(|row| row["model"] == "served-model-fixture"));
+            assert!(entries
+                .iter()
+                .any(|row| row["model"] == "combo/aggregate-fixture"));
+            let grouped_tokens: i64 = groups
+                .iter()
+                .map(|group| {
+                    group.input
+                        + group.output
+                        + group.cache_read
+                        + group.cache_write
+                        + group.reasoning
+                })
+                .sum();
+            assert_eq!(grouped_tokens, original_tokens);
         }
     }
 

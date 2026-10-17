@@ -341,6 +341,20 @@ impl SourceFingerprint {
         Self::from_path_with_related(path, std::iter::empty())
     }
 
+    /// Fingerprint a Codex source together with the exact decoded archive limit
+    /// that governs compressed rollouts. The virtual related-file marker reuses
+    /// the existing cache wire layout, so retained-history cache formats do not
+    /// need a lossy global migration for this Codex-only parser input.
+    pub(crate) fn from_codex_path(path: &Path) -> Option<Self> {
+        let mut fingerprint = Self::from_path(path)?;
+        if crate::sessions::utils::is_zst_path(path) {
+            fingerprint
+                .related_files
+                .push(codex_archive_limit_fingerprint(path));
+        }
+        Some(fingerprint)
+    }
+
     #[cfg(test)]
     pub(crate) fn from_sqlite_path(path: &Path) -> Option<Self> {
         let related_paths = ["-wal"]
@@ -470,6 +484,26 @@ impl SourceFingerprint {
 
     pub(crate) fn check_path(path: &Path, cached: Option<&Self>) -> Option<FingerprintStatus> {
         Self::check_path_with_related(path, std::iter::empty(), cached)
+    }
+
+    pub(crate) fn check_codex_path(
+        path: &Path,
+        cached: Option<&Self>,
+    ) -> Option<FingerprintStatus> {
+        if !crate::sessions::utils::is_zst_path(path) {
+            return Self::check_path(path, cached);
+        }
+
+        if let Some(cached) = cached {
+            let expected = codex_archive_limit_fingerprint(path);
+            if cached.related_files.as_slice() == [expected]
+                && primary_fingerprint_matches(path, cached)?
+            {
+                return Some(FingerprintStatus::Unchanged);
+            }
+        }
+
+        Self::from_codex_path(path).map(FingerprintStatus::Changed)
     }
 
     /// Check a non-Codex source without rebuilding its write-only whole-file
@@ -829,6 +863,23 @@ impl SourceFingerprint {
             content_hash,
             related_files,
         })
+    }
+}
+
+const CODEX_ARCHIVE_LIMIT_FINGERPRINT_SUFFIX: &str = "tokscale-config:codex-max-decoded-bytes";
+
+fn codex_archive_limit_fingerprint(path: &Path) -> RelatedFileFingerprint {
+    // This is a virtual parser input, not a file probe. `size` is an existing
+    // exact u64 wire field, and the fixed suffix distinguishes it from genuine
+    // sidecars. Keeping the source path avoids persisting any additional path.
+    RelatedFileFingerprint {
+        suffix: CODEX_ARCHIVE_LIMIT_FINGERPRINT_SUFFIX.to_string(),
+        path: CachedPath::from_path(path),
+        exists: false,
+        size: crate::sessions::codex::max_codex_archive_bytes(),
+        modified_ns: 0,
+        sample_hashes: Vec::new(),
+        content_hash: [0; 32],
     }
 }
 
@@ -1234,14 +1285,21 @@ const SHARED_PARSER_FAMILIES: &[SharedParserFamily] = &[
             // +1: Pi subagent sessions now derive agent attribution from
             // session_info names; version-1 caches carry those messages
             // without agent metadata.
-            (ClientId::Pi, 2),
+            // +1 more: Pi now counts the billed operations that are not
+            // assistant replies (`compaction`, `branch_summary`, `usage`,
+            // `toolResult`), which version-6 caches omit entirely.
+            (ClientId::Pi, 3),
             // +1: Kimchi's Pi-compatible messages now carry stable
             // namespaced deduplication keys.
-            (ClientId::Kimchi, 1),
+            // +1 more: billed operations, as for Pi. The shared base did not
+            // move because Prime Agent rides on the same parser with
+            // `count_operations` off and its own caches are unaffected.
+            (ClientId::Kimchi, 2),
             // +1: Standard Pi/OMP/Senpi parser now emits cross-session
             // namespaced dedup keys (same behavior as Kimchi/Prime).
-            (ClientId::Omp, 1),
-            (ClientId::Senpi, 1),
+            // +1 more: billed operations, as for Pi.
+            (ClientId::Omp, 2),
+            (ClientId::Senpi, 2),
             // +3 for Prime Agent's independent history. v1->v2 strips a
             // leading BOM and recovers records containing undecodable
             // bytes; its accounting scan also continues past those records
@@ -1316,7 +1374,16 @@ const SHARED_PARSER_FAMILIES: &[SharedParserFamily] = &[
             // while retaining the original call's surface attribution.
             (ClientId::MiMoCode, 5),
             (ClientId::MiMoDesktop, 5),
-            (ClientId::Kilo, 0),
+            // +1 for Kilo's independent history. v1->v2: assistant rows the
+            // Kilo CLI migrated from the VS Code extension (`providerID` and
+            // `modelID` both `"legacy"`, zero usage, `ses_migrated_*` session)
+            // are no longer emitted. Kilo's SQLite store is read directly
+            // rather than through a per-source cache entry, so what this bump
+            // retires is the source-agnostic aggregate cache that
+            // `parser_generation()` keys: without it a warm aggregate would
+            // keep replaying totals that counted those rows as a "legacy"
+            // model.
+            (ClientId::Kilo, 1),
         ],
     },
     SharedParserFamily {
@@ -1443,7 +1510,10 @@ fn parser_version(client: ClientId) -> u32 {
         // v17->v18: settle pending token_usage_record rows when turn_aborted or
         // task_complete ends their turn. Completed v17 rollouts keep the same
         // fingerprint, so their undercounted entries must be reparsed.
-        ClientId::Codex => 18,
+        // v18->v19: OpenCodex Responses combo attribution changes Codex's
+        // reported model/provider identity without changing token totals.
+        // The decoded archive limit remains an exact cache fingerprint marker.
+        ClientId::Codex => 19,
         // v4->v5: jcode's assistant-message timestamp is now back-calculated
         // to the turn start (timestamp - tool_duration_ms) instead of using
         // the recorded (end-anchored) timestamp directly. Follow-up to #890.
@@ -4146,6 +4216,7 @@ mod tests {
             SOURCE_CACHE_ABORT_POINT_ENV,
             SOURCE_CACHE_ABORT_PATHS_ENV,
             SOURCE_CACHE_ABORT_MARKER_ENV,
+            "TOKSCALE_CODEX_MAX_DECODED_BYTES",
         ]);
         env.set("HOME", temp_home);
         env.set("XDG_CONFIG_HOME", temp_home.join(".config"));
@@ -4167,6 +4238,7 @@ mod tests {
         env.remove(SOURCE_CACHE_ABORT_POINT_ENV);
         env.remove(SOURCE_CACHE_ABORT_PATHS_ENV);
         env.remove(SOURCE_CACHE_ABORT_MARKER_ENV);
+        env.remove("TOKSCALE_CODEX_MAX_DECODED_BYTES");
         env
     }
 
@@ -4904,11 +4976,13 @@ mod tests {
         // results, v13->v14 decodes compressed archives (.jsonl.zst),
         // v14->v15 stabilizes fallback-timestamp dedup across rollout copies,
         // v15->v16 counts usage records no token_count confirms, v16->v17
-        // skips oversized records while preserving later usage, and v17->v18
-        // settles pending usage when terminal events end a turn.
+        // skips oversized records while preserving later usage, v17->v18
+        // settles pending usage when terminal events end a turn, and
+        // v18->v19 re-attributes OpenCodex combo traffic to the observed
+        // physical model so cached rows cannot keep the virtual selector.
         // Each bump is what stops an existing cache from replaying the old
         // rows, so it has to be asserted rather than assumed.
-        assert_eq!(parser_version(ClientId::Codex), 18);
+        assert_eq!(parser_version(ClientId::Codex), 19);
         assert_eq!(parser_version(ClientId::Claude), 2);
     }
 
@@ -5270,10 +5344,10 @@ mod tests {
         );
         let fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
         for (client, previous_version) in [
-            (ClientId::Pi, 4),
-            (ClientId::Kimchi, 3),
-            (ClientId::Omp, 3),
-            (ClientId::Senpi, 3),
+            (ClientId::Pi, 5),
+            (ClientId::Kimchi, 4),
+            (ClientId::Omp, 4),
+            (ClientId::Senpi, 4),
             (ClientId::PrimeAgent, 6),
         ] {
             let current = CacheIdentity::for_client(client);
@@ -5311,10 +5385,10 @@ mod tests {
         );
         let fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
         for (client, completion_anchored_version) in [
-            (ClientId::Pi, 5),
-            (ClientId::Kimchi, 4),
-            (ClientId::Omp, 4),
-            (ClientId::Senpi, 4),
+            (ClientId::Pi, 6),
+            (ClientId::Kimchi, 5),
+            (ClientId::Omp, 5),
+            (ClientId::Senpi, 5),
             (ClientId::PrimeAgent, 7),
         ] {
             let current = CacheIdentity::for_client(client);
@@ -5811,7 +5885,7 @@ mod tests {
         cache.save_if_dirty();
         let warm = SourceMessageCache::load();
         let cached = warm.get(identity, &source).unwrap();
-        assert_eq!(cached.parser_version, 18);
+        assert_eq!(cached.parser_version, 19);
         assert_eq!(cached.messages, parsed);
     }
 
@@ -5919,11 +5993,131 @@ mod tests {
         let fresh_cache = SourceMessageCache::load();
         let fresh_entry = fresh_cache
             .get(identity, &source)
-            .expect("the production scan must persist a v18 replacement");
-        assert_eq!(fresh_entry.parser_version, 18);
+            .expect("the production scan must persist a v19 replacement");
+        assert_eq!(fresh_entry.parser_version, 19);
         assert!(
             codex_cache_entry_matches_fingerprint(&fresh_entry, &fingerprint),
-            "the v18 replacement must carry valid incremental metadata"
+            "the v19 replacement must carry valid incremental metadata"
+        );
+
+        // Scan again through the same production path and verify that the
+        // valid warm entry preserves the reparsed result.
+        let cached = crate::parse_local_unified_messages_with_pricing(options, None)
+            .await
+            .unwrap();
+        assert_eq!(cached, reparsed);
+        let warm_cache = SourceMessageCache::load();
+        let warm_entry = warm_cache.get(identity, &source).unwrap();
+        assert!(codex_cache_entry_matches_fingerprint(
+            &warm_entry,
+            &fingerprint
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn codex_v18_shards_are_reparsed_for_opencodex_attribution() {
+        // The OpenCodex combo overlay rewrites the reported model/provider of
+        // already-cached Codex rows. A v18 entry with a valid fingerprint
+        // would otherwise keep the virtual selector forever, so only the
+        // version bump can retire it. The stale entry deliberately holds
+        // wrong tokens, so a warm replay of the old row cannot pass.
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let sessions = temp_home.path().join(".codex/sessions/2026/10/01");
+        fs::create_dir_all(&sessions).unwrap();
+        let source =
+            sessions.join("rollout-2026-10-01T00-00-00-01a0f000-0000-7000-8000-000000000001.jsonl");
+        fs::write(
+            &source,
+            br#"{"timestamp":"2026-10-01T00:00:00Z","type":"session_meta","payload":{"id":"01a0f000-0000-7000-8000-000000000001","originator":"codex_vscode","source":"vscode","model_provider":"openai"}}
+{"timestamp":"2026-10-01T00:01:00Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.5"}}
+{"timestamp":"2026-10-01T00:01:05Z","type":"token_usage_record","payload":{"turn_id":"turn-1","response_id":"resp-1","usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10,"total_tokens":110}}}
+{"timestamp":"2026-10-01T00:01:05.005Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10,"total_tokens":110}}}}
+{"timestamp":"2026-10-01T00:02:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}
+{"timestamp":"2026-10-01T00:02:00.005Z","type":"token_usage_record","payload":{"turn_id":"turn-2","response_id":"resp-2","usage":{"input_tokens":500,"cached_input_tokens":200,"output_tokens":40,"total_tokens":540}}}
+{"timestamp":"2026-10-01T00:02:00.010Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-2"}}
+"#,
+        )
+        .unwrap();
+
+        let identity = CacheIdentity::for_client(ClientId::Codex);
+        let stale_identity = CacheIdentity {
+            parser_version: 18,
+            ..identity
+        };
+        let fingerprint = SourceFingerprint::from_path(&source).unwrap();
+        // What v18 cached: an intentionally wrong single-token row. Its incremental
+        // metadata is valid for the unchanged file, so generation v18 would
+        // reuse this undercounted row instead of reparsing.
+        let stale_entry = CachedSourceEntry::new(
+            stale_identity,
+            &source,
+            fingerprint.clone(),
+            vec![UnifiedMessage::new(
+                identity.namespace,
+                "gpt-5.5",
+                "openai",
+                "01a0f000-0000-7000-8000-000000000001",
+                1790812865000,
+                TokenBreakdown {
+                    input: 1,
+                    ..Default::default()
+                },
+                0.0,
+            )],
+            Vec::new(),
+            Some(CodexIncrementalCache {
+                state: CodexParseState::default(),
+                consumed_offset: fingerprint.size,
+                ends_with_newline: true,
+                prefix_hash: fingerprint.content_hash,
+            }),
+        );
+        assert!(codex_cache_entry_matches_fingerprint(
+            &stale_entry,
+            &fingerprint
+        ));
+        let shard = cache_shard_path(identity, &source);
+        ensure_cache_dir(shard.parent().unwrap()).unwrap();
+        write_shard_with_limit(
+            &shard,
+            stale_identity,
+            &[stale_entry],
+            MAX_CACHE_SHARD_BYTES,
+        )
+        .unwrap();
+
+        assert_eq!(SourceFingerprint::from_path(&source).unwrap(), fingerprint);
+        let options = crate::LocalParseOptions {
+            home_dir: Some(temp_home.path().to_string_lossy().into_owned()),
+            use_env_roots: false,
+            clients: Some(vec!["codex".to_string()]),
+            ..crate::LocalParseOptions::default()
+        };
+
+        // Drive the complete production scanner/cache path. It must reject
+        // the unchanged v17 entry and fully parse the terminal turn.
+        let reparsed = crate::parse_local_unified_messages_with_pricing(options.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(reparsed.len(), 2);
+        assert_eq!(
+            reparsed
+                .iter()
+                .map(|message| message.tokens.total())
+                .sum::<i64>(),
+            110 + 540
+        );
+
+        let fresh_cache = SourceMessageCache::load();
+        let fresh_entry = fresh_cache
+            .get(identity, &source)
+            .expect("the production scan must persist a v19 replacement");
+        assert_eq!(fresh_entry.parser_version, 19);
+        assert!(
+            codex_cache_entry_matches_fingerprint(&fresh_entry, &fingerprint),
+            "the v19 replacement must carry valid incremental metadata"
         );
 
         // Scan again through the same production path and verify that the
@@ -7043,10 +7237,10 @@ mod tests {
             (
                 "pi-format",
                 &[
-                    (ClientId::Pi, 2),
-                    (ClientId::Kimchi, 1),
-                    (ClientId::Omp, 1),
-                    (ClientId::Senpi, 1),
+                    (ClientId::Pi, 3),
+                    (ClientId::Kimchi, 2),
+                    (ClientId::Omp, 2),
+                    (ClientId::Senpi, 2),
                     (ClientId::PrimeAgent, 4),
                 ],
             ),
@@ -7064,7 +7258,7 @@ mod tests {
                     (ClientId::OpenCode, 2),
                     (ClientId::MiMoCode, 5),
                     (ClientId::MiMoDesktop, 5),
-                    (ClientId::Kilo, 0),
+                    (ClientId::Kilo, 1),
                 ],
             ),
             (
@@ -7828,6 +8022,134 @@ mod tests {
             &crate::scanner::ScannerSettings::default(),
         );
         assert_eq!(second, first);
+    }
+
+    /// The shared roo/kilo base bump is what retires cached task-log rows.
+    /// Their bytes never change when the parser is fixed, so a warm entry at
+    /// the old version would keep serving the double-counted input, the
+    /// mislabeled provider and the stale cost authority forever. Removing the
+    /// `ROO_KILO_TASK_LOG_PARSER_BASE_VERSION` bump alone leaves every cold
+    /// parser test green, so this is the regression that pins it.
+    #[test]
+    #[serial_test::serial]
+    fn test_kilocode_stale_parser_cache_is_rejected_and_rebuilt_with_same_fingerprint() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let source_home = TempDir::new().unwrap();
+        let task_dir = PathBuf::from(
+            ClientId::KiloCode
+                .data()
+                .resolve_path_with_env_strategy(&source_home.path().to_string_lossy(), false),
+        )
+        .join("task-warm");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let ui_path = task_dir.join("ui_messages.json");
+        std::fs::write(
+            &ui_path,
+            r#"[{"type":"say","say":"api_req_started","ts":1748038758034,"text":"{\"cost\":0.25,\"tokensIn\":1000,\"tokensOut\":10,\"cacheReads\":600,\"cacheWrites\":100,\"apiProtocol\":\"openai\"}"}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            task_dir.join("api_conversation_history.json"),
+            "<environment_details>\n<model>anthropic/claude-sonnet-4</model>\n</environment_details>",
+        )
+        .unwrap();
+
+        let fingerprint =
+            match SourceFingerprint::check_roo_path_samples_only(&ui_path, None).unwrap() {
+                FingerprintStatus::Changed(fingerprint) => fingerprint,
+                FingerprintStatus::Unchanged => {
+                    panic!("an uncached source must build a fingerprint")
+                }
+            };
+        let identity = CacheIdentity::for_client(ClientId::KiloCode);
+        let stale_identity = CacheIdentity {
+            namespace: identity.namespace,
+            parser_version: identity.parser_version.saturating_sub(1),
+        };
+        // What the pre-fix parser cached for these exact bytes: input gross of
+        // cache, provider taken from the wire protocol.
+        let stale_message = UnifiedMessage::new(
+            "kilocode",
+            "anthropic/claude-sonnet-4",
+            "openai",
+            "task-warm",
+            1748038758034,
+            TokenBreakdown {
+                input: 1000,
+                output: 10,
+                cache_read: 600,
+                cache_write: 100,
+                cache_write_1h: 0,
+                reasoning: 0,
+            },
+            0.25,
+        );
+        let stale_entry = CachedSourceEntry::new(
+            stale_identity,
+            &ui_path,
+            fingerprint.clone(),
+            vec![stale_message],
+            Vec::new(),
+            None,
+        );
+        let stale_shard = cache_shard_path(identity, &ui_path);
+        ensure_cache_dir(stale_shard.parent().unwrap()).unwrap();
+        write_shard_with_limit(
+            &stale_shard,
+            stale_identity,
+            &[stale_entry],
+            MAX_CACHE_SHARD_BYTES,
+        )
+        .unwrap();
+
+        let loaded = SourceMessageCache::load();
+        assert!(
+            loaded.get(identity, &ui_path).is_none(),
+            "a shard written at the previous parser version must not be served"
+        );
+
+        let parsed = crate::parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &["kilocode".to_string()],
+            None,
+            false,
+            &crate::scanner::ScannerSettings::default(),
+        );
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].tokens.input, 300, "cache overlap must be removed");
+        assert_eq!(parsed[0].tokens.cache_read, 600);
+        assert_eq!(parsed[0].tokens.cache_write, 100);
+        assert_eq!(parsed[0].provider_id, "anthropic");
+        assert!(
+            matches!(
+                SourceFingerprint::check_roo_path_samples_only(&ui_path, Some(&fingerprint)),
+                Some(FingerprintStatus::Unchanged)
+            ),
+            "parser-version invalidation must not require a source rewrite"
+        );
+
+        let rebuilt = SourceMessageCache::load();
+        let cached = rebuilt
+            .get(identity, &ui_path)
+            .expect("the reparsed entry should be persisted at the current version");
+        assert_eq!(cached.parser_version, identity.parser_version);
+        assert_eq!(cached.fingerprint, fingerprint);
+        assert_eq!(cached.messages.len(), 1);
+        assert_eq!(cached.messages[0].tokens.input, 300);
+        assert_eq!(cached.messages[0].provider_id, "anthropic");
+    }
+
+    /// Exact versions after this change, so a later edit cannot silently
+    /// collide a member with the version it is replacing. The shared base
+    /// moved 2 -> 3, so Roo/Kilo Code land on 3 and Cline keeps its own
+    /// offset; Kilo CLI moves by its own offset instead.
+    #[test]
+    fn test_roo_kilo_family_parser_versions_after_cache_overlap_fix() {
+        assert_eq!(parser_version(ClientId::RooCode), 3);
+        assert_eq!(parser_version(ClientId::KiloCode), 3);
+        assert_eq!(parser_version(ClientId::Cline), 6);
+        assert_eq!(parser_version(ClientId::Kilo), 2);
     }
 
     #[test]

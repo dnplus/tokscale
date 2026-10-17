@@ -97,6 +97,10 @@ struct CachedTUIData {
     /// matches a real generation, so those are rebuilt once.
     #[serde(default)]
     parser_generation: u64,
+    /// Exact non-parser input that can change Codex archive results while the
+    /// parser implementation stays the same. Zero makes pre-field caches miss.
+    #[serde(default)]
+    codex_max_decoded_bytes: u64,
     timestamp: u64,
     enabled_clients: Vec<String>,
     #[serde(default)]
@@ -813,7 +817,10 @@ fn classify_cached_payload(
     // `decide_initial_data` paints `Stale` exactly like `Fresh` -- so treating a
     // parser change as merely stale would show the pre-fix totals anyway, which
     // is the whole thing this guards against.
-    if cached.parser_generation != tokscale_core::parser_generation() {
+    if cached.parser_generation != tokscale_core::parser_generation()
+        || cached.codex_max_decoded_bytes
+            != tokscale_core::sessions::codex::max_codex_archive_bytes()
+    {
         return CacheResult::Miss;
     }
     let schema_outdated = cached.schema_version < CACHE_SCHEMA_VERSION;
@@ -981,6 +988,7 @@ pub fn save_cached_data(
     let cached = CachedTUIData {
         schema_version: CACHE_SCHEMA_VERSION,
         parser_generation: tokscale_core::parser_generation(),
+        codex_max_decoded_bytes: tokscale_core::sessions::codex::max_codex_archive_bytes(),
         timestamp,
         enabled_clients: clients_vec,
         include_synthetic,
@@ -1034,6 +1042,8 @@ mod tests {
         let mut value: serde_json::Value =
             serde_json::from_str(json).expect("fixture is valid JSON");
         value["parserGeneration"] = serde_json::json!(tokscale_core::parser_generation());
+        value["codexMaxDecodedBytes"] =
+            serde_json::json!(tokscale_core::sessions::codex::max_codex_archive_bytes());
         value.to_string()
     }
     use super::*;
@@ -1307,6 +1317,28 @@ mod tests {
     }
 
     #[test]
+    fn a_cache_from_a_different_codex_archive_limit_misses() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&with_current_generation(LEGACY_FALLBACK_PAYLOAD)).unwrap();
+        let current = tokscale_core::sessions::codex::max_codex_archive_bytes();
+        value["codexMaxDecodedBytes"] = serde_json::json!(current.wrapping_sub(1));
+
+        let payload: CachedTUIData = serde_json::from_value(value).unwrap();
+        let clients = make_filters(&[ClientFilter::Claude], false);
+        let result = classify_cached_payload(
+            payload,
+            &clients,
+            &GroupBy::Model,
+            &CacheReportScope::default(),
+        );
+        assert!(
+            matches!(result, CacheResult::Miss),
+            "a cache built under a different Codex archive limit must miss; got {}",
+            other_variant_name(&result)
+        );
+    }
+
+    #[test]
     fn a_cache_from_the_previous_claude_desktop_generation_misses() {
         // Fixed value emitted by the first Desktop implementation (b161de41),
         // before fdf7e4d0 changed its suffix from 1 to 2 to preserve full
@@ -1315,6 +1347,8 @@ mod tests {
         const PREVIOUS_DESKTOP_GENERATION: u64 = 3_619_169_160_637_170_511;
         let mut value: serde_json::Value = serde_json::from_str(LEGACY_FALLBACK_PAYLOAD).unwrap();
         value["parserGeneration"] = serde_json::json!(PREVIOUS_DESKTOP_GENERATION);
+        value["codexMaxDecodedBytes"] =
+            serde_json::json!(tokscale_core::sessions::codex::max_codex_archive_bytes());
         let clients = make_filters(&[ClientFilter::Claude], false);
         let scope = CacheReportScope::default();
 

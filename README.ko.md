@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Tokscale](./.github/assets/hero-v2.png)](https://tokscale.ai)
+[![Tokscale](./.github/assets/hero-v3.png)](https://tokscale.ai)
 
 </div>
 
@@ -13,11 +13,11 @@
 > **v2 출시 — 네이티브 Rust TUI, 크로스 플랫폼 지원 등.** <br />
 > 저는 매주 새로운 오픈소스 프로젝트를 공개합니다. 놓치지 마세요.
 >
-> | [<img alt="GitHub Follow" src="https://img.shields.io/github/followers/junhoyeo?style=flat-square&logo=github&labelColor=black&color=24292f" width="156px" />](https://github.com/junhoyeo) | GitHub에서 [@junhoyeo](https://github.com/junhoyeo)를 팔로우하고 더 많은 프로젝트를 만나보세요. AI, 인프라 등 다양한 분야를 다룹니다. |
+> [<img alt="X follow" src="https://img.shields.io/badge/follow-%40Tokscale-000000?style=flat-square&logo=x&logoColor=white&labelColor=black" width="156px" />](https://x.com/Tokscale) | X에서 [@Tokscale](https://x.com/Tokscale)을 팔로우하고 릴리스 소식과 업데이트를 받아보세요. |
 > | :-----| :----- |
 > [<img alt="Discord link" src="https://img.shields.io/discord/1480206352755458110?color=5865F2&label=discord&labelColor=black&logo=discord&logoColor=white&style=flat-square" width="156px" />](https://discord.gg/h6DUGWdBbm) | [Discord](https://discord.gg/h6DUGWdBbm)에서 함께해요 — 세계 최고의 바이버들과 어울리세요. |
-> [<img alt="X follow" src="https://img.shields.io/badge/follow-%40Tokscale-000000?style=flat-square&logo=x&logoColor=white&labelColor=black" width="156px" />](https://x.com/Tokscale) | X에서 [@Tokscale](https://x.com/Tokscale)을 팔로우하고 릴리스 소식과 업데이트를 받아보세요. |
 > [<img alt="Sponsor Tokscale" src="https://img.shields.io/badge/sponsor-Tokscale-EA4AAA?style=flat-square&logo=githubsponsors&logoColor=white&labelColor=black" width="156px" />](https://github.com/sponsors/junhoyeo) | [GitHub Sponsors](https://github.com/sponsors/junhoyeo)를 통해 Tokscale의 지속적인 개발을 후원해 주세요. |
+> | [<img alt="GitHub Follow" src="https://img.shields.io/github/followers/junhoyeo?style=flat-square&logo=github&labelColor=black&color=24292f" width="156px" />](https://github.com/junhoyeo) | GitHub에서 [@junhoyeo](https://github.com/junhoyeo)를 팔로우하고 더 많은 프로젝트를 만나보세요. AI, 인프라 등 다양한 분야를 다룹니다. |
 
 <div align="center">
 
@@ -417,7 +417,7 @@ tokscale --client opencode,claude
 # 반복: 같은 효과 (쉘 alias와 함께 쓰기 좋음)
 tokscale -c opencode -c claude
 
-# Cursor IDE는 Tokscale의 API 캐시를 사용; 먼저 login + sync --json 실행
+# Cursor IDE는 Tokscale의 API 캐시를 사용; 저장된 로그인이 없으면 데스크톱 세션을 가져옴
 tokscale --client cursor
 
 # Synthetic (synthetic.new) 은 다른 에이전트 세션에서 검출됨
@@ -616,15 +616,15 @@ tokscale autosubmit disable
 
 ### Cursor IDE 명령어
 
-Cursor IDE 지원은 Cursor의 웹 사용량 API를 사용하며, Tokscale이 `~/.config/tokscale/cursor-cache/usage*.json`에 캐싱합니다. Tokscale은 `~/.cursor` 아래의 로컬 Cursor Agent CLI 상태를 파싱하지 않으며, 데스크톱 SQLite DB를 사용량 원장으로 취급하지도 않습니다.
+Cursor IDE는 Cursor의 usage-events API를 사용합니다. 활성 계정은 `~/.config/tokscale/cursor-cache/usage.json`에, 다른 계정은 `usage.account-<sha256-of-exact-account-id>.json`에 소유자 메타데이터와 함께 저장합니다. 소유자를 확인할 수 없는 이전 JSON/CSV는 동기화나 계정 변경 전에 `cursor-cache/archive/`에 보관합니다. Tokscale은 로컬 `~/.cursor` 기록을 파싱하거나 데스크톱 SQLite DB를 사용량 원장으로 취급하지 않습니다.
 
-Cursor 데스크톱 앱이 설치되어 있고 로그인되어 있으면, `tokscale cursor login`은 Cursor의 `state.vscdb`에서 `cursorAuth/accessToken`을 우선 읽어 세션 쿠키를 자동으로 만듭니다. `tokscale cursor sync`도 가능할 때 이 토큰을 갱신합니다. 사용량 행은 계속 Cursor 사용량 API에서만 가져옵니다.
+Cursor 데스크톱 앱이 설치되어 있고 로그인되어 있으면, 저장된 Cursor 로그인이 없을 때 리포트, submit, wrapped가 `state.vscdb`의 `cursorAuth/accessToken`을 가져올 수 있습니다. wrapped는 요청한 클라이언트에 Cursor가 포함된 경우에만 가져옵니다. 사용량 캐시가 아직 최신이면 리포트는 동기화를 건너뜁니다. 명시적인 `tokscale cursor sync`를 포함해 동기화가 실행될 때마다 사용 가능한 데스크톱 토큰을 갱신하며, 활성 계정이 해당 데스크톱 로그인으로 전환될 수 있습니다. 데스크톱 세션이 없어도 저장된 로그인은 계속 사용할 수 있습니다. 사용량 행은 Cursor usage-events API에서만 가져오며, 로컬 `~/.cursor` 기록은 파싱하지 않습니다.
 
 설정 (데스크톱 자동 로그인):
 
 1. Cursor 데스크톱 앱에 로그인하세요.
-2. `tokscale cursor login --name work`를 실행하세요 (로컬 데스크톱 세션이 있으면 자동 감지).
-3. `tokscale cursor sync --json`을 실행해 `~/.config/tokscale/cursor-cache/usage.json`을 채우세요.
+2. 선택: `tokscale cursor login --name work`를 실행해 그 데스크톱 세션을 이름으로 저장하세요. 저장된 Cursor 로그인이 아직 없으면 리포트, submit, sync가 자동으로 가져옵니다.
+3. 선택: `tokscale cursor sync --json`을 실행해 `~/.config/tokscale/cursor-cache/usage.json`을 지금 새로 고치세요. 캐시가 오래되면 리포트가 직접 동기화합니다.
 4. `tokscale --client cursor` 또는 아무 리포트 명령을 실행하세요.
 
 대체 방법 (브라우저 쿠키 수동 붙여넣기) — 데스크톱 로그인을 쓸 수 없을 때:
@@ -671,7 +671,7 @@ tokscale cursor logout --all
 tokscale cursor logout --all --purge-cache
 ```
 
-기본적으로 Tokscale은 `cursor-cache/usage*.json`을 읽어 저장된 모든 Cursor 계정의 사용량을 합산합니다. 활성 계정은 `usage.json`에 동기화되고, 추가 계정은 `usage.<account>.json`에 동기화됩니다. 이전 버전의 Tokscale이 만든 레거시 CSV 캐시(`usage.csv`, `usage.<account>.csv`)도 아직 JSON 캐시가 없는 계정이라면 계속 읽습니다. 해당 계정이 다음에 동기화에 성공하면 JSON 캐시를 쓰고 CSV는 `cursor-cache/archive/`로 옮깁니다.
+기본적으로 저장된 모든 Cursor 계정의 `cursor-cache/usage*.json`을 합산합니다. 파일명은 정확한 계정 ID의 SHA-256을 사용하며 소유자를 검증하므로 이전 파일명이 충돌해도 기록이나 동기화 진행 상태를 공유하지 않습니다. 소유자를 확인할 수 없는 이전 JSON/CSV는 원래 바이트와 파일명 그대로 `cursor-cache/archive/` 안의 고유 디렉터리에 보관하고 각 계정을 처음부터 가져옵니다. 백업은 리포트에서 제외되며 가져오기가 실패해도 복구할 수 있습니다. 보관 실패 시 덮어쓰기 전에 중단합니다. 이전 캐시는 이 전환 전까지 오프라인 리포트에서 읽을 수 있습니다. 새로운 사용량과 최신 유효 이벤트의 1시간 전까지의 정정 내역을 가져오고 더 오래된 기록은 유지합니다. 시간 초과 시 가져온 페이지를 저장하지 않고 기존 캐시를 유지하여 다음 동기화에서 누락 구간을 건너뛰지 않게 합니다.
 
 로그아웃 시 Tokscale은 캐시된 사용량을 `cursor-cache/archive/`로 옮겨 더 이상 합산되지 않도록 합니다. 캐시된 사용량을 대신 삭제하려면 `--purge-cache`를 사용하세요.
 
