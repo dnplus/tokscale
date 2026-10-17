@@ -1912,26 +1912,36 @@ fn auto_sync_cursor_before_tui(
 fn emit_cursor_sync_warning(
     sync: Option<&cursor::SyncCursorResult>,
     had_cursor_cache: bool,
-    explicit_cursor_filter: bool,
+    _explicit_cursor_filter: bool,
 ) {
-    let Some(sync) = sync else {
-        return;
-    };
-    let Some(error) = sync.error.as_ref() else {
-        return;
-    };
-    if sync.synced || had_cursor_cache || explicit_cursor_filter {
+    if let Some(warning) = cursor_sync_warning(sync, had_cursor_cache) {
         use colored::Colorize;
-        let prefix = if sync.synced {
-            "Cursor sync warning"
-        } else if had_cursor_cache {
-            "Cursor sync failed; using cached data"
-        } else {
-            "Cursor sync failed"
-        };
-        eprintln!("{}", format!("  {}: {}", prefix, error).yellow());
+        eprintln!("{}", format!("  {}", warning).yellow());
     }
 }
+
+/// Without a cache, a failed implicit sync leaves Cursor out of the report
+/// entirely, so it is always surfaced with a pointer to the explicit sync,
+/// whose time budget scales with the account's history.
+fn cursor_sync_warning(
+    sync: Option<&cursor::SyncCursorResult>,
+    had_cursor_cache: bool,
+) -> Option<String> {
+    let sync = sync?;
+    let error = sync.error.as_ref()?;
+    Some(if sync.synced {
+        format!("Cursor sync warning: {}", error)
+    } else if had_cursor_cache {
+        format!("Cursor sync failed; using cached data: {}", error)
+    } else {
+        format!(
+            "Cursor sync failed: {}; {}",
+            error, CURSOR_EXPLICIT_SYNC_HINT
+        )
+    })
+}
+
+const CURSOR_EXPLICIT_SYNC_HINT: &str = "run `tokscale cursor sync` to retry with a longer timeout";
 
 fn default_submit_clients() -> Vec<String> {
     let mut clients: Vec<String> = tokscale_core::ClientId::iter()
@@ -6776,13 +6786,8 @@ fn run_submit_command(
                 "{}",
                 format!("  Cursor: {} usage events synced", sync_result.rows).bright_black()
             );
-        } else if let Some(err) = sync_result.error {
-            if has_cursor_cache {
-                println!(
-                    "{}",
-                    format!("  Cursor sync failed; using cached data: {}", err).yellow()
-                );
-            }
+        } else if let Some(warning) = cursor_sync_warning(Some(&sync_result), has_cursor_cache) {
+            println!("{}", format!("  {}", warning).yellow());
         }
     }
 
@@ -10599,6 +10604,30 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("runtime unavailable")));
+    }
+
+    #[test]
+    fn cursor_sync_failure_without_cache_points_to_explicit_sync() {
+        let failed = cursor::SyncCursorResult {
+            synced: false,
+            rows: 0,
+            error: Some("request timed out".to_string()),
+        };
+        let warning = cursor_sync_warning(Some(&failed), false).unwrap();
+        assert!(warning.contains("request timed out"), "{warning}");
+        assert!(warning.contains("tokscale cursor sync"), "{warning}");
+
+        let warning = cursor_sync_warning(Some(&failed), true).unwrap();
+        assert!(warning.contains("using cached data"), "{warning}");
+        assert!(!warning.contains("tokscale cursor sync"), "{warning}");
+
+        let ok = cursor::SyncCursorResult {
+            synced: true,
+            rows: 1,
+            error: None,
+        };
+        assert!(cursor_sync_warning(Some(&ok), false).is_none());
+        assert!(cursor_sync_warning(None, false).is_none());
     }
 
     #[test]
