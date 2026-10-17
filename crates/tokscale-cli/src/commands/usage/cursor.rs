@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use serde_json::Value;
 
-use super::{UsageAccount, UsageMetric, UsageOutput};
+use super::{UsageAccount, UsageFetchDiagnostic, UsageFetchReport, UsageMetric, UsageOutput};
 
 const USAGE_URL: &str = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage";
 const PLAN_URL: &str = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo";
@@ -63,6 +63,7 @@ struct LocalCursorAuth {
     access_token: String,
     refresh_token: Option<String>,
     email: Option<String>,
+    credential_source: &'static str,
 }
 
 pub fn has_credentials() -> bool {
@@ -115,7 +116,7 @@ pub fn fetch() -> Result<UsageOutput> {
         Ok(UsageOutput {
             provider: PROVIDER.to_string(),
             account: None,
-            credential_source: Some("desktop".into()),
+            credential_source: Some(auth.credential_source.into()),
             plan: plan_name,
             email: auth.email,
             metrics,
@@ -128,7 +129,7 @@ pub fn fetch() -> Result<UsageOutput> {
 
 /// One Grok Bot card per signed-in Cursor account in Grok Bot.app when that
 /// store decrypts; otherwise a single card from Cursor desktop auth.
-pub fn fetch_grok_bot_all() -> Result<Vec<UsageOutput>> {
+pub fn fetch_grok_bot_report() -> Result<UsageFetchReport> {
     match load_grok_bot_app_accounts() {
         Ok(accounts) if !accounts.is_empty() => {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -136,47 +137,56 @@ pub fn fetch_grok_bot_all() -> Result<Vec<UsageOutput>> {
                 .build()?;
             rt.block_on(async {
                 let client = plan_http_client()?;
-                let mut outputs = Vec::new();
-                let mut errors = Vec::new();
+                let mut results = Vec::new();
                 for account in accounts {
-                    match fetch_sand_for_token(&client, &account.access_token).await {
-                        Ok(parsed) => outputs.push(UsageOutput {
-                            provider: GROK_BOT_PROVIDER.to_string(),
-                            account: Some(UsageAccount {
-                                id: account.id,
-                                label: account.name.clone().or_else(|| account.email.clone()),
-                                is_active: account.is_active,
-                            }),
-                            credential_source: Some("grok-bot-app".into()),
-                            plan: parsed.plan,
-                            email: account.email,
-                            metrics: vec![parsed.metric],
-                            reset_credits: None,
-                            credit_status: None,
-                            spend_control: None,
-                        }),
-                        Err(error) => errors.push(error.to_string()),
-                    }
+                    let result = fetch_sand_for_token(&client, &account.access_token).await;
+                    results.push((account, result));
                 }
-                if outputs.is_empty() {
-                    anyhow::bail!(
-                        "Grok Bot app accounts found but Sand usage failed: {}",
-                        errors.join("; ")
-                    );
-                }
-                // Active account first so the card order matches the app switcher.
-                outputs.sort_by_key(|output| {
-                    !output
-                        .account
-                        .as_ref()
-                        .map(|account| account.is_active)
-                        .unwrap_or(false)
-                });
-                Ok(outputs)
+                Ok(grok_bot_account_report(results))
             })
         }
-        Ok(_) | Err(_) => fetch_grok_bot_desktop().map(|output| vec![output]),
+        Ok(_) | Err(_) => {
+            fetch_grok_bot_desktop().map(|output| UsageFetchReport::from_outputs(vec![output]))
+        }
     }
+}
+
+fn grok_bot_account_report(
+    results: impl IntoIterator<Item = (GrokBotAppAccount, Result<ParsedSandUsage>)>,
+) -> UsageFetchReport {
+    let mut report = UsageFetchReport::default();
+    for (account, result) in results {
+        let identity = UsageAccount {
+            id: account.id,
+            label: account.name.or_else(|| account.email.clone()),
+            is_active: account.is_active,
+        };
+        match result {
+            Ok(parsed) => report.outputs.push(UsageOutput {
+                provider: GROK_BOT_PROVIDER.to_string(),
+                account: Some(identity),
+                credential_source: Some("grok-bot-app".into()),
+                plan: parsed.plan,
+                email: account.email,
+                metrics: vec![parsed.metric],
+                reset_credits: None,
+                credit_status: None,
+                spend_control: None,
+            }),
+            Err(error) => report.diagnostics.push(UsageFetchDiagnostic::new(
+                GROK_BOT_PROVIDER,
+                Some(identity),
+                error.to_string(),
+            )),
+        }
+    }
+    report.outputs.sort_by_key(|output| {
+        !output
+            .account
+            .as_ref()
+            .is_some_and(|account| account.is_active)
+    });
+    report
 }
 
 fn fetch_grok_bot_desktop() -> Result<UsageOutput> {
@@ -192,7 +202,7 @@ fn fetch_grok_bot_desktop() -> Result<UsageOutput> {
         Ok(UsageOutput {
             provider: GROK_BOT_PROVIDER.to_string(),
             account: None,
-            credential_source: Some("desktop".into()),
+            credential_source: Some(auth.credential_source.into()),
             plan: parsed.plan,
             email: auth.email,
             metrics: vec![parsed.metric],
@@ -523,38 +533,69 @@ fn resolve_local_auth() -> Result<LocalCursorAuth> {
         (None, None, None)
     };
 
+    select_local_auth(
+        db_access.as_deref(),
+        db_refresh.as_deref(),
+        db_email.as_deref(),
+        || {
+            #[cfg(target_os = "macos")]
+            {
+                let access = super::helpers::read_keychain(ACCESS_SERVICE).ok();
+                let refresh = access
+                    .as_deref()
+                    .filter(|token| access_token_usable(token.trim()))
+                    .and_then(|_| super::helpers::read_keychain(REFRESH_SERVICE).ok());
+                (access, refresh)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                (None, None)
+            }
+        },
+        crate::cursor::load_active_credentials,
+    )
+}
+
+fn select_local_auth(
+    db_access: Option<&str>,
+    db_refresh: Option<&str>,
+    db_email: Option<&str>,
+    keychain: impl FnOnce() -> (Option<String>, Option<String>),
+    stored: impl FnOnce() -> Option<crate::cursor::CursorCredentials>,
+) -> Result<LocalCursorAuth> {
     if let Some(access) = db_access
+        .map(str::trim)
+        .filter(|token| access_token_usable(token))
+    {
+        return Ok(LocalCursorAuth {
+            access_token: access.to_string(),
+            refresh_token: nonempty(db_refresh),
+            email: account_label(db_email),
+            credential_source: "desktop",
+        });
+    }
+
+    let (access, refresh) = keychain();
+    if let Some(access) = access
         .as_deref()
         .map(str::trim)
         .filter(|token| access_token_usable(token))
     {
         return Ok(LocalCursorAuth {
             access_token: access.to_string(),
-            refresh_token: nonempty(db_refresh.as_deref()),
-            email: account_label(db_email.as_deref()),
+            refresh_token: nonempty(refresh.as_deref()),
+            email: None,
+            credential_source: "keychain",
         });
     }
 
-    #[cfg(target_os = "macos")]
-    if let Ok(access) = super::helpers::read_keychain(ACCESS_SERVICE) {
-        let access = access.trim();
-        if access_token_usable(access) {
-            let refresh = super::helpers::read_keychain(REFRESH_SERVICE).ok();
-            return Ok(LocalCursorAuth {
-                access_token: access.to_string(),
-                refresh_token: nonempty(refresh.as_deref())
-                    .or_else(|| nonempty(db_refresh.as_deref())),
-                email: account_label(db_email.as_deref()),
-            });
-        }
-    }
-
-    if let Some(creds) = crate::cursor::load_active_credentials() {
+    if let Some(creds) = stored() {
         if let Some(access) = jwt_from_session_token(&creds.session_token) {
             return Ok(LocalCursorAuth {
                 access_token: access,
                 refresh_token: None,
-                email: account_label(db_email.as_deref()),
+                email: account_label(creds.email.as_deref()),
+                credential_source: "stored",
             });
         }
     }
@@ -812,6 +853,131 @@ fn millis_or_secs_iso(raw: i64) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn bot_account(id: &str, active: bool) -> GrokBotAppAccount {
+        GrokBotAppAccount {
+            id: id.into(),
+            access_token: "fixture-token".into(),
+            email: Some(format!("{id}@test.invalid")),
+            name: Some(id.into()),
+            is_active: active,
+        }
+    }
+
+    fn sand_fixture() -> Result<ParsedSandUsage> {
+        parse_sand_usage(&json!({"hasNonZeroIncludedLimit": true, "usagePercent": 25}))
+    }
+
+    #[test]
+    fn grok_bot_partial_failure_preserves_account_diagnostic_and_active_order() {
+        let report = grok_bot_account_report([
+            (bot_account("other", false), sand_fixture()),
+            (
+                bot_account("expired", false),
+                Err(anyhow::anyhow!("HTTP 401")),
+            ),
+            (bot_account("active", true), sand_fixture()),
+        ]);
+        assert_eq!(report.outputs.len(), 2);
+        assert_eq!(report.outputs[0].account.as_ref().unwrap().id, "active");
+        assert_eq!(report.diagnostics.len(), 1);
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(diagnostic.provider, "Grok Bot");
+        assert_eq!(diagnostic.account.as_ref().unwrap().id, "expired");
+        assert_eq!(diagnostic.message, "HTTP 401");
+    }
+
+    #[test]
+    fn grok_bot_all_failed_keeps_each_account() {
+        let report = grok_bot_account_report(
+            ["one", "two"].map(|id| (bot_account(id, false), Err(anyhow::anyhow!("HTTP 401")))),
+        );
+        assert!(report.outputs.is_empty());
+        assert_eq!(report.diagnostics.len(), 2);
+        assert_eq!(report.diagnostics[1].account.as_ref().unwrap().id, "two");
+    }
+
+    #[test]
+    fn grok_bot_success_has_no_diagnostics() {
+        let report = grok_bot_account_report([(bot_account("one", true), sand_fixture())]);
+        assert_eq!(report.outputs.len(), 1);
+        assert!(report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn stored_auth_keeps_its_identity_when_desktop_has_another_account() {
+        let stored = serde_json::from_value(json!({
+            "sessionToken": "user-b::header.payload.signature",
+            "createdAt": "2026-10-17T00:00:00Z",
+            "email": "b@example.com"
+        }))
+        .unwrap();
+        let auth = select_local_auth(
+            Some("invalid-desktop-token"),
+            Some("desktop-a-refresh"),
+            Some("a@example.com"),
+            || (None, None),
+            || Some(stored),
+        )
+        .unwrap();
+        assert_eq!(auth.access_token, "header.payload.signature");
+        assert_eq!(auth.email.as_deref(), Some("b@example.com"));
+        assert_eq!(auth.credential_source, "stored");
+        assert!(auth.refresh_token.is_none());
+    }
+
+    #[test]
+    fn stored_auth_without_email_does_not_borrow_desktop_identity() {
+        let stored = serde_json::from_value(json!({
+            "sessionToken": "user-b::header.payload.signature",
+            "createdAt": "2026-10-17T00:00:00Z"
+        }))
+        .unwrap();
+        let auth = select_local_auth(
+            None,
+            None,
+            Some("a@example.com"),
+            || (None, None),
+            || Some(stored),
+        )
+        .unwrap();
+        assert!(auth.email.is_none());
+        assert_eq!(auth.credential_source, "stored");
+    }
+
+    #[test]
+    fn desktop_auth_keeps_matching_identity_and_skips_fallbacks() {
+        let auth = select_local_auth(
+            Some(" desktop.payload.signature "),
+            Some(" desktop-refresh "),
+            Some(" a@example.com "),
+            || panic!("desktop auth should not read Keychain"),
+            || panic!("desktop auth should not read stored credentials"),
+        )
+        .unwrap();
+        assert_eq!(auth.access_token, "desktop.payload.signature");
+        assert_eq!(auth.email.as_deref(), Some("a@example.com"));
+        assert_eq!(auth.refresh_token.as_deref(), Some("desktop-refresh"));
+        assert_eq!(auth.credential_source, "desktop");
+    }
+
+    #[test]
+    fn keychain_auth_does_not_borrow_desktop_email_or_refresh_token() {
+        for refresh in [None, Some(" keychain-refresh ".to_string())] {
+            let auth = select_local_auth(
+                None,
+                Some("desktop-a-refresh"),
+                Some("a@example.com"),
+                || (Some("keychain.payload.signature".into()), refresh.clone()),
+                || panic!("Keychain auth should not read stored credentials"),
+            )
+            .unwrap();
+            assert_eq!(auth.access_token, "keychain.payload.signature");
+            assert!(auth.email.is_none());
+            assert_eq!(auth.refresh_token, nonempty(refresh.as_deref()));
+            assert_eq!(auth.credential_source, "keychain");
+        }
+    }
 
     #[test]
     fn test_plan_http_client_applies_thirty_second_timeout() {

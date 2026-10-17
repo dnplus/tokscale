@@ -26,6 +26,20 @@ The existing `usage --bots` command is a separate quota-oriented report and stil
 
 ## Token coverage
 
-`usage --bots` distinguishes missing token counts from partial and complete token data. Empty objects and cost-only objects count as missing. A row is complete only when input, output, cache-read, and cache-write counts are all reported as nonnegative values. An omitted cache-write count remains unknown even though providers commonly omit that field. Explicit zero counts are known values.
+`usage --bots` distinguishes missing token counts from partial and complete token data. Empty objects and cost-only objects count as missing. A row is complete when its input and output counts are valid nonnegative integers. Cursor omits cache-read and cache-write counts on many events, so an absent cache count does not make a row partial, but a present invalid one does. Explicit zero counts are known zero usage.
 
-`missing_token_usage_calls` counts events with no known token counts. `partial_token_usage_calls` counts events with at least one known count but fewer than all four. Token columns sum all reported nonnegative counts, including those from partial rows. Existing normalized messages and submission totals remain unchanged.
+`missing_token_usage_calls` counts events with no valid token counts. `partial_token_usage_calls` counts events with some valid counts that miss input or output, or carry an invalid cache count. Token columns sum valid counts only: a rejected value such as `"inf"`, a negative number, or a fraction contributes nothing, so omitted or rejected fields are unknown rather than zero. Submitted and cached usage keep their existing normalized token values.
+
+## Reported monetary amounts
+
+`usage --bots` retains the provider's metered token cost and wallet charge separately when those fields are present. Each `cost_breakdown` amount has a `known_usd` sum and `reported_calls` count. A count of zero means unknown, not a free event. A smaller count than `calls` means the sum covers only part of the report.
+
+The existing `cost_usd`, weekly cost, and share fields keep their original accounting rule: prefer metered cost and fall back to wallet charge. `cursorTokenFee` is not reported: every observed event carried `0`, so its unit (cents or dollars) is unverified, and a guessed unit could misstate the fee by 100x. Included usage can have nonzero metered cost with a zero wallet charge. This local report does not change submitted cost totals.
+
+## Quota forecasts
+
+`usage --bots` reports the observed weekly quota and local event costs separately. Its JSON `burn_rate` is `null`, with `burn_rate_unavailable_reason` explaining why a forecast is unavailable. Bot event costs do not establish the consumption rate of a quota pool shared with Cursor and Grok, and the local cache does not prove full coverage of that pool.
+
+A future forecast needs provider-confirmed account and pool identity, reset boundaries, and successive quota observations from that same pool. Do not infer pool identity from a plan name or email alone. Samples spanning a reset or a change in entitlement cannot form one consumption rate. The current private API response has not been verified for every unified and legacy subscription variant.
+
+See the [official Cursor subscription documentation](https://cursor.com/docs/models-and-pricing) for shared weekly pools, separate prepaid usage, and legacy monthly plans.

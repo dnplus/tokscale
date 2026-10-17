@@ -54,6 +54,8 @@ pub enum AutosubmitSubcommand {
             help = "Disable automatic quota upload after a successful submit"
         )]
         no_quota: bool,
+        #[command(flatten)]
+        extra_targets: crate::extra_targets::ExtraTargetFlags,
     },
 }
 
@@ -195,6 +197,9 @@ struct StatusOutput {
     no_quota: bool,
     last_quota_at_ms: Option<i64>,
     last_quota_error: Option<String>,
+    extra_targets: Vec<crate::extra_targets::TargetStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extra_targets_error: Option<String>,
 }
 
 pub fn enable(args: AutosubmitEnableArgs) -> Result<()> {
@@ -391,6 +396,19 @@ fn print_scheduled_target_notice(no_quota: bool) {
             );
         }
     }
+    match crate::extra_targets::statuses() {
+        Ok(targets) => {
+            for target in targets.iter().filter(|target| target.enabled) {
+                println!(
+                    "  Scheduled runs also submit to extra target {} ({}).",
+                    target.name, target.api_url
+                );
+            }
+        }
+        Err(error) => eprintln!(
+            "Warning: extra targets are unreadable, so scheduled runs submit to the server above only: {error:#}"
+        ),
+    }
 }
 
 pub fn status(json: bool) -> Result<()> {
@@ -451,6 +469,16 @@ pub fn status(json: bool) -> Result<()> {
     }
     if let Some(error) = autosubmit.last_quota_error {
         println!("  Last quota error: {error}");
+    }
+    match crate::extra_targets::statuses() {
+        Ok(extra_targets) if !extra_targets.is_empty() => {
+            println!("  Extra targets:");
+            for target in &extra_targets {
+                crate::extra_targets::print_status_line(target);
+            }
+        }
+        Ok(_) => {}
+        Err(error) => println!("  Extra targets: unreadable ({error:#})"),
     }
     Ok(())
 }
@@ -537,10 +565,12 @@ pub fn record_quota_result(now_ms: i64, result: &Result<()>) -> Result<()> {
     settings.save_with_origin(origin)
 }
 
-/// POST the `tokscale usage --json` document to `<api-url>/api/quota` with the
-/// same token, and the same origin check, that submit uses.
+/// POST the `tokscale usage --json` document to `<api-url>/api/quota` with
+/// `auth`'s token. This performs no origin check: callers pass the URL already
+/// paired with the token (`auth::api_url_for` for the logged-in server, the
+/// saved URL for an extra target).
 pub fn upload_quota(auth: &crate::auth::ApiTokenAuth, api_url: &str) -> Result<()> {
-    let body = crate::commands::usage::usage_json()?;
+    let body = quota_body()?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let response = tokscale_core::http::client_builder()
@@ -569,6 +599,18 @@ pub fn upload_quota(auth: &crate::auth::ApiTokenAuth, api_url: &str) -> Result<(
             .unwrap_or("Quota upload failed");
         bail!("{error} ({status})")
     })
+}
+
+/// The usage document, fetched once per process: a submit to extra targets
+/// uploads the same reading to every server instead of refetching each
+/// account. A failed fetch is not cached, so the next upload retries it.
+fn quota_body() -> Result<String> {
+    static BODY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(body) = BODY.get() {
+        return Ok(body.clone());
+    }
+    let body = crate::commands::usage::usage_json()?;
+    Ok(BODY.get_or_init(|| body).clone())
 }
 
 /// Official hosts do not implement the quota upload extension.
@@ -771,6 +813,10 @@ fn running_executable_is(path: &str) -> bool {
 }
 
 fn status_output(settings: &AutosubmitSettings) -> StatusOutput {
+    let (extra_targets, extra_targets_error) = match crate::extra_targets::statuses() {
+        Ok(targets) => (targets, None),
+        Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+    };
     StatusOutput {
         enabled: settings.enabled,
         interval_minutes: settings.interval_minutes,
@@ -792,6 +838,8 @@ fn status_output(settings: &AutosubmitSettings) -> StatusOutput {
         no_quota: settings.no_quota,
         last_quota_at_ms: settings.last_quota_at_ms,
         last_quota_error: settings.last_quota_error.clone(),
+        extra_targets,
+        extra_targets_error,
     }
 }
 

@@ -2,7 +2,9 @@
 //!
 //! Parses usage files cached locally at ~/.config/tokscale/cursor-cache/.
 //! The active account's cache is `usage.json` (or legacy `usage.csv`);
-//! additional accounts use `usage.<account>.json` (or legacy `usage.<account>.csv`).
+//! additional accounts use `usage.account-<sha256>.json` with exact-owner metadata.
+//! Unmarked legacy JSON/CSV caches remain readable until the CLI preserves them
+//! in archive/ and independently refetches the saved accounts.
 //!
 //! JSON (preferred) comes from the dashboard `get-filtered-usage-events`
 //! endpoint. Each event carries a real `conversationId`, so sessions are keyed
@@ -182,6 +184,38 @@ fn de_automation_id<'de, D: serde::Deserializer<'de>>(
         .map(str::to_owned))
 }
 
+impl CursorUsageEvent {
+    fn normalized_model(&self) -> Option<&str> {
+        self.model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+    }
+
+    fn normalized_conversation_id(&self) -> Option<&str> {
+        self.conversation_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+    }
+
+    fn usable_timestamp(&self) -> Option<i64> {
+        self.normalized_model()?;
+        let timestamp = self.timestamp.as_ref().map(parse_ms_timestamp).unwrap_or(0);
+        (timestamp != 0).then_some(timestamp)
+    }
+}
+
+/// Return a row's timestamp only when the Cursor report parser accepts the row.
+///
+/// This shares the full row deserializer and model/timestamp checks with reports.
+/// Callers using the timestamp for sync progress must also check plausibility.
+pub fn parse_cursor_usage_event_timestamp(value: &serde_json::Value) -> Option<i64> {
+    CursorUsageEvent::deserialize(value)
+        .ok()?
+        .usable_timestamp()
+}
+
 /// The per-event token breakdown. `cacheWriteTokens` is absent on many events.
 /// Counts are coerced leniently so a single float (e.g. `10.0`) or numeric
 /// string doesn't fail the whole row.
@@ -215,6 +249,47 @@ struct CursorTokenUsage {
     total_cents: Option<f64>,
 }
 
+impl CursorTokenUsage {
+    fn token_breakdown(&self) -> TokenBreakdown {
+        TokenBreakdown {
+            input: self.input_tokens.normalized.unwrap_or(0).max(0),
+            output: self.output_tokens.normalized.unwrap_or(0).max(0),
+            cache_read: self.cache_read_tokens.normalized.unwrap_or(0).max(0),
+            cache_write: self.cache_write_tokens.normalized.unwrap_or(0).max(0),
+            cache_write_1h: 0,
+            reasoning: 0,
+        }
+    }
+}
+
+/// Immutable recognized fields used to match accepted Cursor usage rows.
+/// Billing values are deliberately excluded so an incoming correction replaces
+/// the cached row. An absent conversation id denotes the synthetic-session
+/// fallback within the account's cache; explicit ids remain distinct from it.
+#[derive(Debug)]
+pub struct CursorUsageEventIdentity {
+    pub conversation_id: Option<String>,
+    pub model: String,
+    pub timestamp: i64,
+    pub tokens: TokenBreakdown,
+}
+
+/// Project a row using the report parser's full deserializer and normalization.
+/// Rejected rows return `None` so callers can retain their original identity.
+/// Unknown fields are not part of this projection and must be preserved by the
+/// caller when matching raw events.
+pub fn parse_cursor_usage_event_identity(
+    value: &serde_json::Value,
+) -> Option<CursorUsageEventIdentity> {
+    let event = CursorUsageEvent::deserialize(value).ok()?;
+    Some(CursorUsageEventIdentity {
+        timestamp: event.usable_timestamp()?,
+        model: event.normalized_model()?.to_string(),
+        conversation_id: event.normalized_conversation_id().map(str::to_string),
+        tokens: event.token_usage.unwrap_or_default().token_breakdown(),
+    })
+}
+
 /// Coerce a JSON number/string into `i64`, tolerating floats and numeric
 /// strings so one unexpected shape doesn't drop an otherwise valid row.
 fn json_value_to_i64(value: &serde_json::Value) -> Option<i64> {
@@ -245,6 +320,16 @@ struct CursorTokenCount {
     // Preserve legacy normalized counts independently of raw coverage validity.
     normalized: Option<i64>,
     known: bool,
+    /// The field carried a non-null value, valid or not.
+    present: bool,
+}
+
+impl CursorTokenCount {
+    /// The count only when its raw value is a valid nonnegative integer, so a
+    /// rejected value such as `"inf"` or `1.5` never enters a known-data sum.
+    fn known_value(self) -> Option<i64> {
+        self.known.then_some(self.normalized).flatten()
+    }
 }
 
 fn is_known_token_count(value: &serde_json::Value) -> bool {
@@ -345,6 +430,7 @@ where
     Ok(CursorTokenCount {
         normalized: value.as_ref().and_then(json_value_to_i64),
         known: value.as_ref().is_some_and(is_known_token_count),
+        present: value.is_some(),
     })
 }
 
@@ -505,20 +591,39 @@ pub enum TokenUsageCoverage {
 }
 
 impl CursorTokenUsage {
+    /// Input and output must be valid. Cursor omits the cache counts on many
+    /// events, so an absent cache count is not a gap, but a present invalid
+    /// one is.
     fn coverage(&self) -> TokenUsageCoverage {
-        let known = [
+        let counts = [
             self.input_tokens,
             self.output_tokens,
             self.cache_read_tokens,
             self.cache_write_tokens,
-        ]
-        .map(|count| count.known);
-        if known.iter().all(|known| *known) {
+        ];
+        if !counts.iter().any(|count| count.known) {
+            return TokenUsageCoverage::Missing;
+        }
+        let required = self.input_tokens.known && self.output_tokens.known;
+        let optional = [self.cache_read_tokens, self.cache_write_tokens]
+            .iter()
+            .all(|count| !count.present || count.known);
+        if required && optional {
             TokenUsageCoverage::Complete
-        } else if known.iter().any(|known| *known) {
-            TokenUsageCoverage::Partial
         } else {
-            TokenUsageCoverage::Missing
+            TokenUsageCoverage::Partial
+        }
+    }
+
+    /// Valid counts only; absent or rejected counts contribute nothing.
+    fn known_token_breakdown(&self) -> TokenBreakdown {
+        TokenBreakdown {
+            input: self.input_tokens.known_value().unwrap_or(0).max(0),
+            output: self.output_tokens.known_value().unwrap_or(0).max(0),
+            cache_read: self.cache_read_tokens.known_value().unwrap_or(0).max(0),
+            cache_write: self.cache_write_tokens.known_value().unwrap_or(0).max(0),
+            cache_write_1h: 0,
+            reasoning: 0,
         }
     }
 }
@@ -529,6 +634,11 @@ impl CursorTokenUsage {
 pub struct CursorUsageRecord {
     pub message: UnifiedMessage,
     pub token_usage_coverage: TokenUsageCoverage,
+    /// Only the counts whose raw values are valid. `message.tokens` keeps the
+    /// legacy normalized values that reports and sync identity depend on.
+    pub known_tokens: TokenBreakdown,
+    pub metered_cost_usd: Option<f64>,
+    pub charged_cost_usd: Option<f64>,
     pub automation_id: Option<String>,
 }
 
@@ -564,35 +674,27 @@ pub fn parse_cursor_usage_records(content: &str, account_id: &str) -> Vec<Cursor
             Err(_) => continue,
         };
 
-        let model = event.model.unwrap_or_default();
-        let model = model.trim();
-        if model.is_empty() {
+        let Some(timestamp) = event.usable_timestamp() else {
             continue;
-        }
-
-        let timestamp = event
-            .timestamp
-            .as_ref()
-            .map(parse_ms_timestamp)
-            .unwrap_or(0);
-        if timestamp == 0 {
-            continue;
-        }
+        };
+        let model = event.normalized_model().expect("usable model");
 
         // Prefer the real Cursor session UUID; fall back to the legacy synthetic
         // per-day id only when the event carries no usable conversation id, so
         // its cost still lands in the account's totals.
-        let session_id = match event.conversation_id.as_deref().map(str::trim) {
-            Some(id) if !id.is_empty() => id.to_string(),
-            _ => format!(
+        let session_id = match event.normalized_conversation_id() {
+            Some(id) => id.to_string(),
+            None => format!(
                 "cursor-{}-{}",
                 account_id,
                 timestamp_to_date_with_timezone(timestamp, &chrono::Utc)
             ),
         };
 
-        let token_usage = event.token_usage.unwrap_or_default();
+        let default_usage = CursorTokenUsage::default();
+        let token_usage = event.token_usage.as_ref().unwrap_or(&default_usage);
         let token_usage_coverage = token_usage.coverage();
+        let known_tokens = token_usage.known_token_breakdown();
 
         // Cursor reports two different amounts. `tokenUsage.totalCents` is the
         // metered cost of the event's own tokens; `chargedCents` is what the
@@ -602,9 +704,10 @@ pub fn parse_cursor_usage_records(content: &str, account_id: &str) -> Vec<Cursor
         // rows keep Cursor's own number instead of falling through to local
         // pricing, which refuses the router labels `auto`/`agent_review` (#1062)
         // and would drop them into the unpriced bucket at $0.00.
-        let metered_cents = finite_non_negative_cents(token_usage.total_cents)
-            .or_else(|| finite_non_negative_cents(event.charged_cents));
-        let cost = metered_cents.map(|cents| cents / 100.0);
+        let metered_cost_usd =
+            finite_non_negative_cents(token_usage.total_cents).map(|c| c / 100.0);
+        let charged_cost_usd = finite_non_negative_cents(event.charged_cents).map(|c| c / 100.0);
+        let cost = metered_cost_usd.or(charged_cost_usd);
 
         let mut message = UnifiedMessage::new(
             "cursor",
@@ -612,18 +715,7 @@ pub fn parse_cursor_usage_records(content: &str, account_id: &str) -> Vec<Cursor
             infer_provider(model),
             session_id,
             timestamp,
-            TokenBreakdown {
-                input: token_usage.input_tokens.normalized.unwrap_or(0).max(0),
-                output: token_usage.output_tokens.normalized.unwrap_or(0).max(0),
-                cache_read: token_usage.cache_read_tokens.normalized.unwrap_or(0).max(0),
-                cache_write: token_usage
-                    .cache_write_tokens
-                    .normalized
-                    .unwrap_or(0)
-                    .max(0),
-                cache_write_1h: 0,
-                reasoning: 0,
-            },
+            token_usage.token_breakdown(),
             cost.unwrap_or(0.0).max(0.0),
         );
         if cost.is_some() {
@@ -632,6 +724,9 @@ pub fn parse_cursor_usage_records(content: &str, account_id: &str) -> Vec<Cursor
         messages.push(CursorUsageRecord {
             message,
             token_usage_coverage,
+            known_tokens,
+            metered_cost_usd,
+            charged_cost_usd,
             automation_id: event.automation_id,
         });
     }
@@ -1538,6 +1633,18 @@ mod grok_bot_tests {
             (json!({"inputTokens": 0}), TokenUsageCoverage::Partial),
             (
                 json!({"inputTokens": 10, "outputTokens": 2, "cacheReadTokens": 0}),
+                TokenUsageCoverage::Complete,
+            ),
+            (
+                json!({"inputTokens": 10, "outputTokens": 2}),
+                TokenUsageCoverage::Complete,
+            ),
+            (
+                json!({"inputTokens": 10, "outputTokens": 2, "cacheWriteTokens": "inf"}),
+                TokenUsageCoverage::Partial,
+            ),
+            (
+                json!({"inputTokens": 10, "cacheReadTokens": 0, "cacheWriteTokens": 0}),
                 TokenUsageCoverage::Partial,
             ),
             (
@@ -1631,6 +1738,25 @@ mod grok_bot_tests {
                 assert_eq!(records[0].message.tokens.input, normalized, "{content}");
             }
         }
+    }
+
+    #[test]
+    fn cursor_records_preserve_metered_and_charged_amounts() {
+        let content = json!({"usageEventsDisplay": [
+            {"timestamp": 1791417600000_i64, "model": "auto", "tokenUsage": {"totalCents": 25}, "chargedCents": 0},
+            {"timestamp": 1791417600000_i64, "model": "auto", "tokenUsage": {"totalCents": "20"}, "chargedCents": "21.5", "cursorTokenFee": "1.5"},
+            {"timestamp": 1791417600000_i64, "model": "auto", "chargedCents": 10, "cursorTokenFee": -1},
+        ]}).to_string();
+        let records = parse_cursor_usage_records(&content, "work");
+        assert_eq!(records[0].metered_cost_usd, Some(0.25));
+        assert_eq!(records[0].charged_cost_usd, Some(0.0));
+        assert_eq!(records[0].message.cost, 0.25);
+        assert_eq!(records[1].metered_cost_usd, Some(0.20));
+        assert_eq!(records[1].charged_cost_usd, Some(0.215));
+        assert_eq!(records[1].message.cost, 0.20);
+        assert_eq!(records[2].metered_cost_usd, None);
+        assert_eq!(records[2].charged_cost_usd, Some(0.1));
+        assert_eq!(records[2].message.cost, 0.1);
     }
 
     #[test]

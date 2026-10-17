@@ -12,12 +12,60 @@ use tokscale_core::{
 use super::{cursor, UsageMetric, UsageOutput};
 
 #[derive(Debug, Default, Serialize)]
+struct ReportedAmount {
+    known_usd: f64,
+    reported_calls: usize,
+}
+
+impl ReportedAmount {
+    fn add(&mut self, amount: Option<f64>) {
+        if let Some(amount) = amount {
+            self.known_usd += amount;
+            self.reported_calls += 1;
+        }
+    }
+
+    fn display(&self, calls: usize) -> String {
+        if self.reported_calls == 0 {
+            "unknown".to_string()
+        } else {
+            format!(
+                "${:.2} ({}/{calls} calls)",
+                self.known_usd, self.reported_calls
+            )
+        }
+    }
+}
+
+#[derive(Debug, Default, Serialize)]
+struct CostBreakdown {
+    metered: ReportedAmount,
+    charged: ReportedAmount,
+}
+
+impl CostBreakdown {
+    fn add(&mut self, record: &CursorUsageRecord) {
+        self.metered.add(record.metered_cost_usd);
+        self.charged.add(record.charged_cost_usd);
+    }
+
+    fn render(&self, calls: usize) {
+        println!(
+            "    Metered: {}; wallet charge: {}",
+            self.metered.display(calls),
+            self.charged.display(calls)
+        );
+    }
+}
+
+#[derive(Debug, Default, Serialize)]
 struct Row {
     id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
     calls: usize,
     cost_usd: f64,
+    cost_breakdown: CostBreakdown,
     share_percent: f64,
     distinct_conversations: usize,
     tokens: TokenBreakdown,
@@ -30,6 +78,7 @@ struct Breakdown {
     rows: Vec<Row>,
     calls: usize,
     cost_week_usd: f64,
+    cost_breakdown: CostBreakdown,
     cost_24h_usd: f64,
     tokens: TokenBreakdown,
     missing_token_usage_calls: usize,
@@ -48,6 +97,7 @@ fn summarize(events: &[CursorUsageRecord], now: DateTime<Utc>, start: DateTime<U
         rows: vec![],
         calls: 0,
         cost_week_usd: 0.0,
+        cost_breakdown: CostBreakdown::default(),
         cost_24h_usd: 0.0,
         tokens: TokenBreakdown::default(),
         missing_token_usage_calls: 0,
@@ -83,8 +133,12 @@ fn summarize(events: &[CursorUsageRecord], now: DateTime<Utc>, start: DateTime<U
         row.id = group.to_string();
         row.calls += 1;
         row.cost_usd += cost;
-        row.tokens += &event.tokens;
-        result.tokens += &event.tokens;
+        row.cost_breakdown.add(record);
+        result.cost_breakdown.add(record);
+        // Sum only valid counts; a rejected value such as "inf" must not
+        // saturate the known-data columns.
+        row.tokens += &record.known_tokens;
+        result.tokens += &record.known_tokens;
         match record.token_usage_coverage {
             TokenUsageCoverage::Missing => {
                 row.missing_token_usage_calls += 1;
@@ -116,42 +170,6 @@ fn summarize(events: &[CursorUsageRecord], now: DateTime<Utc>, start: DateTime<U
     result
 }
 
-#[derive(Debug, Serialize)]
-struct BurnRate {
-    percent_per_hour: f64,
-    exhausted_at: DateTime<Utc>,
-    before_reset: bool,
-    hours_before_reset: f64,
-    remaining_at_reset_percent: f64,
-}
-
-fn estimate(
-    data: &Breakdown,
-    now: DateTime<Utc>,
-    reset: Option<DateTime<Utc>>,
-    used: Option<f64>,
-) -> Option<BurnRate> {
-    let reset = reset.filter(|reset| *reset > now)?;
-    let used = used.filter(|v| v.is_finite() && *v > 0.0)?;
-    if data.cost_week_usd <= 0.0 || data.cost_24h_usd <= 0.0 {
-        return None;
-    }
-    let rate = used * (data.cost_24h_usd / data.cost_week_usd) / 24.0;
-    let hours = (100.0 - used).max(0.0) / rate;
-    if !rate.is_finite() || rate <= 0.0 || !hours.is_finite() {
-        return None;
-    }
-    let exhausted_at = now.checked_add_signed(Duration::try_seconds((hours * 3600.0) as i64)?)?;
-    let until_reset = (reset - now).num_seconds() as f64 / 3600.0;
-    Some(BurnRate {
-        percent_per_hour: rate,
-        exhausted_at,
-        before_reset: exhausted_at < reset,
-        hours_before_reset: (until_reset - hours).max(0.0),
-        remaining_at_reset_percent: (100.0 - used - rate * until_reset).max(0.0),
-    })
-}
-
 #[derive(Serialize)]
 struct AccountReport {
     cache_account_id: Option<String>,
@@ -160,7 +178,8 @@ struct AccountReport {
     week_start: DateTime<Utc>,
     reset_at: Option<DateTime<Utc>>,
     breakdown: Option<Breakdown>,
-    burn_rate: Option<BurnRate>,
+    burn_rate: Option<()>,
+    burn_rate_unavailable_reason: &'static str,
 }
 
 fn weekly(card: &UsageOutput) -> Option<&UsageMetric> {
@@ -184,9 +203,6 @@ fn report(
         .map(|r| r - Duration::days(7))
         .unwrap_or_else(|| since.unwrap_or(now - Duration::days(7)));
     let data = events.map(|e| summarize(e, now, start));
-    let burn = data
-        .as_ref()
-        .and_then(|d| estimate(d, now, valid_reset, metric.map(|m| m.used_percent)));
     let status = if events.is_none() {
         "This account has no local Cursor usage cache"
     } else if card.is_none() {
@@ -203,34 +219,63 @@ fn report(
         week_start: start,
         reset_at: reset,
         breakdown: data,
-        burn_rate: burn,
+        burn_rate: None,
+        burn_rate_unavailable_reason: "Quota pool scope and consumption history are unavailable; Bot event costs cannot predict shared quota exhaustion",
     }
 }
 
+/// Maps each usage cache id to the email tokscale saved for the account that
+/// owns it: `active` is `usage.json`, other accounts use their cache stem.
+fn cache_account_emails(
+    store: Option<&crate::cursor::CursorCredentialsStore>,
+) -> BTreeMap<String, String> {
+    let mut emails = BTreeMap::new();
+    let Some(store) = store else {
+        return emails;
+    };
+    for (id, account) in &store.accounts {
+        let Some(email) = account.email.as_deref().filter(|e| !e.trim().is_empty()) else {
+            continue;
+        };
+        emails.insert(crate::cursor::cursor_account_cache_stem(id), email.into());
+        if id == &store.active_account_id {
+            emails.insert("active".into(), email.into());
+        }
+    }
+    emails
+}
+
+/// Pairs each quota card with the cache whose saved account email matches.
+/// The desktop email only stands in for `active` when tokscale saved none.
 fn account_reports(
     cards: Vec<UsageOutput>,
     mut caches: BTreeMap<String, Vec<CursorUsageRecord>>,
-    email: Option<&str>,
+    saved_emails: &BTreeMap<String, String>,
+    desktop_email: Option<&str>,
     now: DateTime<Utc>,
     since: Option<DateTime<Utc>>,
 ) -> Vec<AccountReport> {
     let mut reports = vec![];
     for card in cards {
-        let matched = email
-            .zip(card.email.as_deref())
-            .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b));
-        let events = if matched {
-            caches.remove("active")
-        } else {
-            None
+        let same = |email: &str| {
+            card.email
+                .as_deref()
+                .is_some_and(|card| card.eq_ignore_ascii_case(email))
         };
-        reports.push(report(
-            events.as_ref().map(|_| "active".into()),
-            Some(card),
-            events.as_deref(),
-            now,
-            since,
-        ));
+        let active_email = saved_emails
+            .get("active")
+            .map(String::as_str)
+            .or(desktop_email);
+        let id = caches
+            .keys()
+            .filter(|id| match id.as_str() {
+                "active" => active_email.is_some_and(same),
+                id => saved_emails.get(id).is_some_and(|email| same(email)),
+            })
+            .min_by_key(|id| *id != "active")
+            .cloned();
+        let events = id.as_ref().and_then(|id| caches.remove(id));
+        reports.push(report(id, Some(card), events.as_deref(), now, since));
     }
     for (id, events) in caches {
         reports.push(report(Some(id), None, Some(&events), now, since));
@@ -270,16 +315,26 @@ pub fn run(json: bool, since: Option<DateTime<Utc>>) -> Result<()> {
         since.is_none_or(|s| s <= now),
         "--since must not be in the future"
     );
-    let cards = cursor::fetch_grok_bot_all();
+    let cards = cursor::fetch_grok_bot_report();
     let mut diagnostics = vec![];
     let cards = match cards {
-        Ok(cards) => cards,
+        Ok(report) => {
+            diagnostics.extend(report.diagnostics.iter().map(|diagnostic| {
+                format!(
+                    "Weekly quota unavailable for {}: {}",
+                    diagnostic.display_name(),
+                    diagnostic.message
+                )
+            }));
+            report.outputs
+        }
         Err(e) => {
             diagnostics.push(format!("Weekly quota unavailable: {e}"));
             vec![]
         }
     };
-    let email = cursor::local_cursor_email();
+    let desktop_email = cursor::local_cursor_email();
+    let saved_emails = cache_account_emails(crate::cursor::load_credentials_store().as_ref());
     let mut caches = BTreeMap::new();
     let dir = crate::cursor::get_cursor_cache_dir()?;
     if dir.exists() {
@@ -319,7 +374,14 @@ pub fn run(json: bool, since: Option<DateTime<Utc>>) -> Result<()> {
             }
         }
     }
-    let mut reports = account_reports(cards, caches, email.as_deref(), now, since);
+    let mut reports = account_reports(
+        cards,
+        caches,
+        &saved_emails,
+        desktop_email.as_deref(),
+        now,
+        since,
+    );
     let alias_path = crate::paths::get_config_dir().join("grok-bot-aliases.json");
     match load_aliases(&alias_path) {
         Ok(aliases) => apply_aliases(&mut reports, &aliases),
@@ -417,6 +479,7 @@ fn render(account: &AccountReport) {
                 row.partial_token_usage_calls
             );
         }
+        row.cost_breakdown.render(row.calls);
         if row.missing_token_usage_calls > 0 {
             println!(
                 "    Missing token data: {} calls",
@@ -439,25 +502,11 @@ fn render(account: &AccountReport) {
         "  Missing token data: {} calls; partial token data: {} calls (token columns sum reported counts only; omitted fields are unknown)",
         data.missing_token_usage_calls, data.partial_token_usage_calls
     );
+    data.cost_breakdown.render(data.calls);
+    println!("  Cost USD uses metered cost, or wallet charge when metered cost is unavailable.");
     print!("  Last 24h: ${:.2}", data.cost_24h_usd);
-    match &account.burn_rate {
-        Some(burn) => {
-            print!(
-                " ({:.3}%/h) → estimated exhaustion {}",
-                burn.percent_per_hour,
-                display_time(burn.exhausted_at)
-            );
-            if burn.before_reset {
-                println!("; before reset ({:.1}h early)", burn.hours_before_reset);
-            } else {
-                println!(
-                    "; lasts until reset ({:.1}% remaining at reset)",
-                    burn.remaining_at_reset_percent
-                );
-            }
-        }
-        None => println!("; cannot estimate quota %/h or exhaustion"),
-    }
+    println!("; cannot estimate quota exhaustion");
+    println!("  {}", account.burn_rate_unavailable_reason);
     println!(
         "  Non-Grok Bot Cursor usage (excluded): {} calls / ${:.2}",
         data.excluded_calls, data.excluded_cost_usd
@@ -513,31 +562,71 @@ mod tests {
     }
 
     #[test]
-    fn report_preserves_partial_counts_and_distinguishes_zero() {
+    fn cost_breakdown_preserves_zero_and_unknown_amounts() {
         let now = time("2026-10-08T06:00:00Z");
         let rows: Vec<_> = [
+            serde_json::json!({"totalCents": 25, "charged": 0}),
+            serde_json::json!({"totalCents": 20, "charged": 21.5}),
             serde_json::json!({}),
-            serde_json::json!({"totalCents": 25}),
-            serde_json::json!({"inputTokens": 7}),
-            serde_json::json!({"inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0, "cacheWriteTokens": 0}),
-        ].into_iter().map(|tokens| serde_json::json!({
-            "timestamp": now.timestamp_millis(),
-            "model": "grok-bot-default",
-            "conversationId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            "tokenUsage": tokens,
-        })).collect();
+        ]
+        .into_iter()
+        .map(|amounts| {
+            serde_json::json!({
+                "timestamp": now.timestamp_millis(), "model": "grok-bot-default",
+                "conversationId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "tokenUsage": {"totalCents": amounts["totalCents"]},
+                "chargedCents": amounts["charged"],
+            })
+        })
+        .collect();
         let records = parse_cursor_usage_records(
             &serde_json::json!({"usageEventsDisplay": rows}).to_string(),
             "work",
         );
         let data = summarize(&records, now, now - Duration::days(7));
         let json = serde_json::to_value(&data).unwrap();
-        assert_eq!(json["calls"], 4);
-        assert_eq!(json["tokens"]["input"], 7);
+        assert_eq!(json["cost_week_usd"], 0.45);
+        assert_eq!(json["cost_breakdown"]["metered"]["known_usd"], 0.45);
+        assert_eq!(json["cost_breakdown"]["charged"]["known_usd"], 0.215);
+        assert_eq!(json["cost_breakdown"]["charged"]["reported_calls"], 2);
+        assert!(json["cost_breakdown"].get("cursor_token_fee").is_none());
+        assert_eq!(json["rows"][0]["cost_breakdown"], json["cost_breakdown"]);
+        assert_eq!(ReportedAmount::default().display(3), "unknown");
+        assert_eq!(data.cost_breakdown.charged.display(3), "$0.21 (2/3 calls)");
+    }
+
+    #[test]
+    fn report_counts_partial_rows_and_sums_only_valid_counts() {
+        let now = time("2026-10-08T06:00:00Z");
+        let rows: Vec<_> = [
+            serde_json::json!({}),
+            serde_json::json!({"totalCents": 25}),
+            serde_json::json!({"inputTokens": 7}),
+            serde_json::json!({"inputTokens": "inf", "outputTokens": 3}),
+            serde_json::json!({"inputTokens": 0, "outputTokens": 0}),
+        ]
+        .into_iter()
+        .map(|tokens| {
+            serde_json::json!({
+                "timestamp": now.timestamp_millis(),
+                "model": "grok-bot-default",
+                "conversationId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "tokenUsage": tokens,
+            })
+        })
+        .collect();
+        let records = parse_cursor_usage_records(
+            &serde_json::json!({"usageEventsDisplay": rows}).to_string(),
+            "work",
+        );
+        let data = summarize(&records, now, now - Duration::days(7));
+        let json = serde_json::to_value(&data).unwrap();
+        assert_eq!(json["calls"], 5);
+        assert_eq!(json["tokens"]["input"], 7, "a rejected count is not summed");
+        assert_eq!(json["tokens"]["output"], 3);
         assert_eq!(json["missing_token_usage_calls"], 2);
-        assert_eq!(json["partial_token_usage_calls"], 1);
-        assert_eq!(json["rows"][0]["missing_token_usage_calls"], 2);
-        assert_eq!(json["rows"][0]["partial_token_usage_calls"], 1);
+        assert_eq!(json["partial_token_usage_calls"], 2);
+        assert_eq!(json["rows"][0]["partial_token_usage_calls"], 2);
     }
 
     #[test]
@@ -586,6 +675,7 @@ mod tests {
         let mut reports = account_reports(
             vec![],
             BTreeMap::from([("active".into(), events)]),
+            &BTreeMap::new(),
             None,
             now,
             None,
@@ -686,32 +776,37 @@ mod tests {
     }
 
     #[test]
-    fn burn_rate_before_after_reset_and_unavailable() {
-        let now = time("2026-10-08T00:00:00Z");
-        let data = Breakdown {
-            rows: vec![],
-            calls: 1,
-            cost_week_usd: 100.0,
-            cost_24h_usd: 24.0,
-            tokens: TokenBreakdown::default(),
-            missing_token_usage_calls: 0,
-            partial_token_usage_calls: 0,
-            excluded_calls: 0,
-            excluded_cost_usd: 0.0,
-        };
-        let burn = estimate(&data, now, Some(now + Duration::hours(48)), Some(80.0)).unwrap();
-        assert!((burn.percent_per_hour - 0.8).abs() < 1e-9);
-        assert_eq!(burn.exhausted_at, now + Duration::hours(25));
-        assert!(burn.before_reset);
-        assert!((burn.hours_before_reset - 23.0).abs() < 1e-9);
-        let burn = estimate(&data, now, Some(now + Duration::hours(10)), Some(80.0)).unwrap();
-        assert!(!burn.before_reset);
-        assert!((burn.remaining_at_reset_percent - 12.0).abs() < 1e-9);
-        assert!(estimate(&data, now, None, Some(80.0)).is_none());
-        assert!(estimate(&data, now, Some(now), Some(80.0)).is_none());
-        assert!(estimate(&data, now, Some(now + Duration::days(1)), Some(f64::NAN)).is_none());
-        let empty = summarize(&[], now, now - Duration::days(7));
-        assert!(estimate(&empty, now, Some(now + Duration::days(1)), Some(80.0)).is_none());
+    fn bot_costs_do_not_predict_shared_quota_exhaustion() {
+        let now = time("2026-10-08T06:00:00Z");
+        let records = parse_cursor_usage_records(
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../tokscale-core/tests/fixtures/grok_bot_usage.json"
+            )),
+            "synthetic",
+        );
+        let card: UsageOutput = serde_json::from_value(serde_json::json!({
+            "provider": "Grok Bot", "plan": null, "email": null,
+            "metrics": [{"label": "Weekly", "used_percent": 80.0, "remaining_percent": 20.0,
+                "remaining_label": null, "resets_at": (now + Duration::days(3)).to_rfc3339()}]
+        }))
+        .unwrap();
+        let result = report(
+            Some("synthetic".into()),
+            Some(card),
+            Some(&records),
+            now,
+            None,
+        );
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json["burn_rate"].is_null());
+        assert!(json["burn_rate_unavailable_reason"]
+            .as_str()
+            .unwrap()
+            .contains("pool scope"));
+        assert_eq!(json["quota"]["metrics"][0]["used_percent"], 80.0);
+        assert_eq!(json["breakdown"]["cost_week_usd"], 5.5);
+        assert!(json["breakdown"]["cost_24h_usd"].as_f64().unwrap() > 0.0);
     }
 
     #[test]
@@ -731,6 +826,7 @@ mod tests {
         let results = account_reports(
             vec![card.clone()],
             caches,
+            &BTreeMap::new(),
             Some("SYNTHETIC@example.invalid"),
             now,
             Some(now - Duration::days(1)),
@@ -739,9 +835,135 @@ mod tests {
         assert_eq!(results[0].cache_account_id.as_deref(), Some("active"));
         assert_eq!(results[0].week_start, reset - Duration::days(7));
         assert!(results[1].quota.is_none());
-        let results = account_reports(vec![card], BTreeMap::new(), None, now, None);
+        let results = account_reports(
+            vec![card],
+            BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+            now,
+            None,
+        );
         assert!(results[0].breakdown.is_none());
         assert_eq!(results[0].reset_at, Some(reset));
+    }
+
+    fn card(email: &str) -> UsageOutput {
+        serde_json::from_value(serde_json::json!({
+            "provider":"Grok Bot", "plan":null, "email":email, "metrics":[]
+        }))
+        .unwrap()
+    }
+
+    fn store(
+        active: &str,
+        accounts: &[(&str, Option<&str>)],
+    ) -> crate::cursor::CursorCredentialsStore {
+        crate::cursor::CursorCredentialsStore {
+            version: 1,
+            active_account_id: active.into(),
+            accounts: accounts
+                .iter()
+                .map(|(id, email)| {
+                    let credentials = crate::cursor::CursorCredentials {
+                        email: email.map(Into::into),
+                        ..Default::default()
+                    };
+                    (id.to_string(), credentials)
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn saved_emails_cover_active_and_per_account_caches() {
+        let store = store(
+            "synthetic-a",
+            &[
+                ("synthetic-a", Some("a@example.invalid")),
+                ("synthetic-b", Some("b@example.invalid")),
+                ("synthetic-c", None),
+            ],
+        );
+        let emails = cache_account_emails(Some(&store));
+        let stem = crate::cursor::cursor_account_cache_stem;
+        assert_eq!(
+            emails.get("active").map(String::as_str),
+            Some("a@example.invalid")
+        );
+        assert_eq!(
+            emails.get(&stem("synthetic-a")).map(String::as_str),
+            Some("a@example.invalid")
+        );
+        assert_eq!(
+            emails.get(&stem("synthetic-b")).map(String::as_str),
+            Some("b@example.invalid")
+        );
+        assert!(!emails.contains_key(&stem("synthetic-c")));
+        assert!(cache_account_emails(None).is_empty());
+    }
+
+    #[test]
+    fn per_account_cache_matches_card_by_saved_email() {
+        let now = time("2026-10-08T00:00:00Z");
+        let store = store(
+            "synthetic-a",
+            &[
+                ("synthetic-a", Some("a@example.invalid")),
+                ("synthetic-b", Some("B@example.invalid")),
+            ],
+        );
+        let secondary = crate::cursor::cursor_account_cache_stem("synthetic-b");
+        let caches = BTreeMap::from([("active".into(), vec![]), (secondary.clone(), vec![])]);
+        // The desktop is signed in to the second account; the saved email
+        // still decides which cache `usage.json` belongs to.
+        let results = account_reports(
+            vec![card("b@example.invalid"), card("a@example.invalid")],
+            caches,
+            &cache_account_emails(Some(&store)),
+            Some("b@example.invalid"),
+            now,
+            None,
+        );
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].cache_account_id.as_deref(),
+            Some(secondary.as_str())
+        );
+        assert_eq!(results[1].cache_account_id.as_deref(), Some("active"));
+        assert!(results
+            .iter()
+            .all(|r| r.quota.is_some() && r.breakdown.is_some()));
+    }
+
+    #[test]
+    fn desktop_email_only_maps_active_cache_without_saved_email() {
+        let now = time("2026-10-08T00:00:00Z");
+        let caches = || BTreeMap::from([("active".into(), vec![])]);
+        let unsaved = store("synthetic-a", &[("synthetic-a", None)]);
+        let results = account_reports(
+            vec![card("a@example.invalid")],
+            caches(),
+            &cache_account_emails(Some(&unsaved)),
+            Some("a@example.invalid"),
+            now,
+            None,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].cache_account_id.as_deref(), Some("active"));
+
+        let saved = store("synthetic-a", &[("synthetic-a", Some("a@example.invalid"))]);
+        let results = account_reports(
+            vec![card("b@example.invalid")],
+            caches(),
+            &cache_account_emails(Some(&saved)),
+            Some("b@example.invalid"),
+            now,
+            None,
+        );
+        assert_eq!(results.len(), 2);
+        assert!(results[0].breakdown.is_none());
+        assert_eq!(results[1].cache_account_id.as_deref(), Some("active"));
+        assert!(results[1].quota.is_none());
     }
 
     #[test]
