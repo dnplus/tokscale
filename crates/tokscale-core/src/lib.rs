@@ -8,6 +8,7 @@ pub mod clients;
 pub mod content_extractor;
 pub mod fs_atomic;
 pub mod http;
+mod legacy_graph;
 pub mod mcp;
 mod message_cache;
 pub mod model_alias;
@@ -26,6 +27,7 @@ pub mod wiki;
 pub use aggregator::*;
 pub use bucket_tz::BucketTimezone;
 pub use clients::{ClientCounts, ClientDef, ClientId, PathRoot};
+pub use legacy_graph::*;
 pub use message_cache::parser_generation;
 pub use model_alias::ModelAliasMap;
 pub use parser::*;
@@ -48,6 +50,12 @@ use std::time::Instant;
 #[cfg(test)]
 static RETENTION_PROVENANCE_REBUILDS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// Records every Claude transcript a scan continued from its checkpoint
+/// instead of parsing from byte 0. Paths are unique per test, so a test can
+/// assert on its own transcript while others run alongside it.
+#[cfg(test)]
+static CLAUDE_RESUMED_PATHS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// Strip a CLIProxyAPI-style `(level)` reasoning-effort suffix from a model id.
 ///
@@ -458,30 +466,125 @@ pub struct LocalParseOptions {
     pub scanner_settings: scanner::ScannerSettings,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CostProvenance {
+    #[serde(default)]
+    pub kind: CostProvenanceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate_source: Option<EstimateSource>,
+}
+
+impl CostProvenance {
+    pub const fn unknown() -> Self {
+        Self {
+            kind: CostProvenanceKind::Unknown,
+            estimate_source: None,
+        }
+    }
+
+    pub const fn provider_reported() -> Self {
+        Self {
+            kind: CostProvenanceKind::ProviderReported,
+            estimate_source: None,
+        }
+    }
+
+    pub const fn estimated(estimate_source: EstimateSource) -> Self {
+        Self {
+            kind: CostProvenanceKind::Estimated,
+            estimate_source: Some(estimate_source),
+        }
+    }
+
+    pub const fn mixed(estimate_source: Option<EstimateSource>) -> Self {
+        Self {
+            kind: CostProvenanceKind::Mixed,
+            estimate_source,
+        }
+    }
+}
+
+impl Default for CostProvenance {
+    fn default() -> Self {
+        Self::unknown()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CostProvenanceKind {
+    #[default]
+    Unknown,
+    ProviderReported,
+    Estimated,
+    Mixed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EstimateSource {
+    Catalog,
+    Custom,
+    Unknown,
+    Mixed,
+}
+
+const fn default_unknown_provenance_opt() -> Option<CostProvenance> {
+    Some(CostProvenance::unknown())
+}
+
+/// Daily totals with cost provenance. The original [`DailyTotals`] retains its field layout.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct DailyTotals {
+pub struct DailyTotalsV2 {
     pub tokens: i64,
     pub cost: f64,
     pub messages: i32,
+    #[serde(
+        default = "default_unknown_provenance_opt",
+        skip_serializing_if = "Option::is_none",
+        rename = "costProvenance"
+    )]
+    pub cost_provenance: Option<CostProvenance>,
 }
 
+impl DailyTotalsV2 {
+    pub fn cost_provenance(&self) -> CostProvenance {
+        self.cost_provenance.unwrap_or_default()
+    }
+}
+
+/// Client/model totals with cost provenance; opt in from [`ClientContribution`].
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ClientContribution {
+pub struct ClientContributionV2 {
     pub client: String,
     pub model_id: String,
     pub provider_id: String,
     pub tokens: TokenBreakdown,
     pub cost: f64,
     pub messages: i32,
+    #[serde(
+        default = "default_unknown_provenance_opt",
+        skip_serializing_if = "Option::is_none",
+        rename = "costProvenance"
+    )]
+    pub cost_provenance: Option<CostProvenance>,
 }
 
+impl ClientContributionV2 {
+    pub fn cost_provenance(&self) -> CostProvenance {
+        self.cost_provenance.unwrap_or_default()
+    }
+}
+
+/// Daily contribution whose totals and clients retain cost provenance.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct DailyContribution {
+pub struct DailyContributionV2 {
     pub date: String,
-    pub totals: DailyTotals,
+    pub totals: DailyTotalsV2,
     pub intensity: u8,
     pub token_breakdown: TokenBreakdown,
-    pub clients: Vec<ClientContribution>,
+    pub clients: Vec<ClientContributionV2>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_time_ms: Option<i64>,
 }
@@ -490,31 +593,45 @@ pub struct DailyContribution {
 /// `session_id` so downstream consumers can attribute cost to a specific
 /// agent-CLI session rather than just a date or model rollup.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-pub struct SessionContribution {
+pub struct SessionContributionV2 {
     pub session_id: String,
     pub client: String,
     pub provider: String,
     pub model: String,
-    pub totals: DailyTotals,
+    pub totals: DailyTotalsV2,
     pub token_breakdown: TokenBreakdown,
-    pub clients: Vec<ClientContribution>,
+    pub clients: Vec<ClientContributionV2>,
     /// Earliest message timestamp (unix seconds) in the session.
     pub first_seen: i64,
     /// Latest message timestamp (unix seconds) in the session.
     pub last_seen: i64,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct YearSummary {
+/// Year totals with cost provenance; opt in from [`YearSummary`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct YearSummaryV2 {
     pub year: String,
     pub total_tokens: i64,
     pub total_cost: f64,
     pub range_start: String,
     pub range_end: String,
+    #[serde(
+        default = "default_unknown_provenance_opt",
+        skip_serializing_if = "Option::is_none",
+        rename = "costProvenance"
+    )]
+    pub cost_provenance: Option<CostProvenance>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct DataSummary {
+impl YearSummaryV2 {
+    pub fn cost_provenance(&self) -> CostProvenance {
+        self.cost_provenance.unwrap_or_default()
+    }
+}
+
+/// Overall totals with cost provenance; opt in from [`DataSummary`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DataSummaryV2 {
     pub total_tokens: i64,
     pub total_cost: f64,
     pub total_days: i32,
@@ -523,6 +640,18 @@ pub struct DataSummary {
     pub max_cost_in_single_day: f64,
     pub clients: Vec<String>,
     pub models: Vec<String>,
+    #[serde(
+        default = "default_unknown_provenance_opt",
+        skip_serializing_if = "Option::is_none",
+        rename = "costProvenance"
+    )]
+    pub cost_provenance: Option<CostProvenance>,
+}
+
+impl DataSummaryV2 {
+    pub fn cost_provenance(&self) -> CostProvenance {
+        self.cost_provenance.unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -534,12 +663,14 @@ pub struct GraphMeta {
     pub processing_time_ms: u32,
 }
 
+/// Graph with cost provenance, returned by [`generate_graph_v2`].
+/// Convert into [`GraphResult`] to discard provenance and retain the original shape.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct GraphResult {
+pub struct GraphResultV2 {
     pub meta: GraphMeta,
-    pub summary: DataSummary,
-    pub years: Vec<YearSummary>,
-    pub contributions: Vec<DailyContribution>,
+    pub summary: DataSummaryV2,
+    pub years: Vec<YearSummaryV2>,
+    pub contributions: Vec<DailyContributionV2>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_metrics: Option<sessionize::TimeMetrics>,
     #[serde(skip)]
@@ -548,7 +679,7 @@ pub struct GraphResult {
     /// token-bearing message could not be priced authoritatively.
     ///
     /// The CLI serializes these days as `totals.costIsComplete: false`. Kept
-    /// outside `DailyTotals` because it is submission-only protocol metadata,
+    /// outside `DailyTotalsV2` because it is submission-only protocol metadata,
     /// not part of local report aggregation or exported historical reports.
     #[serde(skip)]
     pub incomplete_cost_dates: BTreeSet<String>,
@@ -889,6 +1020,39 @@ fn opencode_json_superseded_by_sqlite(
 /// Callers that genuinely want the whole vector still get one: `Vec` is a sink.
 trait MessageSink {
     fn accept(&mut self, message: UnifiedMessage);
+
+    fn accept_with_estimate_source(
+        &mut self,
+        message: UnifiedMessage,
+        _source: Option<EstimateSource>,
+    ) {
+        self.accept(message);
+    }
+}
+
+/// Recovery already needs the collected native rows. Carry their captured
+/// origins separately through reconciliation without changing cached messages.
+#[derive(Default)]
+struct GraphMessageCollector {
+    messages: Vec<UnifiedMessage>,
+    cost_estimates: pricing::provenance::CostEstimateCapture,
+}
+
+impl MessageSink for GraphMessageCollector {
+    fn accept(&mut self, message: UnifiedMessage) {
+        self.messages.push(message);
+    }
+
+    fn accept_with_estimate_source(
+        &mut self,
+        message: UnifiedMessage,
+        source: Option<EstimateSource>,
+    ) {
+        if let Some(source) = source {
+            self.cost_estimates.record(&message, source);
+        }
+        self.accept(message);
+    }
 }
 
 impl MessageSink for Vec<UnifiedMessage> {
@@ -957,6 +1121,7 @@ impl RecordedCodexTurns {
 }
 
 struct FlushContext<'a> {
+    pricing: Option<&'a pricing::PricingService>,
     include_all: bool,
     requested: HashSet<&'a str>,
     include_synthetic: bool,
@@ -993,6 +1158,9 @@ fn flush_lane<S: MessageSink>(
     for message in buffer.drain(..) {
         flush_message(message, context, sink);
     }
+    if let Some(pricing) = context.pricing {
+        pricing.clear_cost_estimate_sources();
+    }
 }
 
 /// Apply the parse tail to one message and release it into the consumer.
@@ -1004,6 +1172,11 @@ fn flush_message<S: MessageSink>(
     context: &FlushContext<'_>,
     sink: &mut S,
 ) {
+    // Take the source before gateway normalization changes model/provider
+    // identity. Rebucketing and filtering never need another price lookup.
+    let estimate_source = context
+        .pricing
+        .and_then(|pricing| pricing.take_cost_estimate_source(&message));
     if !context.include_all
         && !retain_for_requested_clients(
             &message.client,
@@ -1026,7 +1199,7 @@ fn flush_message<S: MessageSink>(
         message.rebucket_date(timezone);
     }
 
-    sink.accept(message);
+    sink.accept_with_estimate_source(message, estimate_source);
 }
 
 fn parse_all_messages_with_pricing_with_cache_policy(
@@ -1454,6 +1627,65 @@ fn parse_all_messages_streaming<S: MessageSink>(
             Option<&message_cache::SourceFingerprint>,
         ) -> Option<message_cache::FingerprintStatus>,
     {
+        load_or_parse_resumable_source(
+            identity,
+            path,
+            source_cache,
+            pricing,
+            history,
+            fingerprint_from_path,
+            |path, fingerprint| {
+                let (messages, cacheable) = parse(path, fingerprint);
+                SourceParse {
+                    messages,
+                    cacheable,
+                    claude_checkpoint: None,
+                }
+            },
+            None,
+        )
+    }
+
+    /// One parse of a source file, and the Claude checkpoint it ended in, if
+    /// any (see [`sessions::claudecode::ClaudeCheckpoint`]).
+    struct SourceParse {
+        messages: Vec<UnifiedMessage>,
+        cacheable: bool,
+        claude_checkpoint: Option<sessions::claudecode::ClaudeCheckpoint>,
+    }
+
+    /// Continues a changed file's parse from the entry cached for it, or
+    /// returns `None` to have the whole file parsed instead.
+    type ResumeSource<'a> = &'a dyn Fn(
+        &Path,
+        &message_cache::CachedSourceEntry,
+        &message_cache::SourceFingerprint,
+    ) -> Option<SourceParse>;
+
+    /// The loader behind every `load_or_parse_source*` variant.
+    ///
+    /// `resume` is only tried when the fingerprint changed under a cached
+    /// entry, and before the full parse. Whatever it returns goes through the
+    /// same retention merge and entry rebuild as a full parse, so it has to
+    /// produce exactly the messages a full parse of the file would.
+    #[allow(clippy::too_many_arguments)]
+    fn load_or_parse_resumable_source<F, FingerprintFn>(
+        identity: message_cache::CacheIdentity,
+        path: &Path,
+        source_cache: &message_cache::SourceMessageCache,
+        pricing: Option<&pricing::PricingService>,
+        history: HistoryRetention,
+        fingerprint_from_path: FingerprintFn,
+        parse: F,
+        resume: Option<ResumeSource<'_>>,
+    ) -> CachedParseOutcome
+    where
+        F: Fn(&Path, Option<&message_cache::SourceFingerprint>) -> SourceParse,
+        FingerprintFn: Fn(
+            &Path,
+            Option<&message_cache::SourceFingerprint>,
+        ) -> Option<message_cache::FingerprintStatus>,
+    {
         let mut cached = source_cache.take(identity, path);
         // An entry written before retention provenance existed cannot say
         // which of its rows the live transcript already dropped, so serving it
@@ -1474,7 +1706,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         let Some(fingerprint_status) =
             fingerprint_from_path(path, cached.as_ref().map(|entry| &entry.fingerprint))
         else {
-            let (mut messages, _) = parse(path, None);
+            let mut messages = parse(path, None).messages;
             apply_pricing_to_messages(&mut messages, pricing);
             return CachedParseOutcome {
                 messages,
@@ -1521,7 +1753,19 @@ fn parse_all_messages_streaming<S: MessageSink>(
             cached = Some(entry);
         }
 
-        let (mut messages, cacheable) = parse(path, Some(&fingerprint));
+        // An entry that needs its retention provenance rebuilt has to take the
+        // full parse, which is what re-derives it.
+        let resumed = match (resume, cached.as_ref()) {
+            (Some(resume), Some(entry)) if !rebuild_retention_provenance => {
+                resume(path, entry, &fingerprint)
+            }
+            _ => None,
+        };
+        let SourceParse {
+            mut messages,
+            cacheable,
+            claude_checkpoint,
+        } = resumed.unwrap_or_else(|| parse(path, Some(&fingerprint)));
         // Reaching here means the file changed under a cache entry we still
         // hold. For a source that rewrites transcripts in place that is not
         // only "new content appeared" — it can also be "already-published
@@ -1567,6 +1811,9 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 }
             })
         };
+        // The checkpoint describes the live messages, which come first in the
+        // entry; retained history follows them.
+        let cache_entry = cache_entry.map(|entry| entry.with_claude_checkpoint(claude_checkpoint));
         apply_pricing_to_messages(&mut messages, pricing);
 
         CachedParseOutcome {
@@ -1614,6 +1861,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
     /// count, and neither do some keys inside an otherwise-qualifying lane —
     /// hence `key_is_globally_stable` rather than a blanket per-client
     /// promise.
+    #[allow(clippy::too_many_arguments)]
     fn load_or_parse_source_with_fingerprint_retaining_history<F, FingerprintFn>(
         identity: message_cache::CacheIdentity,
         path: &Path,
@@ -1622,15 +1870,16 @@ fn parse_all_messages_streaming<S: MessageSink>(
         key_is_globally_stable: fn(&str) -> bool,
         fingerprint_from_path: FingerprintFn,
         parse: F,
+        resume: Option<ResumeSource<'_>>,
     ) -> CachedParseOutcome
     where
-        F: Fn(&Path) -> Vec<UnifiedMessage>,
+        F: Fn(&Path) -> SourceParse,
         FingerprintFn: Fn(
             &Path,
             Option<&message_cache::SourceFingerprint>,
         ) -> Option<message_cache::FingerprintStatus>,
     {
-        load_or_parse_source_with_fingerprint_and_policy(
+        load_or_parse_resumable_source(
             identity,
             path,
             source_cache,
@@ -1639,8 +1888,41 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 key_is_globally_stable,
             },
             fingerprint_from_path,
-            |path, _| (parse(path), true),
+            |path, _| parse(path),
+            resume,
         )
+    }
+
+    /// Continue a Claude Code transcript that only grew since its entry was
+    /// cached. A changed sidecar (the subagent meta file, a parent session, a
+    /// cc-mirror variant) can change messages before the checkpoint, so it
+    /// takes the full parse.
+    fn resume_claude_source(
+        path: &Path,
+        entry: &message_cache::CachedSourceEntry,
+        fingerprint: &message_cache::SourceFingerprint,
+        claude_home: &Path,
+    ) -> Option<SourceParse> {
+        let checkpoint = entry.claude_checkpoint.as_ref()?;
+        if entry.fingerprint.related_files != fingerprint.related_files {
+            return None;
+        }
+        let parsed = sessions::claudecode::resume_claude_file(
+            path,
+            Some(claude_home),
+            checkpoint,
+            &entry.messages,
+        )?;
+        #[cfg(test)]
+        CLAUDE_RESUMED_PATHS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(path.to_path_buf());
+        Some(SourceParse {
+            messages: parsed.messages,
+            cacheable: true,
+            claude_checkpoint: parsed.checkpoint,
+        })
     }
 
     fn load_or_parse_source_with_fingerprint_context<F, FingerprintFn>(
@@ -2304,6 +2586,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
     let flush_context = {
         let timezone = bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings);
         FlushContext {
+            pricing,
             include_all,
             requested: clients.iter().map(String::as_str).collect(),
             include_synthetic,
@@ -2440,7 +2723,22 @@ fn parse_all_messages_streaming<S: MessageSink>(
                         Some(&claude_home),
                     )
                 },
-                |path| sessions::claudecode::parse_claude_file_with_home(path, Some(&claude_home)),
+                |path| {
+                    let parsed = sessions::claudecode::parse_claude_file_with_checkpoint(
+                        path,
+                        Some(&claude_home),
+                    );
+                    SourceParse {
+                        messages: parsed.messages,
+                        cacheable: true,
+                        claude_checkpoint: parsed.checkpoint,
+                    }
+                },
+                Some(&|path: &Path,
+                       entry: &message_cache::CachedSourceEntry,
+                       fingerprint: &message_cache::SourceFingerprint| {
+                    resume_claude_source(path, entry, fingerprint, &claude_home)
+                }),
             )
         })
         .collect();
@@ -2571,14 +2869,19 @@ fn parse_all_messages_streaming<S: MessageSink>(
     // copilot's own messages must still be buffered when they run.
     flush_lane(&mut all_messages, &flush_context, sink);
 
+    // Price once after merging snapshots, including on warm cache hits.
     parse_cached_lane(
         &scan_result,
         &mut source_cache,
-        pricing,
+        None,
         &mut all_messages,
         ClientId::Copilot,
         sessions::copilot::parse_copilot_file,
     );
+    merge_copilot_rows_in_place(&mut all_messages);
+    for message in &mut all_messages {
+        apply_pricing_if_available(message, pricing);
+    }
     let copilot_otel_sessions: HashSet<String> = all_messages
         .iter()
         .filter(|message| message.client == "copilot")
@@ -3005,6 +3308,15 @@ fn parse_all_messages_streaming<S: MessageSink>(
         }
     }
 
+    parse_cached_lane_deduped(
+        &scan_result,
+        &mut source_cache,
+        pricing,
+        &mut all_messages,
+        ClientId::Aside,
+        sessions::aside::parse_aside_file,
+    );
+
     // Pi branch/fork copies prior assistant records into a new session file
     // (#1306). The parser stamps cross-session keys (`responseId` preferred);
     // this lane drops the copies — first-wins in scan order, same key survives
@@ -3377,6 +3689,17 @@ fn parse_all_messages_streaming<S: MessageSink>(
         sessions::muse::parse_muse_file,
     );
 
+    // Mistral Vibe `meta.json` session records carry cumulative usage stats,
+    // and pricing is resolved through Tokscale's pricing engine.
+    parse_cached_lane_deduped(
+        &scan_result,
+        &mut source_cache,
+        pricing,
+        &mut all_messages,
+        ClientId::Vibe,
+        sessions::vibe::parse_vibe_file,
+    );
+
     // ZCode (Z.ai GLM-5.2 ADE) JSONL sessions. Token usage may be embedded
     // from the API response; otherwise estimated from content.
     let zcode_messages: Vec<UnifiedMessage> = scan_result
@@ -3584,15 +3907,17 @@ fn parse_all_messages_streaming<S: MessageSink>(
         all_messages.extend(kilo_messages);
     }
 
-    let mut hermes_seen: HashSet<String> = HashSet::new();
-    for db_path in scan_result.hermes_db_paths() {
-        let hermes_messages = parse_hermes_sqlite_with_pricing(&db_path, pricing);
-        all_messages.extend(
-            hermes_messages
-                .into_iter()
-                .filter(|message| should_keep_deduped_message(&mut hermes_seen, message)),
-        );
-    }
+    // Hermes decides its day split at parse time (it allocates row buckets
+    // across days from the agent log), so it needs the pinned zone here — the
+    // post-parse `rebucket_days` pass cannot recover a split this grouping
+    // collapsed.
+    let hermes_bucket_timezone = bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings);
+    let hermes_databases = scan_result
+        .hermes_db_paths()
+        .into_iter()
+        .map(|db_path| parse_hermes_sqlite_with_pricing(&db_path, pricing, &hermes_bucket_timezone))
+        .collect();
+    all_messages.extend(select_best_covered_hermes_groups(hermes_databases));
 
     if let Some(db_path) = &scan_result.goose_db {
         let goose_messages: Vec<UnifiedMessage> = sessions::goose::parse_goose_sqlite(db_path)
@@ -4802,8 +5127,10 @@ async fn generate_graph_with_loaded_pricing(
     options: ReportOptions,
     pricing: Option<&pricing::PricingService>,
     pricing_requirement: GraphPricingRequirement,
-) -> Result<GraphResult, String> {
+) -> Result<GraphResultV2, String> {
     let start = Instant::now();
+    let captured_pricing = pricing.map(pricing::PricingService::with_cost_provenance_capture);
+    let pricing = captured_pricing.as_ref();
 
     let home_dir = get_home_dir_string(&options.home_dir)?;
 
@@ -4831,14 +5158,24 @@ async fn generate_graph_with_loaded_pricing(
         // always streams only the verifiable source messages, and so does
         // `LenientSourceOnly`, whose callers compare against what submission
         // sends and must not see the never-submitted overlay.
-        for message in parse_all_messages_with_pricing_with_env_strategy(
+        let mut collector = GraphMessageCollector::default();
+        parse_all_messages_streaming_with_env_strategy(
             &home_dir,
             &clients,
             pricing,
             options.use_env_roots,
             &options.scanner_settings,
-        ) {
-            sink.accept(message);
+            &mut collector,
+        );
+        recovery::apply(
+            &mut collector.messages,
+            &home_dir,
+            &clients,
+            bucket_timezone.is_pinned().then_some(&bucket_timezone),
+        );
+        for message in collector.messages {
+            let source = collector.cost_estimates.take(&message);
+            sink.accept_with_estimate_source(message, source);
         }
     } else {
         parse_all_messages_streaming_with_env_strategy(
@@ -4879,8 +5216,8 @@ struct GraphSink<'a> {
     filter: Option<&'a ReportOptions>,
     pricing: Option<&'a pricing::PricingService>,
     requirement: GraphPricingRequirement,
-    buffer: Vec<UnifiedMessage>,
-    daily: aggregator::DailyFold,
+    buffer: Vec<(UnifiedMessage, Option<EstimateSource>)>,
+    daily: aggregator::DailyFoldV2,
     interner: sessionize::SpanInterner,
     spans: Vec<sessionize::SessionSpan>,
     /// Merged across batches by (provider, model); counts and tokens add.
@@ -4902,7 +5239,7 @@ impl<'a> GraphSink<'a> {
             pricing,
             requirement,
             buffer: Vec::new(),
-            daily: aggregator::DailyFold::default(),
+            daily: aggregator::DailyFoldV2::default(),
             interner: sessionize::SpanInterner::default(),
             spans: Vec::new(),
             unpriced_usage: HashMap::new(),
@@ -4923,8 +5260,20 @@ impl<'a> GraphSink<'a> {
             // priced, so the two share this arm.
             GraphPricingRequirement::Lenient | GraphPricingRequirement::LenientSourceOnly => batch,
             GraphPricingRequirement::Submission => {
+                // Submission may reorder rows and zero unsafe estimates. Keep
+                // only metadata matching the amounts that survive preparation.
+                let sources = pricing::provenance::CostEstimateCapture::default();
+                let messages = batch
+                    .into_iter()
+                    .map(|(message, source)| {
+                        if let Some(source) = source {
+                            sources.record(&message, source);
+                        }
+                        message
+                    })
+                    .collect();
                 let (mut submitted, zeroed, unpriced_usage, incomplete_cost_dates) =
-                    prepare_submission_pricing(batch, self.pricing);
+                    prepare_submission_pricing(messages, self.pricing);
                 for usage in unpriced_usage {
                     let entry = self
                         .unpriced_usage
@@ -4945,11 +5294,18 @@ impl<'a> GraphSink<'a> {
                 }
                 submitted.extend(zeroed);
                 submitted
+                    .into_iter()
+                    .map(|message| {
+                        let source = sources.take(&message);
+                        (message, source)
+                    })
+                    .collect()
             }
         };
 
-        for message in &batch {
-            self.daily.add(message);
+        for (message, estimate_source) in &batch {
+            self.daily
+                .add_with_estimate_source(message, *estimate_source);
             if message.timestamp > 0 {
                 self.spans.push(sessionize::SessionSpan::from_message(
                     message,
@@ -4963,7 +5319,7 @@ impl<'a> GraphSink<'a> {
         mut self,
         start: Instant,
         bucket_timezone: &bucket_tz::BucketTimezone,
-    ) -> Result<GraphResult, String> {
+    ) -> Result<GraphResultV2, String> {
         self.drain_batch();
 
         let mut unpriced_submission_usage: Vec<UnpricedSubmissionUsage> = self
@@ -5007,7 +5363,7 @@ impl<'a> GraphSink<'a> {
         let contributions = self.daily.finish();
 
         let processing_time_ms = start.elapsed().as_millis() as u32;
-        let mut result = aggregator::generate_graph_result(contributions, processing_time_ms);
+        let mut result = aggregator::generate_graph_result_v2(contributions, processing_time_ms);
         result.time_metrics = Some(time_metrics);
         result.unpriced_submission_usage = unpriced_submission_usage;
         result.incomplete_cost_dates = self.incomplete_cost_dates;
@@ -5024,6 +5380,17 @@ impl<'a> GraphSink<'a> {
 
 impl MessageSink for GraphSink<'_> {
     fn accept(&mut self, message: UnifiedMessage) {
+        let source = self
+            .pricing
+            .and_then(|pricing| pricing.take_cost_estimate_source(&message));
+        self.accept_with_estimate_source(message, source);
+    }
+
+    fn accept_with_estimate_source(
+        &mut self,
+        message: UnifiedMessage,
+        source: Option<EstimateSource>,
+    ) {
         // Cumulative Desktop balances have no day attribution. They belong in
         // all-time local totals, never daily graphs or leaderboard submissions.
         if claude_desktop::is_undated_balance(&message) {
@@ -5034,7 +5401,7 @@ impl MessageSink for GraphSink<'_> {
                 return;
             }
         }
-        self.buffer.push(message);
+        self.buffer.push((message, source));
         if self.buffer.len() >= GRAPH_SINK_BATCH {
             self.drain_batch();
         }
@@ -5073,7 +5440,7 @@ fn build_graph_from_messages(
     pricing_requirement: GraphPricingRequirement,
     start: Instant,
     bucket_timezone: &bucket_tz::BucketTimezone,
-) -> Result<GraphResult, String> {
+) -> Result<GraphResultV2, String> {
     // `filtered` has already been through the report's date filters, so the
     // sink applies none of its own. Delegating rather than duplicating keeps
     // this path and the streaming one on identical aggregation code, and lets
@@ -5269,19 +5636,24 @@ pub async fn get_time_metrics_report(options: ReportOptions) -> Result<TimeMetri
     })
 }
 
-pub async fn generate_graph(options: ReportOptions) -> Result<GraphResult, String> {
+/// Version of [`generate_graph`] that retains cost provenance.
+pub async fn generate_graph_v2(options: ReportOptions) -> Result<GraphResultV2, String> {
     let pricing = pricing::PricingService::get_or_init().await?;
     generate_graph_with_loaded_pricing(options, Some(&pricing), GraphPricingRequirement::Lenient)
         .await
 }
 
-pub async fn generate_submission_graph(options: ReportOptions) -> Result<GraphResult, String> {
+/// Version of [`generate_submission_graph`] that retains cost provenance.
+pub async fn generate_submission_graph_v2(options: ReportOptions) -> Result<GraphResultV2, String> {
     let pricing = pricing::PricingService::get_or_init().await?;
     generate_graph_with_loaded_pricing(options, Some(&pricing), GraphPricingRequirement::Submission)
         .await
 }
 
-pub async fn generate_local_graph_report(options: ReportOptions) -> Result<GraphResult, String> {
+/// Version of [`generate_local_graph_report`] that retains cost provenance.
+pub async fn generate_local_graph_report_v2(
+    options: ReportOptions,
+) -> Result<GraphResultV2, String> {
     let pricing = load_pricing_for_local_parse().await;
     generate_graph_with_loaded_pricing(
         options,
@@ -5293,14 +5665,17 @@ pub async fn generate_local_graph_report(options: ReportOptions) -> Result<Graph
 
 /// Local graph built from source messages only: exactly what submission reads.
 ///
-/// Identical to [`generate_local_graph_report`] — same optional pricing, same
+/// Identical to [`generate_local_graph_report_v2`] — same optional pricing, same
 /// lenient pricing rules — except that it never merges the local recovery
 /// overlay (`recovered-usage-v1.json`). That overlay is local-only and
 /// `tokscale submit` never sends it, so any caller that asks "does this machine
 /// already report this usage?" must not see it. Treating a recovery-only day as
 /// already reported drops the imported row for it while submission never
 /// uploads that day either, and the usage disappears (#1364).
-pub async fn generate_source_graph_report(options: ReportOptions) -> Result<GraphResult, String> {
+/// Version of [`generate_source_graph_report`] that retains cost provenance.
+pub async fn generate_source_graph_report_v2(
+    options: ReportOptions,
+) -> Result<GraphResultV2, String> {
     let pricing = load_pricing_for_local_parse().await;
     generate_graph_with_loaded_pricing(
         options,
@@ -5573,6 +5948,45 @@ pub fn calculate_cost_with_service_tier(
         * openai_fast_mode_multiplier(pricing, model_id, provider_id, service_tier)
 }
 
+pub fn calculate_cost_detailed_with_service_tier(
+    pricing: &pricing::PricingService,
+    model_id: &str,
+    provider_id: Option<&str>,
+    tokens: &TokenBreakdown,
+    service_tier: Option<&str>,
+) -> (f64, Option<EstimateSource>) {
+    let (cost, source) =
+        pricing.calculate_cost_detailed_with_provider(model_id, provider_id, tokens);
+    (
+        cost * openai_fast_mode_multiplier(pricing, model_id, provider_id, service_tier),
+        source,
+    )
+}
+
+/// Merge Copilot OTEL snapshots inside a shared lane buffer.
+///
+/// [`sessions::copilot::merge_copilot_messages`] owns a whole vector: it sorts
+/// by its own comparator and merges rows sharing a dedup key. That is only safe
+/// for rows the Copilot lane produced. The streaming tail drains the buffer
+/// right before that lane, so today the buffer holds Copilot rows alone — but
+/// that is an implicit invariant. A future lane that buffers its rows ahead of
+/// Copilot would have them re-ordered by the Copilot comparator, and could see
+/// them merged against a colliding dedup key from another client.
+///
+/// Partition explicitly instead: foreign rows keep their relative order and
+/// pass through untouched, and only `client == "copilot"` rows reach the
+/// merger.
+fn merge_copilot_rows_in_place(messages: &mut Vec<UnifiedMessage>) {
+    let (copilot_rows, foreign_rows): (Vec<UnifiedMessage>, Vec<UnifiedMessage>) = messages
+        .drain(..)
+        .partition(|message| message.client == "copilot");
+    *messages = foreign_rows;
+    if copilot_rows.is_empty() {
+        return;
+    }
+    messages.extend(sessions::copilot::merge_copilot_messages(copilot_rows));
+}
+
 fn apply_pricing_if_available(
     message: &mut UnifiedMessage,
     pricing: Option<&pricing::PricingService>,
@@ -5585,15 +5999,22 @@ fn apply_pricing_if_available(
         return;
     };
 
-    let calculated_cost = pricing.calculate_cost_with_provider(
+    let (calculated_cost, estimate_source) = pricing.calculate_cost_detailed_with_provider(
         &message.model_id,
         Some(&message.provider_id),
         &message.tokens,
-    ) * pricing_multiplier(message, pricing);
+    );
+    let calculated_cost = calculated_cost * pricing_multiplier(message, pricing);
 
-    if calculated_cost > 0.0 {
-        message.cost = calculated_cost;
-        message.mark_estimated_cost();
+    if let Some(source) = estimate_source {
+        // A covered zero rate may classify a message that carries no cost, but
+        // must never zero out a positive cost already on a non-authoritative
+        // message (e.g. after a cross-file merge).
+        if calculated_cost > 0.0 || message.cost <= 0.0 {
+            message.cost = calculated_cost;
+            message.mark_estimated_cost();
+            pricing.record_cost_estimate_source(message, source);
+        }
     }
 }
 
@@ -5621,11 +6042,134 @@ fn merge_claude_cross_file_duplicate(
     apply_pricing_if_available(existing, pricing);
 }
 
+fn hermes_candidate_totals(messages: &[UnifiedMessage]) -> ([i128; 6], f64) {
+    let mut tokens = [0_i128; 6];
+    let mut cost = 0.0;
+    for message in messages {
+        tokens[0] += message.tokens.input as i128;
+        tokens[1] += message.tokens.output as i128;
+        tokens[2] += message.tokens.cache_read as i128;
+        tokens[3] += message.tokens.cache_write as i128;
+        tokens[4] += message.tokens.cache_write_1h as i128;
+        tokens[5] += message.tokens.reasoning as i128;
+        cost += message.cost;
+    }
+    (tokens, cost)
+}
+
+fn hermes_candidates_have_same_usage(a: &[UnifiedMessage], b: &[UnifiedMessage]) -> bool {
+    let (a_tokens, a_cost) = hermes_candidate_totals(a);
+    let (b_tokens, b_cost) = hermes_candidate_totals(b);
+    let cost_scale = a_cost.abs().max(b_cost.abs()).max(1.0);
+    a_tokens == b_tokens && (a_cost - b_cost).abs() <= 1e-9 * cost_scale
+}
+
+fn hermes_candidate_day_coverage(messages: &[UnifiedMessage]) -> usize {
+    messages
+        .iter()
+        .filter_map(sessions::hermes::message_logged_day)
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+/// Select one copy of each Hermes (session, model, provider) group when the
+/// same database is discovered through default and extra roots. A log-split
+/// copy beats a start-day fallback only when their authoritative token and cost
+/// totals agree. Among matching copies, the one covering the most distinct log
+/// days wins; ties keep the first database. Mismatched totals always keep the
+/// first database rather than replacing a complete row with a stale partial copy.
+///
+/// `message_count` belongs to the session rather than any model group. Group-
+/// by-group selection can mix copies from different databases whose primary
+/// model differs, so normalize the first database's count onto exactly one of
+/// the selected messages after choosing every group.
+fn select_best_covered_hermes_groups(databases: Vec<Vec<UnifiedMessage>>) -> Vec<UnifiedMessage> {
+    let mut group_order: Vec<(String, String, String)> = Vec::new();
+    let mut group_candidates: HashMap<(String, String, String), Vec<Vec<UnifiedMessage>>> =
+        HashMap::new();
+    let mut session_message_counts: HashMap<String, i32> = HashMap::new();
+
+    for messages in databases {
+        let mut database_session_counts: HashMap<String, i32> = HashMap::new();
+        for message in &messages {
+            database_session_counts
+                .entry(message.session_id.clone())
+                .and_modify(|count| *count = (*count).max(message.message_count))
+                .or_insert(message.message_count);
+        }
+        for (session_id, count) in database_session_counts {
+            session_message_counts.entry(session_id).or_insert(count);
+        }
+
+        let mut database_groups: HashMap<(String, String, String), Vec<UnifiedMessage>> =
+            HashMap::new();
+        let mut database_group_order: Vec<(String, String, String)> = Vec::new();
+        for message in messages {
+            let group = (
+                message.session_id.clone(),
+                message.model_id.clone(),
+                message.provider_id.clone(),
+            );
+            if !database_groups.contains_key(&group) {
+                database_group_order.push(group.clone());
+            }
+            database_groups.entry(group).or_default().push(message);
+        }
+        for group in database_group_order {
+            let group_messages = database_groups.remove(&group).unwrap_or_default();
+            if !group_candidates.contains_key(&group) {
+                group_order.push(group.clone());
+            }
+            group_candidates
+                .entry(group)
+                .or_default()
+                .push(group_messages);
+        }
+    }
+
+    let mut selected = Vec::new();
+    for group in group_order {
+        let candidates = group_candidates.remove(&group).unwrap_or_default();
+        let best = candidates.first().map_or(0, |baseline| {
+            let mut best_index = 0;
+            let mut best_coverage = hermes_candidate_day_coverage(baseline);
+            for (index, messages) in candidates.iter().enumerate().skip(1) {
+                if !hermes_candidates_have_same_usage(baseline, messages) {
+                    continue;
+                }
+                let coverage = hermes_candidate_day_coverage(messages);
+                if coverage > best_coverage {
+                    best_index = index;
+                    best_coverage = coverage;
+                }
+            }
+            best_index
+        });
+        if let Some(messages) = candidates.into_iter().nth(best) {
+            selected.extend(messages);
+        }
+    }
+
+    let mut counted_sessions = HashSet::new();
+    for message in &mut selected {
+        message.message_count = if counted_sessions.insert(message.session_id.clone()) {
+            session_message_counts
+                .get(&message.session_id)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+    }
+    selected
+}
+
 fn parse_hermes_sqlite_with_pricing(
     db_path: &Path,
     pricing: Option<&pricing::PricingService>,
+    bucket_timezone: &bucket_tz::BucketTimezone,
 ) -> Vec<UnifiedMessage> {
-    sessions::hermes::parse_hermes_sqlite(db_path)
+    sessions::hermes::parse_hermes_sqlite_in(db_path, bucket_timezone)
         .into_iter()
         .map(|mut msg| {
             if msg.cost <= 0.0 {
@@ -5988,6 +6532,7 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
                 .collect::<Vec<_>>()
         })
         .collect();
+    copilot_unified_msgs = sessions::copilot::merge_copilot_messages(copilot_unified_msgs);
     let copilot_otel_sessions: HashSet<String> = copilot_unified_msgs
         .iter()
         .map(|message| message.session_id.clone())
@@ -6232,6 +6777,23 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
         inspected_codex_files,
         codex_archive_failures,
     );
+
+    let aside_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::Aside)
+        .par_iter()
+        .flat_map(|path| sessions::aside::parse_aside_file(path))
+        .collect();
+    let mut aside_seen = HashSet::new();
+    let aside_msgs: Vec<ParsedMessage> = aside_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut aside_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    counts.set(
+        ClientId::Aside,
+        i32::try_from(aside_msgs.len()).unwrap_or(i32::MAX),
+    );
+    messages.extend(aside_msgs);
 
     // Pi branch/fork copies prior assistant records into a new session file
     // (#1306); the parser stamps cross-session keys, drop the copies here too
@@ -6538,6 +7100,21 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Muse, muse_count);
     messages.extend(muse_msgs);
 
+    let vibe_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::Vibe)
+        .par_iter()
+        .flat_map(|path| sessions::vibe::parse_vibe_file(path))
+        .collect();
+    let mut vibe_seen: HashSet<String> = HashSet::new();
+    let vibe_msgs: Vec<ParsedMessage> = vibe_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut vibe_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let vibe_count = summed_parsed_message_count(&vibe_msgs);
+    counts.set(ClientId::Vibe, vibe_count);
+    messages.extend(vibe_msgs);
+
     let mcode_raw: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Mcode)
         .par_iter()
@@ -6699,12 +7276,17 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
 
     let hermes_db_paths = scan_result.hermes_db_paths();
     if !hermes_db_paths.is_empty() {
-        let mut hermes_seen: HashSet<String> = HashSet::new();
-        let hermes_msgs: Vec<ParsedMessage> = hermes_db_paths
+        let hermes_bucket_timezone =
+            bucket_tz::BucketTimezone::from_scanner_settings(&options.scanner_settings);
+        let hermes_databases = hermes_db_paths
             .iter()
-            .flat_map(|db_path| sessions::hermes::parse_hermes_sqlite(db_path))
-            .filter(|msg| should_keep_deduped_message(&mut hermes_seen, msg))
-            .map(|msg| unified_to_parsed(&msg))
+            .map(|db_path| {
+                sessions::hermes::parse_hermes_sqlite_in(db_path, &hermes_bucket_timezone)
+            })
+            .collect();
+        let hermes_msgs: Vec<ParsedMessage> = select_best_covered_hermes_groups(hermes_databases)
+            .iter()
+            .map(unified_to_parsed)
             .collect();
         let count = summed_parsed_message_count(&hermes_msgs);
         counts.set(ClientId::Hermes, count);
@@ -7234,30 +7816,31 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
         parent_session_id: None,
         is_turn_start: false,
         model_attribution_conflicted: false,
+        copilot_context: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_by_date, aggregate_hourly_usage_entries, aggregate_model_usage_entries,
+        aggregate_by_date_v2, aggregate_hourly_usage_entries, aggregate_model_usage_entries,
         aggregate_monthly_usage_v2_entries, apply_pricing_if_available, build_graph_from_messages,
         calculate_cost_with_service_tier, dedupe_antigravity_family_messages,
         dedupe_latest_trae_messages, filter_messages_for_report,
         generate_graph_with_loaded_pricing, get_home_dir_string, is_generic_routing_label,
-        merge_claude_cross_file_duplicate, message_cache, message_passes_report_filter,
-        normalize_model_for_grouping, opencode_json_superseded_by_sqlite,
-        parse_all_messages_with_pricing_with_cache_policy,
+        merge_claude_cross_file_duplicate, merge_copilot_rows_in_place, message_cache,
+        message_passes_report_filter, normalize_model_for_grouping, normalize_syntactic,
+        opencode_json_superseded_by_sqlite, parse_all_messages_with_pricing_with_cache_policy,
         parse_all_messages_with_pricing_with_env_strategy, parse_local_clients,
         parse_local_unified_messages, parse_local_unified_messages_deferred, parsed_to_unified,
         paths, prepare_submission_pricing, pricing, retain_for_requested_clients, scanner,
-        select_local_parse_pricing, sessions, unified_to_parsed, validate_priced_messages,
-        ClientId, GraphPricingRequirement, GraphSink, GroupBy, LocalParseOptions, MessageSink,
-        MonthlyReportV2, MonthlyUsage, MonthlyUsageV2, ReportOptions, SourceCachePolicy,
-        TokenBreakdown, UnifiedMessage, UnpricedSubmissionUsage, AMBIGUOUS_MODEL_PRICING_REASON,
-        GRAPH_SINK_BATCH, INCOMPLETE_MODEL_PRICING_REASON, MISSING_MODEL_PRICING_REASON,
-        ROUTING_LABEL_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL, UNVERIFIED_MODEL_IDENTITY_REASON,
-        UNVERIFIED_PROVIDER_IDENTITY_REASON,
+        select_best_covered_hermes_groups, select_local_parse_pricing, sessions, unified_to_parsed,
+        validate_priced_messages, ClientId, GraphPricingRequirement, GraphSink, GroupBy,
+        LocalParseOptions, MessageSink, MonthlyReportV2, MonthlyUsage, MonthlyUsageV2,
+        ReportOptions, SourceCachePolicy, TokenBreakdown, UnifiedMessage, UnpricedSubmissionUsage,
+        AMBIGUOUS_MODEL_PRICING_REASON, GRAPH_SINK_BATCH, INCOMPLETE_MODEL_PRICING_REASON,
+        MISSING_MODEL_PRICING_REASON, ROUTING_LABEL_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL,
+        UNVERIFIED_MODEL_IDENTITY_REASON, UNVERIFIED_PROVIDER_IDENTITY_REASON,
     };
     // Kept as its own statement rather than folded into the list above: that list
     // is edited by nearly every PR that touches this file, and sharing it made
@@ -7483,11 +8066,508 @@ mod tests {
 
         assert_eq!(unique.len(), 3);
         assert_eq!(unique[0].client, "antigravity-cli");
-        let daily = aggregate_by_date(unique);
+        let daily = aggregate_by_date_v2(unique);
         assert_eq!(daily.len(), 1);
         assert_eq!(daily[0].totals.tokens, 146);
         assert_eq!(daily[0].token_breakdown.input, 120);
         assert_eq!(daily[0].token_breakdown.output, 26);
+    }
+
+    #[test]
+    fn copilot_merge_leaves_other_clients_untouched_in_a_shared_buffer() {
+        // The streaming tail drains the buffer right before the Copilot lane,
+        // so in practice only Copilot rows are present. Pin the guarantee
+        // anyway: a lane that later buffers its rows ahead of Copilot must not
+        // have them reordered, merged, or repriced by the Copilot comparator,
+        // even when they collide on a dedup key.
+        let copilot_row = |input: i64, output: i64| {
+            let mut message = UnifiedMessage::new_with_dedup(
+                "copilot",
+                "gpt-4o",
+                "openai",
+                "copilot-session",
+                1_775_934_260_000,
+                TokenBreakdown {
+                    input,
+                    output,
+                    ..Default::default()
+                },
+                0.0,
+                Some("shared-key".to_string()),
+            );
+            message.copilot_context = Some(sessions::copilot::CopilotContextProvenance {
+                model: sessions::copilot::ContextOrigin::Record,
+                session: sessions::copilot::ContextOrigin::Record,
+                agent: sessions::copilot::ContextOrigin::Missing,
+            });
+            message
+        };
+        let foreign_row = |client: &str, session: &str, input: i64| {
+            UnifiedMessage::new_with_dedup(
+                client,
+                "claude-sonnet-4",
+                "anthropic",
+                session,
+                1_775_934_260_000,
+                TokenBreakdown {
+                    input,
+                    ..Default::default()
+                },
+                0.0,
+                Some("shared-key".to_string()),
+            )
+        };
+
+        let mut buffer = vec![
+            foreign_row("claude", "claude-b", 7),
+            copilot_row(1000, 20),
+            foreign_row("claude", "claude-a", 5),
+            copilot_row(1000, 10),
+        ];
+        merge_copilot_rows_in_place(&mut buffer);
+
+        let foreign: Vec<_> = buffer
+            .iter()
+            .filter(|message| message.client != "copilot")
+            .collect();
+        assert_eq!(
+            foreign.len(),
+            2,
+            "same-key rows from another client must not be merged away"
+        );
+        assert_eq!(
+            foreign
+                .iter()
+                .map(|message| message.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["claude-b", "claude-a"],
+            "foreign rows must keep their buffer order"
+        );
+        assert_eq!(foreign[0].tokens.input, 7);
+        assert_eq!(foreign[1].tokens.input, 5);
+
+        let copilot: Vec<_> = buffer
+            .iter()
+            .filter(|message| message.client == "copilot")
+            .collect();
+        assert_eq!(copilot.len(), 1, "the Copilot snapshots still coalesce");
+        assert_eq!(copilot[0].tokens.input, 1000);
+        assert_eq!(copilot[0].tokens.output, 20);
+    }
+
+    #[test]
+    fn copilot_merge_in_place_is_a_no_op_without_copilot_rows() {
+        let row = |session: &str| {
+            UnifiedMessage::new_with_dedup(
+                "claude",
+                "claude-sonnet-4",
+                "anthropic",
+                session,
+                1_775_934_260_000,
+                TokenBreakdown::default(),
+                0.0,
+                Some("shared-key".to_string()),
+            )
+        };
+        let original = vec![row("second"), row("first")];
+        let mut buffer = original.clone();
+        merge_copilot_rows_in_place(&mut buffer);
+        assert_eq!(buffer, original);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn copilot_rotation_missing_context_merges_in_all_lanes() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let otel = source_home.path().join(".copilot/otel");
+        std::fs::create_dir_all(&otel).unwrap();
+        let usage = serde_json::json!({
+            "type": "span", "traceId": "rotation-trace", "spanId": "chat-span",
+            "name": "chat", "startTime": [1775934260i64, 0],
+            "attributes": {"gen_ai.operation.name": "chat",
+                "gen_ai.usage.input_tokens": 100, "gen_ai.usage.output_tokens": 20}
+        })
+        .to_string();
+        let context = serde_json::json!({
+            "type": "span", "traceId": "rotation-trace", "spanId": "invoke-span",
+            "name": "invoke_agent", "attributes": {
+                "gen_ai.operation.name": "invoke_agent", "gen_ai.request.model": "gpt-4o",
+                "gen_ai.conversation.id": "real-session", "gen_ai.agent.id": "root-agent"}
+        })
+        .to_string();
+        let rich = format!("{usage}\n{context}\n");
+        let clients = ["copilot".to_string()];
+        for (a, b) in [(&usage, &rich), (&rich, &usage)] {
+            std::fs::write(otel.join("a.jsonl"), a).unwrap();
+            std::fs::write(otel.join("b.jsonl"), b).unwrap();
+            for _ in 0..2 {
+                let messages = parse_all_messages_with_pricing_with_env_strategy(
+                    source_home.path().to_str().unwrap(),
+                    &clients,
+                    None,
+                    false,
+                    &scanner::ScannerSettings::default(),
+                );
+                assert_eq!(
+                    messages.len(),
+                    1,
+                    "cold and warm rotation snapshots must coalesce"
+                );
+                assert_eq!(messages[0].model_id, "gpt-4o");
+                assert_eq!(messages[0].provider_id, "openai");
+                assert_eq!(messages[0].session_id, "real-session");
+                assert_eq!(messages[0].agent.as_deref(), Some("root-agent"));
+                assert_eq!(messages[0].tokens.input, 100);
+            }
+            let parsed = parse_local_clients(LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(clients.to_vec()),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+            })
+            .unwrap();
+            assert_eq!(parsed.messages.len(), 1);
+            assert_eq!(parsed.messages[0].input, 100);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn copilot_cross_file_snapshots_merge_in_cached_and_direct_lanes() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let otel = source_home.path().join(".copilot/otel");
+        std::fs::create_dir_all(&otel).unwrap();
+        let snapshot = |input, output, cache_read, cache_write, reasoning| {
+            serde_json::json!({
+                "type": "span", "traceId": "rotation-trace", "spanId": "rotation-span",
+                "name": "chat gpt-4o", "startTime": [1775934260i64, 0],
+                "attributes": {
+                    "gen_ai.operation.name": "chat", "gen_ai.response.model": "gpt-4o",
+                    "gen_ai.conversation.id": "rotation-session",
+                    "gen_ai.usage.input_tokens": input, "gen_ai.usage.output_tokens": output,
+                    "gen_ai.usage.cache_read.input_tokens": cache_read,
+                    "gen_ai.usage.cache_write.input_tokens": cache_write,
+                    "gen_ai.usage.reasoning_tokens": reasoning
+                }
+            })
+            .to_string()
+        };
+        let first = snapshot(1000, 20, 0, 40, 5);
+        let second = snapshot(1000, 10, 500, 20, 10);
+        let clients = ["copilot".to_string()];
+        let pricing = pricing::PricingService::new(
+            HashMap::from([(
+                "gpt-4o".to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(1e-6),
+                    output_cost_per_token: Some(2e-6),
+                    cache_read_input_token_cost: Some(2e-7),
+                    cache_creation_input_token_cost: Some(1.5e-6),
+                    ..Default::default()
+                },
+            )]),
+            HashMap::new(),
+        );
+        for (a, b) in [(&first, &second), (&second, &first)] {
+            std::fs::write(otel.join("a.jsonl"), a).unwrap();
+            std::fs::write(otel.join("b.jsonl"), b).unwrap();
+            let cold = parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                Some(&pricing),
+                false,
+                &scanner::ScannerSettings::default(),
+            );
+            let warm = parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                Some(&pricing),
+                false,
+                &scanner::ScannerSettings::default(),
+            );
+            assert_eq!(cold, warm);
+            assert_eq!(
+                cold.len(),
+                1,
+                "the same trace/span across files is one message"
+            );
+            assert_eq!(
+                cold[0].tokens,
+                TokenBreakdown {
+                    input: 500,
+                    output: 20,
+                    cache_read: 500,
+                    cache_write: 40,
+                    cache_write_1h: 0,
+                    reasoning: 10,
+                }
+            );
+            let expected_cost =
+                pricing.calculate_cost_with_provider("gpt-4o", Some("openai"), &cold[0].tokens);
+            assert!(expected_cost > 0.0);
+            assert_eq!(cold[0].cost, expected_cost);
+            let cache = message_cache::SourceMessageCache::load();
+            for path in [otel.join("a.jsonl"), otel.join("b.jsonl")] {
+                let entry = cache
+                    .get(
+                        message_cache::CacheIdentity::for_client(ClientId::Copilot),
+                        &path,
+                    )
+                    .unwrap();
+                assert_eq!(entry.messages.len(), 1);
+                assert_eq!(
+                    entry.messages[0].tokens,
+                    sessions::copilot::parse_copilot_file(&path)[0].tokens
+                );
+            }
+            let parsed = parse_local_clients(LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(clients.to_vec()),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+            })
+            .unwrap();
+            assert_eq!(parsed.counts.get(ClientId::Copilot), 1);
+            assert_eq!(parsed.messages.len(), 1);
+            assert_eq!(parsed.messages[0].input, 500);
+            assert_eq!(parsed.messages[0].output, 20);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn copilot_cross_file_span_identity_requires_trace_and_span_in_both_lanes() {
+        for operation in ["chat", "invoke_agent"] {
+            for (case, trace_a, span_a, trace_b, span_b, nested, expected_rows) in [
+                (
+                    "missing trace",
+                    None,
+                    Some("span"),
+                    None,
+                    Some("span"),
+                    false,
+                    2,
+                ),
+                (
+                    "empty trace",
+                    Some(""),
+                    Some("span"),
+                    Some(""),
+                    Some("span"),
+                    false,
+                    2,
+                ),
+                (
+                    "zero trace",
+                    Some("00000000000000000000000000000000"),
+                    Some("span"),
+                    Some("00000000000000000000000000000000"),
+                    Some("span"),
+                    false,
+                    2,
+                ),
+                (
+                    "nested span only",
+                    None,
+                    Some("span"),
+                    None,
+                    Some("span"),
+                    true,
+                    2,
+                ),
+                (
+                    "complete identity",
+                    Some("trace"),
+                    Some("span"),
+                    Some("trace"),
+                    Some("span"),
+                    false,
+                    1,
+                ),
+                (
+                    "nested complete identity",
+                    Some("trace"),
+                    Some("span"),
+                    Some("trace"),
+                    Some("span"),
+                    true,
+                    1,
+                ),
+                (
+                    "different traces",
+                    Some("trace-a"),
+                    Some("span"),
+                    Some("trace-b"),
+                    Some("span"),
+                    false,
+                    2,
+                ),
+                (
+                    "different spans",
+                    Some("trace"),
+                    Some("span-a"),
+                    Some("trace"),
+                    Some("span-b"),
+                    false,
+                    2,
+                ),
+                (
+                    "missing span",
+                    Some("trace"),
+                    None,
+                    Some("trace"),
+                    None,
+                    false,
+                    2,
+                ),
+                (
+                    "empty span",
+                    Some("trace"),
+                    Some(""),
+                    Some("trace"),
+                    Some(""),
+                    false,
+                    2,
+                ),
+                (
+                    "zero span",
+                    Some("trace"),
+                    Some("0000000000000000"),
+                    Some("trace"),
+                    Some("0000000000000000"),
+                    false,
+                    2,
+                ),
+            ] {
+                let cache_home = tempfile::TempDir::new().unwrap();
+                let source_home = tempfile::TempDir::new().unwrap();
+                let _cache_env = redirect_cache_home(cache_home.path());
+                let otel = source_home.path().join(".copilot/otel");
+                std::fs::create_dir_all(&otel).unwrap();
+                let record = |trace: Option<&str>, span: Option<&str>, input| {
+                    let mut record = serde_json::json!({
+                        "type": "span", "name": operation, "startTime": [1775934260i64, 0],
+                        "attributes": {"gen_ai.operation.name": operation, "gen_ai.response.model": "gpt-4o",
+                            "gen_ai.conversation.id": "same-session", "gen_ai.usage.input_tokens": input}
+                    });
+                    let mut context = serde_json::Map::new();
+                    if let Some(trace) = trace {
+                        context.insert("traceId".into(), trace.into());
+                    }
+                    if let Some(span) = span {
+                        context.insert("spanId".into(), span.into());
+                    }
+                    if nested {
+                        // Empty top-level sentinels must not mask valid nested IDs.
+                        record["traceId"] = "00000000000000000000000000000000".into();
+                        record["spanId"] = "0000000000000000".into();
+                        record["spanContext"] = context.into();
+                    } else {
+                        record.as_object_mut().unwrap().extend(context);
+                    }
+                    record.to_string()
+                };
+                std::fs::write(otel.join("a.jsonl"), record(trace_a, span_a, 100)).unwrap();
+                std::fs::write(otel.join("b.jsonl"), record(trace_b, span_b, 200)).unwrap();
+                let clients = ["copilot".to_string()];
+                let scan = || {
+                    parse_all_messages_with_pricing_with_env_strategy(
+                        source_home.path().to_str().unwrap(),
+                        &clients,
+                        None,
+                        false,
+                        &scanner::ScannerSettings::default(),
+                    )
+                };
+                let cold = scan();
+                let warm = scan();
+                let direct = parse_local_clients(LocalParseOptions {
+                    home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                    use_env_roots: false,
+                    clients: Some(clients.to_vec()),
+                    since: None,
+                    until: None,
+                    year: None,
+                    scanner_settings: scanner::ScannerSettings::default(),
+                })
+                .unwrap();
+                assert_eq!(cold, warm, "{operation}: {case}");
+                let expected = (expected_rows, if expected_rows == 1 { 200 } else { 300 });
+                assert_eq!(
+                    [
+                        (cold.len(), cold.iter().map(|m| m.tokens.input).sum::<i64>()),
+                        (warm.len(), warm.iter().map(|m| m.tokens.input).sum::<i64>()),
+                        (
+                            direct.messages.len(),
+                            direct.messages.iter().map(|m| m.input).sum::<i64>()
+                        ),
+                    ],
+                    [expected; 3],
+                    "{operation}: {case}; cold, warm, direct",
+                );
+                assert_eq!(direct.counts.get(ClientId::Copilot), expected_rows as i32);
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn copilot_cross_file_anonymous_rows_survive_cached_and_direct_lanes() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let otel = source_home.path().join(".copilot/otel");
+        std::fs::create_dir_all(&otel).unwrap();
+        let anonymous = r#"{"type":"span","traceId":"00000000000000000000000000000000","spanId":"0000000000000000","name":"chat gpt-4o","startTime":[1775934260,0],"attributes":{"gen_ai.operation.name":"chat","gen_ai.response.model":"gpt-4o","gen_ai.conversation.id":"session","gen_ai.usage.input_tokens":10}}"#;
+        std::fs::write(otel.join("a.jsonl"), format!("{anonymous}\n{anonymous}\n")).unwrap();
+        std::fs::write(otel.join("b.jsonl"), anonymous).unwrap();
+        let clients = ["copilot".to_string()];
+        let mut cold = None;
+        for _ in 0..2 {
+            let messages = parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+            );
+            assert_eq!(messages.len(), 3);
+            assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 30);
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter_map(|m| m.dedup_key.as_ref())
+                    .collect::<HashSet<_>>()
+                    .len(),
+                3
+            );
+            if let Some(cold) = &cold {
+                assert_eq!(&messages, cold);
+            }
+            cold = Some(messages);
+        }
+        let parsed = parse_local_clients(LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(clients.to_vec()),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+        })
+        .unwrap();
+        assert_eq!(parsed.counts.get(ClientId::Copilot), 3);
+        assert_eq!(parsed.messages.len(), 3);
     }
 
     #[test]
@@ -9267,13 +10347,17 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_model_for_grouping_handles_non_ascii_names() {
-        assert_eq!(normalize_model_for_grouping("按需模型"), "按需模型");
-        assert_eq!(
-            normalize_model_for_grouping("按需模型-20241022"),
-            "按需模型"
-        );
-        assert_eq!(normalize_model_for_grouping("-12345678"), "-12345678");
+    fn test_normalize_syntactic_handles_non_ascii_names() {
+        for (input, expected) in [
+            ("按需模型", "按需模型"),
+            ("按需模型-20241022", "按需模型"),
+            ("model-按需", "model-按需"),
+            ("🚀-20241022", "🚀"),
+            ("🚀-１２３４５６７８", "🚀-１２３４５６７８"),
+            ("-12345678", "-12345678"),
+        ] {
+            assert_eq!(normalize_syntactic(input), expected, "input: {input}");
+        }
     }
 
     #[test]
@@ -11326,6 +12410,206 @@ mod tests {
                 .as_deref()
                 .is_some_and(|k| k.contains(":tool_result:"))),
             "the phantom tool_result row must not survive the rebuild"
+        );
+    }
+
+    /// A Claude Code transcript that only grew since the last scan continues
+    /// from its checkpoint, also after the checkpoint went through a shard on
+    /// disk, and the result equals a cold scan of the same bytes. One that was
+    /// rewritten before it grew takes the full parse.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_grown_transcript_resumes_and_matches_a_cold_scan() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let cold_cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let mut env = redirect_cache_home(cache_home.path());
+
+        let claude_dir = client_scan_root(source_home.path(), ClientId::Claude).join("demo");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let path = claude_dir.join("session.jsonl");
+        let turn = |n: u32, output: u32| {
+            format!(
+                "{}\n{}\n",
+                format_args!(
+                    r#"{{"type":"user","timestamp":"2026-10-01T10:{n:02}:00.000Z","message":{{"role":"user","content":"turn {n}"}}}}"#
+                ),
+                format_args!(
+                    r#"{{"type":"assistant","timestamp":"2026-10-01T10:{n:02}:05.000Z","requestId":"req_{n}","message":{{"id":"msg_{n}","model":"claude-sonnet-4-5","usage":{{"input_tokens":10,"output_tokens":{output},"cache_read_input_tokens":100}}}}}}"#
+                ),
+            )
+        };
+        // The streamed completion of a response whose first line is already
+        // before the checkpoint.
+        let completion = |n: u32, output: u32| {
+            format!(
+                "{}\n",
+                format_args!(
+                    r#"{{"type":"assistant","timestamp":"2026-10-01T10:{n:02}:09.000Z","requestId":"req_{n}","message":{{"id":"msg_{n}","model":"claude-sonnet-4-5","usage":{{"input_tokens":10,"output_tokens":{output},"cache_read_input_tokens":100}}}}}}"#
+                ),
+            )
+        };
+        let append = |text: &str| {
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap();
+        };
+        let scan = || {
+            let mut messages = parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &["claude".to_string()],
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+            );
+            messages.sort_by(|left, right| left.dedup_key.cmp(&right.dedup_key));
+            messages
+                .into_iter()
+                .map(|message| {
+                    (
+                        message.dedup_key,
+                        message.timestamp,
+                        message.duration_ms,
+                        message.is_turn_start,
+                        message.tokens,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let resumes = || {
+            crate::CLAUDE_RESUMED_PATHS
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|resumed| resumed.ends_with("demo/session.jsonl"))
+                .filter(|resumed| resumed.starts_with(source_home.path()))
+                .count()
+        };
+        let cold_scans = std::cell::Cell::new(0);
+        let cold_scan = |env: &mut crate::paths::test_env::EnvGuard| {
+            // A fresh cache home each time, so nothing is warm.
+            cold_scans.set(cold_scans.get() + 1);
+            let cold_dir = cold_cache_home.path().join(cold_scans.get().to_string());
+            point_cache_home(env, &cold_dir);
+            let cold = scan();
+            point_cache_home(env, cache_home.path());
+            cold
+        };
+
+        std::fs::write(&path, format!("{}{}", turn(1, 5), turn(2, 1))).unwrap();
+        assert_eq!(scan().len(), 2, "seed scan");
+        assert_eq!(resumes(), 0);
+
+        append(&format!("{}{}", completion(2, 50), turn(3, 7)));
+        let warm = scan();
+        assert_eq!(
+            resumes(),
+            1,
+            "a grown transcript resumes from its checkpoint"
+        );
+        assert_eq!(
+            warm,
+            cold_scan(&mut env),
+            "the resumed scan equals a cold one"
+        );
+        assert_eq!(
+            warm.len(),
+            3,
+            "the streamed completion merges into its turn"
+        );
+
+        // Every scan above wrote its entry back, so this checkpoint was read
+        // from a shard on disk.
+        append(&format!("{}{}", turn(4, 9), completion(4, 90)));
+        let warm = scan();
+        assert_eq!(resumes(), 2, "the checkpoint survives the shard round trip");
+        assert_eq!(warm, cold_scan(&mut env));
+
+        // Rewritten in place, then grown: the full parse.
+        let rewritten = std::fs::read_to_string(&path).unwrap().replacen(
+            "\"output_tokens\":5,",
+            "\"output_tokens\":6,",
+            1,
+        );
+        std::fs::write(&path, rewritten).unwrap();
+        append(&turn(5, 3));
+        let warm = scan();
+        assert_eq!(resumes(), 2, "a rewritten transcript does not resume");
+        assert_eq!(warm, cold_scan(&mut env));
+    }
+
+    /// A subagent transcript takes its name from its `.meta.json` sidecar, so
+    /// when the sidecar changed as the transcript grew, the messages before
+    /// the checkpoint change too and the transcript is parsed in full.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_grown_transcript_with_a_changed_sidecar_is_parsed_in_full() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let cold_cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let mut env = redirect_cache_home(cache_home.path());
+
+        let claude_dir = client_scan_root(source_home.path(), ClientId::Claude).join("demo");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let path = claude_dir.join("agent-sidecar1.jsonl");
+        let meta = claude_dir.join("agent-sidecar1.meta.json");
+        let line = |n: u32| {
+            format!(
+                "{}\n",
+                format_args!(
+                    r#"{{"type":"assistant","isSidechain":true,"sessionId":"parent-1","agentId":"sidecar1","timestamp":"2026-10-01T10:{n:02}:05.000Z","requestId":"req_{n}","message":{{"id":"msg_{n}","model":"claude-sonnet-4-5","usage":{{"input_tokens":10,"output_tokens":5}}}}}}"#
+                ),
+            )
+        };
+        let scan = || {
+            let mut messages = parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &["claude".to_string()],
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+            );
+            messages.sort_by(|left, right| left.dedup_key.cmp(&right.dedup_key));
+            messages
+                .into_iter()
+                .map(|message| (message.dedup_key, message.agent, message.tokens))
+                .collect::<Vec<_>>()
+        };
+
+        std::fs::write(&meta, r#"{"agentType":"explorer"}"#).unwrap();
+        std::fs::write(&path, line(1)).unwrap();
+        let seed = scan();
+        assert_eq!(seed.len(), 1, "seed scan");
+
+        std::fs::write(&meta, r#"{"agentType":"reviewer"}"#).unwrap();
+        {
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(line(2).as_bytes())
+                .unwrap();
+        }
+        let warm = scan();
+
+        point_cache_home(&mut env, cold_cache_home.path());
+        let cold = scan();
+        point_cache_home(&mut env, cache_home.path());
+        assert_eq!(cold.len(), 2);
+        assert_ne!(cold[0].1, seed[0].1, "the rename reaches a cold scan");
+        assert_eq!(warm, cold, "both messages carry the renamed agent");
+        assert!(
+            !crate::CLAUDE_RESUMED_PATHS
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|resumed| resumed.starts_with(source_home.path())),
+            "a changed sidecar takes the full parse"
         );
     }
 
@@ -16585,6 +17869,250 @@ mod tests {
     }
 
     #[test]
+    fn graph_sink_preserves_pricing_origin_without_changing_message_layout() {
+        use crate::{CostProvenance, EstimateSource};
+        use std::time::Instant;
+        let rate = pricing::ModelPricing {
+            input_cost_per_token: Some(0.001),
+            ..Default::default()
+        };
+        let pricing = pricing::PricingService::new_with_custom(
+            pricing::custom::CustomPricing::from_models(HashMap::from([
+                ("custom-model".into(), rate.clone()),
+                (
+                    "custom-free".into(),
+                    pricing::ModelPricing {
+                        input_cost_per_token: Some(0.0),
+                        ..Default::default()
+                    },
+                ),
+            ])),
+            HashMap::from([("catalog-model".into(), rate)]),
+            HashMap::new(),
+        )
+        .with_cost_provenance_capture();
+        let cases = [
+            ("custom-model", "test", "openai", EstimateSource::Custom),
+            ("custom-free", "test", "openai", EstimateSource::Custom),
+            ("catalog-model", "test", "openai", EstimateSource::Catalog),
+            (
+                "catalog-model",
+                "zed",
+                sessions::zed::ZED_HOSTED_PROVIDER,
+                EstimateSource::Catalog,
+            ),
+        ];
+        for (model, client, provider, source) in cases {
+            let mut message = UnifiedMessage::new(
+                client,
+                model,
+                provider,
+                "session",
+                1_736_510_400_000,
+                TokenBreakdown {
+                    input: 100,
+                    ..Default::default()
+                },
+                0.0,
+            );
+            apply_pricing_if_available(&mut message, Some(&pricing));
+            let expected_cost = message.cost;
+            let calculations = pricing.detailed_calculation_count();
+            let graph = build_graph_from_messages(
+                vec![message],
+                Some(&pricing),
+                GraphPricingRequirement::Lenient,
+                Instant::now(),
+                &crate::bucket_tz::BucketTimezone::Local,
+            )
+            .unwrap();
+            assert_eq!(
+                pricing.detailed_calculation_count(),
+                calculations,
+                "graph folding must reuse the original pricing result"
+            );
+            let expected = CostProvenance::estimated(source);
+            assert_eq!(graph.summary.total_cost, expected_cost);
+            assert_eq!(graph.summary.cost_provenance(), expected);
+            assert_eq!(graph.years[0].cost_provenance(), expected);
+            assert_eq!(graph.contributions[0].totals.cost_provenance(), expected);
+            assert_eq!(
+                graph.contributions[0].clients[0].cost_provenance(),
+                expected
+            );
+        }
+
+        // A historical estimate cannot be labeled with a rate source just
+        // because the current catalog can also resolve its model.
+        let mut retained = UnifiedMessage::new(
+            "test",
+            "catalog-model",
+            "openai",
+            "retained",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 100,
+                ..Default::default()
+            },
+            2.0,
+        );
+        retained.mark_estimated_cost();
+        let graph = build_graph_from_messages(
+            vec![retained],
+            Some(&pricing),
+            GraphPricingRequirement::Lenient,
+            Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .unwrap();
+        assert_eq!(graph.summary.total_cost, 2.0);
+        assert_eq!(
+            graph.summary.cost_provenance(),
+            CostProvenance::estimated(EstimateSource::Unknown)
+        );
+    }
+
+    #[test]
+    fn captured_origins_survive_gateway_normalization_and_recovery() {
+        use super::{
+            flush_lane, recovery, CostProvenance, EstimateSource, FlushContext,
+            GraphMessageCollector,
+        };
+        use std::time::Instant;
+        let pricing = pricing::PricingService::new_with_custom(
+            pricing::custom::CustomPricing::from_models(HashMap::from([(
+                "hf:deepseek-ai/DeepSeek-V3-0324".into(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.001),
+                    ..Default::default()
+                },
+            )])),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let scan = pricing.with_cost_provenance_capture();
+        let other_scan = pricing.with_cost_provenance_capture();
+        let mut message = UnifiedMessage::new(
+            "opencode",
+            "hf:deepseek-ai/DeepSeek-V3-0324",
+            "unknown",
+            "native",
+            1_736_510_400_000,
+            TokenBreakdown {
+                input: 100,
+                ..Default::default()
+            },
+            0.0,
+        );
+        apply_pricing_if_available(&mut message, Some(&scan));
+        assert_eq!(other_scan.take_cost_estimate_source(&message), None);
+        // A repeated pricing observation dropped by deduplication must not
+        // survive the lane boundary and classify a historical row later.
+        apply_pricing_if_available(&mut message, Some(&scan));
+        let mut collector = GraphMessageCollector::default();
+        let context = FlushContext {
+            pricing: Some(&scan),
+            include_all: true,
+            requested: HashSet::new(),
+            include_synthetic: true,
+            timezone: Some(crate::bucket_tz::BucketTimezone::Local),
+        };
+        flush_lane(&mut vec![message.clone()], &context, &mut collector);
+        assert_eq!(scan.take_cost_estimate_source(&message), None);
+        assert_eq!(collector.messages[0].model_id, "deepseek-v3-0324");
+        assert_eq!(collector.messages[0].provider_id, "synthetic");
+        let mut recovered = collector.messages[0].clone();
+        recovered.session_id = "archived".into();
+        recovered.timestamp += 1;
+        recovered.dedup_key = Some("archived-request".into());
+        // Same amount as the current custom estimate, but no original rate
+        // metadata: equality must not invent a historical pricing origin.
+        recovery::merge(&mut collector.messages, vec![recovered], vec![], |_| true);
+        assert_eq!(collector.messages.len(), 2);
+        let calculations = scan.detailed_calculation_count();
+        let mut sink = GraphSink::new(None, Some(&scan), GraphPricingRequirement::Lenient);
+        for message in collector.messages {
+            let source = collector.cost_estimates.take(&message);
+            if message.session_id == "native" {
+                assert_eq!(source, Some(EstimateSource::Custom));
+            } else {
+                assert_eq!(source, None);
+            }
+            sink.accept_with_estimate_source(message, source);
+        }
+        let graph = sink
+            .finish(Instant::now(), &crate::bucket_tz::BucketTimezone::Local)
+            .unwrap();
+        assert_eq!(scan.detailed_calculation_count(), calculations);
+        assert_eq!(graph.summary.total_cost, 0.2);
+        assert_eq!(
+            graph.summary.cost_provenance(),
+            CostProvenance::estimated(EstimateSource::Mixed)
+        );
+    }
+
+    #[test]
+    fn captured_submission_origins_follow_retained_and_zeroed_costs() {
+        use super::{CostProvenance, EstimateSource};
+        use std::time::Instant;
+        let pricing = pricing::PricingService::new_with_custom(
+            pricing::custom::CustomPricing::from_models(HashMap::from([(
+                "model".into(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.001),
+                    ..Default::default()
+                },
+            )])),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .with_cost_provenance_capture();
+        let mut messages: Vec<_> = ["unsafe", "safe"]
+            .into_iter()
+            .map(|client| {
+                UnifiedMessage::new(
+                    client,
+                    "model",
+                    "provider",
+                    client,
+                    1_736_510_400_000,
+                    TokenBreakdown {
+                        input: 100,
+                        output: if client == "unsafe" { 10 } else { 0 },
+                        ..Default::default()
+                    },
+                    0.0,
+                )
+            })
+            .collect();
+        for message in &mut messages {
+            apply_pricing_if_available(message, Some(&pricing));
+        }
+        let graph = build_graph_from_messages(
+            messages,
+            Some(&pricing),
+            GraphPricingRequirement::Submission,
+            Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .unwrap();
+        let clients = &graph.contributions[0].clients;
+        let safe = clients.iter().find(|row| row.client == "safe").unwrap();
+        let unsafe_row = clients.iter().find(|row| row.client == "unsafe").unwrap();
+        assert_eq!(safe.cost, 0.1);
+        assert_eq!(
+            safe.cost_provenance(),
+            CostProvenance::estimated(EstimateSource::Custom)
+        );
+        assert_eq!(unsafe_row.cost, 0.0);
+        assert_eq!(unsafe_row.cost_provenance(), CostProvenance::unknown());
+        assert_eq!(
+            graph.summary.cost_provenance(),
+            CostProvenance::mixed(Some(EstimateSource::Custom))
+        );
+    }
+
+    #[test]
     fn submission_keeps_unpriced_tokens_and_marks_their_day_incomplete() {
         let message = UnifiedMessage::new(
             "opencode",
@@ -16731,7 +18259,7 @@ mod tests {
             0.0,
         );
 
-        // `None` is unreachable from `generate_submission_graph`, which always
+        // `None` is unreachable from `generate_submission_graph_v2`, which always
         // passes `Some(..)` because `PricingService::get_or_init` degrades every
         // failed source to an empty map rather than erroring. The reachable
         // shape of "no pricing dataset loaded" is a populated-with-nothing
@@ -19907,6 +21435,115 @@ mod tests {
     }
 
     #[test]
+    fn test_hermes_cross_database_selection_credits_session_count_once() {
+        let message = |model: &str, message_count: i32, split: bool| {
+            let mut message = UnifiedMessage::new(
+                "hermes",
+                model,
+                "anthropic",
+                "shared-session",
+                1_775_100_000_000,
+                TokenBreakdown {
+                    input: 10,
+                    ..Default::default()
+                },
+                0.01,
+            );
+            message.message_count = message_count;
+            message.dedup_key = Some(if split {
+                format!(
+                    "hermes:shared-session:{model}:anthropic:__hermes_logged_day_v1__:2026-04-01"
+                )
+            } else {
+                format!("hermes:shared-session:{model}:anthropic")
+            });
+            message
+        };
+
+        // Per-group selection would otherwise choose two zero-count secondary
+        // groups and lose the session count completely.
+        let lost = select_best_covered_hermes_groups(vec![
+            vec![message("model-a", 7, false), message("model-b", 0, true)],
+            vec![message("model-a", 0, true), message("model-b", 7, false)],
+        ]);
+        assert_eq!(lost.iter().map(|m| m.message_count).sum::<i32>(), 7);
+
+        // The opposite log placement would choose both databases' primary
+        // groups and double the same session count without normalization.
+        let doubled = select_best_covered_hermes_groups(vec![
+            vec![message("model-a", 7, true), message("model-b", 0, false)],
+            vec![message("model-a", 0, false), message("model-b", 7, true)],
+        ]);
+        assert_eq!(doubled.iter().map(|m| m.message_count).sum::<i32>(), 7);
+
+        // A day suffix is not enough to prove that a later database is the
+        // same authoritative row. Do not let a stale ten-token split replace
+        // the first database's complete thousand-token fallback.
+        let mut complete = message("model-a", 7, false);
+        complete.tokens.input = 1_000;
+        complete.cost = 1.0;
+        let stale_split = message("model-a", 7, true);
+        let mismatched = select_best_covered_hermes_groups(vec![vec![complete], vec![stale_split]]);
+        assert_eq!(mismatched.len(), 1);
+        assert_eq!(mismatched[0].tokens.input, 1_000);
+        assert_eq!(mismatched[0].cost, 1.0);
+        assert!(!sessions::hermes::message_is_day_split(&mismatched[0]));
+
+        // A fallback provider that looks like a date is still a bare key, not
+        // parser-owned day evidence.
+        let mut date_provider_fallback = message("model-a", 7, false);
+        date_provider_fallback.dedup_key =
+            Some("hermes:shared-session:model-a:2026-04-01".to_string());
+        assert!(!sessions::hermes::message_is_day_split(
+            &date_provider_fallback
+        ));
+
+        // Equal authoritative totals can have different surviving log ranges.
+        // A residual-only start day is emitted for identity and accounting but
+        // does not increase evidence coverage. Prefer two logged days over one.
+        let mut one_logged_day = message("model-a", 7, true);
+        one_logged_day.tokens.input = 4;
+        one_logged_day.cost = 0.004;
+        let mut residual_start_day = message("model-a", 0, true);
+        residual_start_day.tokens.input = 6;
+        residual_start_day.cost = 0.006;
+        residual_start_day.timestamp -= 86_400_000;
+        residual_start_day.dedup_key = Some(
+            "hermes:shared-session:model-a:anthropic:__hermes_residual_day_v1__:2026-03-31"
+                .to_string(),
+        );
+        assert!(sessions::hermes::message_is_day_split(&residual_start_day));
+        assert!(sessions::hermes::message_logged_day(&residual_start_day).is_none());
+
+        let mut broad_day_a = message("model-a", 7, true);
+        broad_day_a.tokens.input = 4;
+        broad_day_a.cost = 0.004;
+        let mut broad_day_b = message("model-a", 0, true);
+        broad_day_b.tokens.input = 6;
+        broad_day_b.cost = 0.006;
+        broad_day_b.timestamp += 86_400_000;
+        broad_day_b.dedup_key = Some(
+            "hermes:shared-session:model-a:anthropic:__hermes_logged_day_v1__:2026-04-02"
+                .to_string(),
+        );
+        let broader = select_best_covered_hermes_groups(vec![
+            vec![one_logged_day, residual_start_day],
+            vec![broad_day_a, broad_day_b],
+        ]);
+        assert_eq!(broader.len(), 2);
+        assert_eq!(broader.iter().map(|m| m.tokens.input).sum::<i64>(), 10);
+        assert_eq!(broader.iter().map(|m| m.message_count).sum::<i32>(), 7);
+        assert_eq!(
+            broader
+                .iter()
+                .filter_map(sessions::hermes::message_logged_day)
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn test_parse_local_clients_dedups_hermes_sessions_across_default_and_extra_dbs() {
         let temp_dir = tempfile::TempDir::new().unwrap();
 
@@ -19961,6 +21598,176 @@ mod tests {
         assert_eq!(parsed.messages[0].session_id, "shared-hermes-session");
         assert_eq!(parsed.messages[0].input, 100);
         assert_eq!(parsed.messages[0].output, 25);
+    }
+
+    /// One Hermes main-loop `API call #N` log line for the fixed test
+    /// model/provider, matching the `session_model_usage` rows
+    /// `insert_hermes_session` writes.
+    fn hermes_api_call_log_line(session: &str, call: i64, stamp: &str, input: i64) -> String {
+        let output = input / 4;
+        format!(
+            "{stamp} INFO [{session}] agent.conversation_loop: API call #{call}: model=claude-sonnet-4 provider=anthropic in={input} out={output} total={} latency=1.0s cache=0/{input} (0%) id=gen-{call}",
+            input + output
+        )
+    }
+
+    #[test]
+    fn test_parse_local_clients_dedups_hermes_split_group_across_default_and_extra_dbs() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+
+        // Default database: the session, plus agent logs that split it across
+        // two logged days (60 and 40 fresh input, 15 and 10 output — the row's
+        // totals exactly, so no residual share).
+        let default_dir = temp_dir.path().join(".hermes");
+        std::fs::create_dir_all(&default_dir).unwrap();
+        let default_db = default_dir.join("state.db");
+        let default_conn = create_hermes_sqlite_db(&default_db);
+        insert_hermes_session(
+            &default_conn,
+            "shared-hermes-session",
+            "claude-sonnet-4",
+            2,
+            100,
+            25,
+            0.07,
+        );
+        drop(default_conn);
+        let logs_dir = default_dir.join("logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        std::fs::write(
+            logs_dir.join("agent.log"),
+            format!(
+                "{}\n{}\n",
+                hermes_api_call_log_line("shared-hermes-session", 1, "2026-03-05 12:00:00,000", 60),
+                hermes_api_call_log_line("shared-hermes-session", 2, "2026-03-06 12:00:00,000", 40),
+            ),
+        )
+        .unwrap();
+
+        // Profile database: the same session again with no logs beside it, so
+        // it takes the whole-row fallback path.
+        let profile_dir = temp_dir.path().join(".hermes/profiles/director_planning");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let profile_db = profile_dir.join("state.db");
+        let profile_conn = create_hermes_sqlite_db(&profile_db);
+        insert_hermes_session(
+            &profile_conn,
+            "shared-hermes-session",
+            "claude-sonnet-4",
+            9,
+            999,
+            999,
+            9.99,
+        );
+        drop(profile_conn);
+
+        let mut extra_scan_paths = std::collections::BTreeMap::new();
+        extra_scan_paths.insert("hermes".to_string(), vec![profile_db]);
+        let parsed = parse_local_clients(LocalParseOptions {
+            home_dir: Some(temp_dir.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["hermes".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings {
+                extra_scan_paths,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+
+        // The default database's two split days survive; the profile copy of
+        // the same group is dropped whole instead of landing as an undeduped
+        // third row next to the day-suffixed keys.
+        assert_eq!(parsed.messages.len(), 2);
+        assert_eq!(parsed.messages.iter().map(|m| m.input).sum::<i64>(), 100);
+        assert_eq!(parsed.messages.iter().map(|m| m.output).sum::<i64>(), 25);
+        assert!(
+            (parsed.messages.iter().map(|m| m.cost).sum::<f64>() - 0.07).abs() < 1e-9,
+            "the split days must carry the row's cost, and only once"
+        );
+        assert_eq!(
+            parsed.messages.iter().map(|m| m.message_count).sum::<i32>(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_parse_local_clients_prefers_split_copy_when_fallback_db_comes_first() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+
+        // Default database: the session with no logs beside it, so it takes
+        // the whole-row fallback path and is parsed first.
+        let default_dir = temp_dir.path().join(".hermes");
+        std::fs::create_dir_all(&default_dir).unwrap();
+        let default_db = default_dir.join("state.db");
+        let default_conn = create_hermes_sqlite_db(&default_db);
+        insert_hermes_session(
+            &default_conn,
+            "shared-hermes-session",
+            "claude-sonnet-4",
+            2,
+            100,
+            25,
+            0.07,
+        );
+        drop(default_conn);
+
+        // Profile database: the same session again, this time WITH logs that
+        // split it across two days. It is parsed second, so a first-wins
+        // dedup would keep the fallback and strand the later days on the
+        // start day — the bug this guards.
+        let profile_dir = temp_dir.path().join(".hermes/profiles/director_planning");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let profile_db = profile_dir.join("state.db");
+        let profile_conn = create_hermes_sqlite_db(&profile_db);
+        insert_hermes_session(
+            &profile_conn,
+            "shared-hermes-session",
+            "claude-sonnet-4",
+            2,
+            100,
+            25,
+            0.07,
+        );
+        drop(profile_conn);
+        let logs_dir = profile_dir.join("logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        std::fs::write(
+            logs_dir.join("agent.log"),
+            format!(
+                "{}\n{}\n",
+                hermes_api_call_log_line("shared-hermes-session", 1, "2026-03-05 12:00:00,000", 60),
+                hermes_api_call_log_line("shared-hermes-session", 2, "2026-03-06 12:00:00,000", 40),
+            ),
+        )
+        .unwrap();
+
+        let mut extra_scan_paths = std::collections::BTreeMap::new();
+        extra_scan_paths.insert("hermes".to_string(), vec![profile_db]);
+        let parsed = parse_local_clients(LocalParseOptions {
+            home_dir: Some(temp_dir.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["hermes".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings {
+                extra_scan_paths,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+
+        // The better-covered copy wins regardless of database order.
+        assert_eq!(parsed.messages.len(), 2);
+        assert_eq!(parsed.messages.iter().map(|m| m.input).sum::<i64>(), 100);
+        assert_eq!(parsed.messages.iter().map(|m| m.output).sum::<i64>(), 25);
+        assert!(
+            (parsed.messages.iter().map(|m| m.cost).sum::<f64>() - 0.07).abs() < 1e-9,
+            "the split days must carry the row's cost, and only once"
+        );
     }
 
     #[test]

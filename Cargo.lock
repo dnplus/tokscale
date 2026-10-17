@@ -3285,6 +3285,7 @@ dependencies = [
  "image",
  "imageproc",
  "indicatif",
+ "libc",
  "pbkdf2",
  "predicates",
  "qrcode",
