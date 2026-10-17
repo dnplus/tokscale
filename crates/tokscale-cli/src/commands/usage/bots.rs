@@ -5,7 +5,7 @@ use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use tokscale_core::{
-    sessions::cursor::{account_id_from_cursor_cache_path, CursorUsageRecord},
+    sessions::cursor::{account_id_from_cursor_cache_path, CursorUsageRecord, TokenUsageCoverage},
     TokenBreakdown,
 };
 
@@ -22,6 +22,7 @@ struct Row {
     distinct_conversations: usize,
     tokens: TokenBreakdown,
     missing_token_usage_calls: usize,
+    partial_token_usage_calls: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -32,6 +33,7 @@ struct Breakdown {
     cost_24h_usd: f64,
     tokens: TokenBreakdown,
     missing_token_usage_calls: usize,
+    partial_token_usage_calls: usize,
     excluded_calls: usize,
     excluded_cost_usd: f64,
 }
@@ -49,6 +51,7 @@ fn summarize(events: &[CursorUsageRecord], now: DateTime<Utc>, start: DateTime<U
         cost_24h_usd: 0.0,
         tokens: TokenBreakdown::default(),
         missing_token_usage_calls: 0,
+        partial_token_usage_calls: 0,
         excluded_calls: 0,
         excluded_cost_usd: 0.0,
     };
@@ -80,12 +83,18 @@ fn summarize(events: &[CursorUsageRecord], now: DateTime<Utc>, start: DateTime<U
         row.id = group.to_string();
         row.calls += 1;
         row.cost_usd += cost;
-        if record.has_token_usage {
-            row.tokens += &event.tokens;
-            result.tokens += &event.tokens;
-        } else {
-            row.missing_token_usage_calls += 1;
-            result.missing_token_usage_calls += 1;
+        row.tokens += &event.tokens;
+        result.tokens += &event.tokens;
+        match record.token_usage_coverage {
+            TokenUsageCoverage::Missing => {
+                row.missing_token_usage_calls += 1;
+                result.missing_token_usage_calls += 1;
+            }
+            TokenUsageCoverage::Partial => {
+                row.partial_token_usage_calls += 1;
+                result.partial_token_usage_calls += 1;
+            }
+            TokenUsageCoverage::Complete => {}
         }
         conversations.insert(event.session_id.clone());
         result.calls += 1;
@@ -402,6 +411,12 @@ fn render(account: &AccountReport) {
             row.tokens.cache_read,
             row.tokens.cache_write
         );
+        if row.partial_token_usage_calls > 0 {
+            println!(
+                "    Partial token data: {} calls",
+                row.partial_token_usage_calls
+            );
+        }
         if row.missing_token_usage_calls > 0 {
             println!(
                 "    Missing token data: {} calls",
@@ -421,8 +436,8 @@ fn render(account: &AccountReport) {
         data.tokens.cache_write
     );
     println!(
-        "  Missing token data: {} calls (token columns sum known data only)",
-        data.missing_token_usage_calls
+        "  Missing token data: {} calls; partial token data: {} calls (token columns sum reported counts only; omitted fields are unknown)",
+        data.missing_token_usage_calls, data.partial_token_usage_calls
     );
     print!("  Last 24h: ${:.2}", data.cost_24h_usd);
     match &account.burn_rate {
@@ -495,6 +510,34 @@ mod tests {
         assert_eq!(data.excluded_cost_usd, 0.4);
         assert!((data.rows.iter().map(|r| r.share_percent).sum::<f64>() - 100.0).abs() < 1e-9);
         assert_eq!(data.rows[0].id, bot);
+    }
+
+    #[test]
+    fn report_preserves_partial_counts_and_distinguishes_zero() {
+        let now = time("2026-10-08T06:00:00Z");
+        let rows: Vec<_> = [
+            serde_json::json!({}),
+            serde_json::json!({"totalCents": 25}),
+            serde_json::json!({"inputTokens": 7}),
+            serde_json::json!({"inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0, "cacheWriteTokens": 0}),
+        ].into_iter().map(|tokens| serde_json::json!({
+            "timestamp": now.timestamp_millis(),
+            "model": "grok-bot-default",
+            "conversationId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "tokenUsage": tokens,
+        })).collect();
+        let records = parse_cursor_usage_records(
+            &serde_json::json!({"usageEventsDisplay": rows}).to_string(),
+            "work",
+        );
+        let data = summarize(&records, now, now - Duration::days(7));
+        let json = serde_json::to_value(&data).unwrap();
+        assert_eq!(json["calls"], 4);
+        assert_eq!(json["tokens"]["input"], 7);
+        assert_eq!(json["missing_token_usage_calls"], 2);
+        assert_eq!(json["partial_token_usage_calls"], 1);
+        assert_eq!(json["rows"][0]["missing_token_usage_calls"], 2);
+        assert_eq!(json["rows"][0]["partial_token_usage_calls"], 1);
     }
 
     #[test]
@@ -578,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_automation_ids_and_zero_tokens_remain_subtasks() {
+    fn empty_automation_ids_and_unknown_tokens_remain_subtasks() {
         let events = parse_cursor_usage_records(&serde_json::json!({"usageEventsDisplay": [
             {"timestamp": "1791417600000", "model": "gpt-5", "conversationId": "sand-subagent-11111111-2222-3333-4444-555555555555", "automationId": " ", "tokenUsage": {}},
             {"timestamp": "1791417600000", "model": "grok-4", "conversationId": "bbbbbbbb-cccc-dddd-eeee-ffffffffffff", "automationId": "ordinary-cursor"}
@@ -589,7 +632,7 @@ mod tests {
         assert_eq!(data.excluded_calls, 1);
         assert_eq!(data.rows[0].id, "subtasks");
         assert_eq!(data.tokens, TokenBreakdown::default());
-        assert_eq!(data.missing_token_usage_calls, 0);
+        assert_eq!(data.missing_token_usage_calls, 1);
     }
 
     #[test]
@@ -652,6 +695,7 @@ mod tests {
             cost_24h_usd: 24.0,
             tokens: TokenBreakdown::default(),
             missing_token_usage_calls: 0,
+            partial_token_usage_calls: 0,
             excluded_calls: 0,
             excluded_cost_usd: 0.0,
         };

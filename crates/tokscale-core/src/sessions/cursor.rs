@@ -405,12 +405,38 @@ fn classify_grok_bot_messages(records: &mut [CursorUsageRecord], account_id: &st
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenUsageCoverage {
+    Missing,
+    Partial,
+    Complete,
+}
+
+impl CursorTokenUsage {
+    fn coverage(&self) -> TokenUsageCoverage {
+        let known = [
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_read_tokens,
+            self.cache_write_tokens,
+        ]
+        .map(|count| count.is_some_and(|count| count >= 0));
+        if known.iter().all(|known| *known) {
+            TokenUsageCoverage::Complete
+        } else if known.iter().any(|known| *known) {
+            TokenUsageCoverage::Partial
+        } else {
+            TokenUsageCoverage::Missing
+        }
+    }
+}
+
 /// Parsed Cursor metadata for local bot accounting. Kept separate from messages
 /// so optional display metadata does not alter cache or submission contracts.
 #[derive(Debug, Clone)]
 pub struct CursorUsageRecord {
     pub message: UnifiedMessage,
-    pub has_token_usage: bool,
+    pub token_usage_coverage: TokenUsageCoverage,
     pub automation_id: Option<String>,
 }
 
@@ -473,8 +499,8 @@ pub fn parse_cursor_usage_records(content: &str, account_id: &str) -> Vec<Cursor
             ),
         };
 
-        let has_token_usage = event.token_usage.is_some();
         let token_usage = event.token_usage.unwrap_or_default();
+        let token_usage_coverage = token_usage.coverage();
 
         // Cursor reports two different amounts. `tokenUsage.totalCents` is the
         // metered cost of the event's own tokens; `chargedCents` is what the
@@ -509,7 +535,7 @@ pub fn parse_cursor_usage_records(content: &str, account_id: &str) -> Vec<Cursor
         }
         messages.push(CursorUsageRecord {
             message,
-            has_token_usage,
+            token_usage_coverage,
             automation_id: event.automation_id,
         });
     }
@@ -1407,6 +1433,35 @@ mod grok_bot_tests {
     }
 
     #[test]
+    fn token_coverage_distinguishes_absent_counts_from_explicit_zero() {
+        for (tokens, expected) in [
+            (json!(null), TokenUsageCoverage::Missing),
+            (json!({}), TokenUsageCoverage::Missing),
+            (json!({"totalCents": 25}), TokenUsageCoverage::Missing),
+            (json!({"inputTokens": -1}), TokenUsageCoverage::Missing),
+            (json!({"inputTokens": 0}), TokenUsageCoverage::Partial),
+            (
+                json!({"inputTokens": 10, "outputTokens": 2, "cacheReadTokens": 0}),
+                TokenUsageCoverage::Partial,
+            ),
+            (
+                json!({"inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0, "cacheWriteTokens": 0}),
+                TokenUsageCoverage::Complete,
+            ),
+        ] {
+            let content = json!({"usageEventsDisplay": [{
+                "timestamp": 1791417600000_i64,
+                "model": "grok-bot-default",
+                "tokenUsage": tokens,
+            }]})
+            .to_string();
+            let records = parse_cursor_usage_records(&content, "work");
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].token_usage_coverage, expected, "{content}");
+        }
+    }
+
+    #[test]
     fn cursor_records_keep_missing_zero_partial_and_invalid_metadata_distinct() {
         let bot = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let rows: Vec<_> = [
@@ -1432,9 +1487,15 @@ mod grok_bot_tests {
         assert_eq!(
             records
                 .iter()
-                .map(|r| r.has_token_usage)
+                .map(|r| r.token_usage_coverage)
                 .collect::<Vec<_>>(),
-            [true, false, true, true, true]
+            [
+                TokenUsageCoverage::Missing,
+                TokenUsageCoverage::Missing,
+                TokenUsageCoverage::Partial,
+                TokenUsageCoverage::Partial,
+                TokenUsageCoverage::Missing
+            ]
         );
         assert_eq!(records[0].message.tokens, TokenBreakdown::default());
         assert_eq!(records[2].message.tokens, TokenBreakdown::default());

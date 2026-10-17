@@ -23,3 +23,9 @@ Bot usage is never folded back into Cursor for compatibility: that could double-
 The cache contains usage events, not a guaranteed one-to-one record of user requests or tool calls. Missing token fields in the existing normalized format become zero; absence is not evidence of zero consumption. Provider metered `totalCents` and wallet `chargedCents` have different meanings. Weekly allowance percentages from `GetSandUsageStatus` are separate from per-event token accounting and from the Grok/SuperGrok billing adapter.
 
 The existing `usage --bots` command is a separate quota-oriented report and still contacts the quota API. Its pooled subtask/schedule breakdown is not a verified parent-child graph. This change does not claim to resolve Bot names, account entitlement linkage, cache completeness, or quota burn-rate accuracy.
+
+## Token coverage
+
+`usage --bots` distinguishes missing token counts from partial and complete token data. Empty objects and cost-only objects count as missing. A row is complete only when input, output, cache-read, and cache-write counts are all reported as nonnegative values. An omitted cache-write count remains unknown even though providers commonly omit that field. Explicit zero counts are known values.
+
+`missing_token_usage_calls` counts events with no known token counts. `partial_token_usage_calls` counts events with at least one known count but fewer than all four. Token columns sum all reported nonnegative counts, including those from partial rows. Existing normalized messages and submission totals remain unchanged.
