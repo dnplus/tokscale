@@ -1188,12 +1188,14 @@ printf '%s\n' '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{
         );
 
         let started = std::time::Instant::now();
-        let outputs = fetch.call().unwrap_or_else(|error| {
-            panic!(
-                "the provider the gate admitted must also fetch: {error} -- {}",
-                discovery_state(started, &seen)
-            )
-        });
+        let report = fetch.call(PROVIDER);
+        assert!(
+            report.diagnostics.is_empty(),
+            "the provider the gate admitted must also fetch: {:?} -- {}",
+            report.diagnostics,
+            discovery_state(started, &seen)
+        );
+        let outputs = report.outputs;
         assert_eq!(outputs.len(), 1, "one output per quota group");
         assert_eq!(outputs[0].provider, PROVIDER);
         assert_eq!(
@@ -1249,12 +1251,14 @@ printf '%s\n' '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{
             discovery_state(started, &seen)
         );
         let started = std::time::Instant::now();
-        let outputs = fetch.call().unwrap_or_else(|error| {
-            panic!(
-                "the fetch must reach the same server: {error} -- {}",
-                discovery_state(started, &seen)
-            )
-        });
+        let report = fetch.call(PROVIDER);
+        assert!(
+            report.diagnostics.is_empty(),
+            "the fetch must reach the same server: {:?} -- {}",
+            report.diagnostics,
+            discovery_state(started, &seen)
+        );
+        let outputs = report.outputs;
         assert_eq!(
             outputs[0].account.as_ref().unwrap().label.as_deref(),
             Some("Fixture Models")
@@ -1306,12 +1310,14 @@ printf '%s\n' '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{
             discovery_state(started, &newer_seen)
         );
         let started = std::time::Instant::now();
-        let outputs = fetch.call().unwrap_or_else(|error| {
-            panic!(
-                "the fetch must reach a server: {error} -- {}",
-                discovery_state(started, &newer_seen)
-            )
-        });
+        let report = fetch.call(PROVIDER);
+        assert!(
+            report.diagnostics.is_empty(),
+            "the fetch must reach a server: {:?} -- {}",
+            report.diagnostics,
+            discovery_state(started, &newer_seen)
+        );
+        let outputs = report.outputs;
         assert_eq!(
             outputs[0].account.as_ref().unwrap().label.as_deref(),
             Some("Fixture Models"),

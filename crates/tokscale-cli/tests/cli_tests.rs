@@ -7431,6 +7431,7 @@ fn test_submit_and_autosubmit_share_default_quota_upload() {
                     }
                     Err(error) => panic!("accept: {error}"),
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(10)))
                     .unwrap();

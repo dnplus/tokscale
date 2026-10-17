@@ -361,6 +361,8 @@ enum Commands {
         json: bool,
         #[arg(long, help = "Light terminal output (no TUI)")]
         light: bool,
+        #[arg(long, conflicts_with_all = ["json", "bots"], help = "Output usage and per-account fetch diagnostics as JSON")]
+        json_report: bool,
         #[arg(long, help = "Break down local Grok Bot usage by bot")]
         bots: bool,
         #[arg(
@@ -1006,6 +1008,7 @@ fn main() -> Result<()> {
         }
         Some(Commands::Usage {
             json,
+            json_report,
             light,
             bots,
             since,
@@ -1014,7 +1017,7 @@ fn main() -> Result<()> {
             if bots {
                 commands::usage::bots::run(json, since.map(|date| date.with_timezone(&chrono::Utc)))
             } else {
-                commands::usage::run(json, light, cli.debug)
+                commands::usage::run(json, json_report, light, cli.debug)
             }
         }
         Some(Commands::Codex { subcommand }) => {
@@ -7857,6 +7860,32 @@ fn prepare_headless_args(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn usage_json_report_is_explicit_and_exclusive() {
+        use clap::Parser;
+        let cli =
+            super::Cli::try_parse_from(["tokscale", "--no-spinner", "usage", "--json-report"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(super::Commands::Usage {
+                json_report: true,
+                json: false,
+                ..
+            })
+        ));
+        for flag in ["--json", "--bots"] {
+            assert!(super::Cli::try_parse_from([
+                "tokscale",
+                "--no-spinner",
+                "usage",
+                "--json-report",
+                flag
+            ])
+            .is_err());
+        }
+    }
+
     #[test]
     fn usage_bot_flags_are_opt_in() {
         use clap::Parser;
