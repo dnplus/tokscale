@@ -1242,9 +1242,12 @@ async fn consume_reset_credit(
     parse_chatgpt_json_response(resp, "Codex reset request").await
 }
 
-fn metric_from_window(label: &str, window: &Window) -> UsageMetric {
-    let pct = window.used_percent.unwrap_or(0.0).clamp(0.0, 100.0);
-    UsageMetric {
+fn metric_from_window(label: &str, window: &Window) -> Option<UsageMetric> {
+    let pct = window
+        .used_percent
+        .filter(|pct| pct.is_finite())?
+        .clamp(0.0, 100.0);
+    Some(UsageMetric {
         label: label.into(),
         used_percent: pct,
         remaining_percent: 100.0 - pct,
@@ -1253,7 +1256,7 @@ fn metric_from_window(label: &str, window: &Window) -> UsageMetric {
             .reset_at
             .and_then(|ts| Utc.timestamp_opt(ts, 0).single())
             .map(|dt| dt.to_rfc3339()),
-    }
+    })
 }
 
 fn rate_limit_window_label(window: &Window) -> Option<String> {
@@ -1299,11 +1302,11 @@ fn push_rate_limit_metrics(
     let label_prefix = prefix.map(str::trim).filter(|label| !label.is_empty());
     if let Some(ref w) = rate_limit.primary_window {
         let label = metric_label(label_prefix, w, "5h", "5h");
-        metrics.push(metric_from_window(&label, w));
+        metrics.extend(metric_from_window(&label, w));
     }
     if let Some(ref w) = rate_limit.secondary_window {
         let label = metric_label(label_prefix, w, "Weekly", "week");
-        metrics.push(metric_from_window(&label, w));
+        metrics.extend(metric_from_window(&label, w));
     }
 }
 
@@ -1490,6 +1493,19 @@ async fn fetch_with_auth_async(
         individual_limit: json_scalar_string(control.individual_limit),
         reached: control.reached,
     });
+
+    let has_credit_status = credit_status.as_ref().is_some_and(|credits| {
+        credits.balance.is_some()
+            || credits.has_credits.is_some()
+            || credits.unlimited.is_some()
+            || credits.overage_limit_reached.is_some()
+    });
+    let has_spend_control = spend_control
+        .as_ref()
+        .is_some_and(|control| control.individual_limit.is_some() || control.reached.is_some());
+    if metrics.is_empty() && reset_credits.is_none() && !has_credit_status && !has_spend_control {
+        anyhow::bail!("Codex returned no parseable usage or credit status");
+    }
 
     Ok(UsageOutput {
         provider: provider_name,
@@ -2199,6 +2215,85 @@ mod tests {
         assert_eq!(usage.email.as_deref(), Some("plus@example.com"));
         assert!(usage.additional_rate_limits.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn known_quota_codex_prunes_unknown_windows_and_preserves_zero() {
+        for unknown in [
+            serde_json::json!({}),
+            serde_json::json!({"used_percent": null}),
+        ] {
+            let limit: RateLimit = serde_json::from_value(serde_json::json!({
+                "primary_window": unknown,
+                "secondary_window": {"used_percent": 0, "reset_at": 1782413780}
+            }))
+            .unwrap();
+            let mut metrics = Vec::new();
+            push_rate_limit_metrics(&mut metrics, None, &limit);
+            assert_eq!(metric_labels(&metrics), ["Weekly"]);
+            assert_eq!(metrics[0].remaining_percent, 100.0);
+            assert!(metrics[0].resets_at.is_some());
+        }
+    }
+
+    #[test]
+    fn known_quota_codex_rejects_nonfinite_windows() {
+        for percent in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut window: Window = serde_json::from_str("{}").unwrap();
+            window.used_percent = Some(percent);
+            let limit = RateLimit {
+                primary_window: Some(window),
+                secondary_window: None,
+            };
+            let mut metrics = Vec::new();
+            push_rate_limit_metrics(&mut metrics, None, &limit);
+            assert!(metrics.is_empty());
+        }
+    }
+
+    #[test]
+    fn known_quota_codex_no_usable_response_errors_but_credit_only_survives() {
+        for (body, usable) in [
+            (r#"{}"#, false),
+            (
+                r#"{"rate_limit":{"primary_window":{"used_percent":null}},"credits":{}}"#,
+                false,
+            ),
+            (r#"{"credits":{"balance":"0","has_credits":false}}"#, true),
+            (
+                r#"{"rate_limit_reset_credits":{"available_count":0}}"#,
+                true,
+            ),
+        ] {
+            let (base, _) = spawn_server(move |path, _| {
+                if path == USAGE_PATH {
+                    (200, body.to_string())
+                } else {
+                    (200, r#"{"available_count":null}"#.to_string())
+                }
+            });
+            let endpoints = CodexEndpoints {
+                usage: format!("{base}{USAGE_PATH}"),
+                reset_credits: format!("{base}{RESET_CREDITS_PATH}"),
+                token: format!("{base}{TOKEN_PATH}"),
+            };
+            let auth = serde_json::from_str(CODEX_AUTH_FIXTURE).unwrap();
+            let result = fetch_with_auth_at(
+                &endpoints,
+                auth,
+                CredentialSource::File(PathBuf::from("fixture.json")),
+                "Codex".into(),
+                None,
+            );
+            if usable {
+                assert!(result.unwrap().metrics.is_empty());
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("no parseable usage"));
+            }
+        }
     }
 
     #[test]
