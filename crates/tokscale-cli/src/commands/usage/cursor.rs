@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use serde_json::Value;
 
-use super::{UsageAccount, UsageMetric, UsageOutput};
+use super::{UsageAccount, UsageFetchDiagnostic, UsageFetchReport, UsageMetric, UsageOutput};
 
 const USAGE_URL: &str = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage";
 const PLAN_URL: &str = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo";
@@ -129,7 +129,7 @@ pub fn fetch() -> Result<UsageOutput> {
 
 /// One Grok Bot card per signed-in Cursor account in Grok Bot.app when that
 /// store decrypts; otherwise a single card from Cursor desktop auth.
-pub fn fetch_grok_bot_all() -> Result<Vec<UsageOutput>> {
+pub fn fetch_grok_bot_report() -> Result<UsageFetchReport> {
     match load_grok_bot_app_accounts() {
         Ok(accounts) if !accounts.is_empty() => {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -137,47 +137,56 @@ pub fn fetch_grok_bot_all() -> Result<Vec<UsageOutput>> {
                 .build()?;
             rt.block_on(async {
                 let client = plan_http_client()?;
-                let mut outputs = Vec::new();
-                let mut errors = Vec::new();
+                let mut results = Vec::new();
                 for account in accounts {
-                    match fetch_sand_for_token(&client, &account.access_token).await {
-                        Ok(parsed) => outputs.push(UsageOutput {
-                            provider: GROK_BOT_PROVIDER.to_string(),
-                            account: Some(UsageAccount {
-                                id: account.id,
-                                label: account.name.clone().or_else(|| account.email.clone()),
-                                is_active: account.is_active,
-                            }),
-                            credential_source: Some("grok-bot-app".into()),
-                            plan: parsed.plan,
-                            email: account.email,
-                            metrics: vec![parsed.metric],
-                            reset_credits: None,
-                            credit_status: None,
-                            spend_control: None,
-                        }),
-                        Err(error) => errors.push(error.to_string()),
-                    }
+                    let result = fetch_sand_for_token(&client, &account.access_token).await;
+                    results.push((account, result));
                 }
-                if outputs.is_empty() {
-                    anyhow::bail!(
-                        "Grok Bot app accounts found but Sand usage failed: {}",
-                        errors.join("; ")
-                    );
-                }
-                // Active account first so the card order matches the app switcher.
-                outputs.sort_by_key(|output| {
-                    !output
-                        .account
-                        .as_ref()
-                        .map(|account| account.is_active)
-                        .unwrap_or(false)
-                });
-                Ok(outputs)
+                Ok(grok_bot_account_report(results))
             })
         }
-        Ok(_) | Err(_) => fetch_grok_bot_desktop().map(|output| vec![output]),
+        Ok(_) | Err(_) => {
+            fetch_grok_bot_desktop().map(|output| UsageFetchReport::from_outputs(vec![output]))
+        }
     }
+}
+
+fn grok_bot_account_report(
+    results: impl IntoIterator<Item = (GrokBotAppAccount, Result<ParsedSandUsage>)>,
+) -> UsageFetchReport {
+    let mut report = UsageFetchReport::default();
+    for (account, result) in results {
+        let identity = UsageAccount {
+            id: account.id,
+            label: account.name.or_else(|| account.email.clone()),
+            is_active: account.is_active,
+        };
+        match result {
+            Ok(parsed) => report.outputs.push(UsageOutput {
+                provider: GROK_BOT_PROVIDER.to_string(),
+                account: Some(identity),
+                credential_source: Some("grok-bot-app".into()),
+                plan: parsed.plan,
+                email: account.email,
+                metrics: vec![parsed.metric],
+                reset_credits: None,
+                credit_status: None,
+                spend_control: None,
+            }),
+            Err(error) => report.diagnostics.push(UsageFetchDiagnostic::new(
+                GROK_BOT_PROVIDER,
+                Some(identity),
+                error.to_string(),
+            )),
+        }
+    }
+    report.outputs.sort_by_key(|output| {
+        !output
+            .account
+            .as_ref()
+            .is_some_and(|account| account.is_active)
+    });
+    report
 }
 
 fn fetch_grok_bot_desktop() -> Result<UsageOutput> {
@@ -844,6 +853,56 @@ fn millis_or_secs_iso(raw: i64) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn bot_account(id: &str, active: bool) -> GrokBotAppAccount {
+        GrokBotAppAccount {
+            id: id.into(),
+            access_token: "fixture-token".into(),
+            email: Some(format!("{id}@test.invalid")),
+            name: Some(id.into()),
+            is_active: active,
+        }
+    }
+
+    fn sand_fixture() -> Result<ParsedSandUsage> {
+        parse_sand_usage(&json!({"hasNonZeroIncludedLimit": true, "usagePercent": 25}))
+    }
+
+    #[test]
+    fn grok_bot_partial_failure_preserves_account_diagnostic_and_active_order() {
+        let report = grok_bot_account_report([
+            (bot_account("other", false), sand_fixture()),
+            (
+                bot_account("expired", false),
+                Err(anyhow::anyhow!("HTTP 401")),
+            ),
+            (bot_account("active", true), sand_fixture()),
+        ]);
+        assert_eq!(report.outputs.len(), 2);
+        assert_eq!(report.outputs[0].account.as_ref().unwrap().id, "active");
+        assert_eq!(report.diagnostics.len(), 1);
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(diagnostic.provider, "Grok Bot");
+        assert_eq!(diagnostic.account.as_ref().unwrap().id, "expired");
+        assert_eq!(diagnostic.message, "HTTP 401");
+    }
+
+    #[test]
+    fn grok_bot_all_failed_keeps_each_account() {
+        let report = grok_bot_account_report(
+            ["one", "two"].map(|id| (bot_account(id, false), Err(anyhow::anyhow!("HTTP 401")))),
+        );
+        assert!(report.outputs.is_empty());
+        assert_eq!(report.diagnostics.len(), 2);
+        assert_eq!(report.diagnostics[1].account.as_ref().unwrap().id, "two");
+    }
+
+    #[test]
+    fn grok_bot_success_has_no_diagnostics() {
+        let report = grok_bot_account_report([(bot_account("one", true), sand_fixture())]);
+        assert_eq!(report.outputs.len(), 1);
+        assert!(report.diagnostics.is_empty());
+    }
 
     #[test]
     fn stored_auth_keeps_its_identity_when_desktop_has_another_account() {

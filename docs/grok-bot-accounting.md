@@ -23,3 +23,11 @@ Bot usage is never folded back into Cursor for compatibility: that could double-
 The cache contains usage events, not a guaranteed one-to-one record of user requests or tool calls. Missing token fields in the existing normalized format become zero; absence is not evidence of zero consumption. Provider metered `totalCents` and wallet `chargedCents` have different meanings. Weekly allowance percentages from `GetSandUsageStatus` are separate from per-event token accounting and from the Grok/SuperGrok billing adapter.
 
 The existing `usage --bots` command is a separate quota-oriented report and still contacts the quota API. Its pooled subtask/schedule breakdown is not a verified parent-child graph. This change does not claim to resolve Bot names, account entitlement linkage, cache completeness, or quota burn-rate accuracy.
+
+## Quota forecasts
+
+`usage --bots` reports the observed weekly quota and local event costs separately. Its JSON `burn_rate` is `null`, with `burn_rate_unavailable_reason` explaining why a forecast is unavailable. Bot event costs do not establish the consumption rate of a quota pool shared with Cursor and Grok, and the local cache does not prove full coverage of that pool.
+
+A future forecast needs provider-confirmed account and pool identity, reset boundaries, and successive quota observations from that same pool. Do not infer pool identity from a plan name or email alone. Samples spanning a reset or a change in entitlement cannot form one consumption rate. The current private API response has not been verified for every unified and legacy subscription variant.
+
+See the [official Cursor subscription documentation](https://cursor.com/docs/models-and-pricing) for shared weekly pools, separate prepaid usage, and legacy monthly plans.
