@@ -12,12 +12,63 @@ use tokscale_core::{
 use super::{cursor, UsageMetric, UsageOutput};
 
 #[derive(Debug, Default, Serialize)]
+struct ReportedAmount {
+    known_usd: f64,
+    reported_calls: usize,
+}
+
+impl ReportedAmount {
+    fn add(&mut self, amount: Option<f64>) {
+        if let Some(amount) = amount {
+            self.known_usd += amount;
+            self.reported_calls += 1;
+        }
+    }
+
+    fn display(&self, calls: usize) -> String {
+        if self.reported_calls == 0 {
+            "unknown".to_string()
+        } else {
+            format!(
+                "${:.2} ({}/{calls} calls)",
+                self.known_usd, self.reported_calls
+            )
+        }
+    }
+}
+
+#[derive(Debug, Default, Serialize)]
+struct CostBreakdown {
+    metered: ReportedAmount,
+    charged: ReportedAmount,
+    cursor_token_fee: ReportedAmount,
+}
+
+impl CostBreakdown {
+    fn add(&mut self, record: &CursorUsageRecord) {
+        self.metered.add(record.metered_cost_usd);
+        self.charged.add(record.charged_cost_usd);
+        self.cursor_token_fee.add(record.cursor_token_fee_usd);
+    }
+
+    fn render(&self, calls: usize) {
+        println!(
+            "    Metered: {}; wallet charge: {}; Cursor token fee: {}",
+            self.metered.display(calls),
+            self.charged.display(calls),
+            self.cursor_token_fee.display(calls)
+        );
+    }
+}
+
+#[derive(Debug, Default, Serialize)]
 struct Row {
     id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
     calls: usize,
     cost_usd: f64,
+    cost_breakdown: CostBreakdown,
     share_percent: f64,
     distinct_conversations: usize,
     tokens: TokenBreakdown,
@@ -29,6 +80,7 @@ struct Breakdown {
     rows: Vec<Row>,
     calls: usize,
     cost_week_usd: f64,
+    cost_breakdown: CostBreakdown,
     cost_24h_usd: f64,
     tokens: TokenBreakdown,
     missing_token_usage_calls: usize,
@@ -46,6 +98,7 @@ fn summarize(events: &[CursorUsageRecord], now: DateTime<Utc>, start: DateTime<U
         rows: vec![],
         calls: 0,
         cost_week_usd: 0.0,
+        cost_breakdown: CostBreakdown::default(),
         cost_24h_usd: 0.0,
         tokens: TokenBreakdown::default(),
         missing_token_usage_calls: 0,
@@ -80,6 +133,8 @@ fn summarize(events: &[CursorUsageRecord], now: DateTime<Utc>, start: DateTime<U
         row.id = group.to_string();
         row.calls += 1;
         row.cost_usd += cost;
+        row.cost_breakdown.add(record);
+        result.cost_breakdown.add(record);
         if record.has_token_usage {
             row.tokens += &event.tokens;
             result.tokens += &event.tokens;
@@ -402,6 +457,7 @@ fn render(account: &AccountReport) {
             row.tokens.cache_read,
             row.tokens.cache_write
         );
+        row.cost_breakdown.render(row.calls);
         if row.missing_token_usage_calls > 0 {
             println!(
                 "    Missing token data: {} calls",
@@ -424,6 +480,8 @@ fn render(account: &AccountReport) {
         "  Missing token data: {} calls (token columns sum known data only)",
         data.missing_token_usage_calls
     );
+    data.cost_breakdown.render(data.calls);
+    println!("  Cost USD uses metered cost, or wallet charge when metered cost is unavailable; fees are not added again.");
     print!("  Last 24h: ${:.2}", data.cost_24h_usd);
     match &account.burn_rate {
         Some(burn) => {
@@ -495,6 +553,47 @@ mod tests {
         assert_eq!(data.excluded_cost_usd, 0.4);
         assert!((data.rows.iter().map(|r| r.share_percent).sum::<f64>() - 100.0).abs() < 1e-9);
         assert_eq!(data.rows[0].id, bot);
+    }
+
+    #[test]
+    fn cost_breakdown_preserves_zero_unknown_and_fee_without_double_counting() {
+        let now = time("2026-10-08T06:00:00Z");
+        let rows: Vec<_> = [
+            serde_json::json!({"totalCents": 25, "charged": 0}),
+            serde_json::json!({"totalCents": 20, "charged": 21.5, "fee": 1.5}),
+            serde_json::json!({}),
+        ]
+        .into_iter()
+        .map(|amounts| {
+            serde_json::json!({
+                "timestamp": now.timestamp_millis(), "model": "grok-bot-default",
+                "conversationId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "tokenUsage": {"totalCents": amounts["totalCents"]},
+                "chargedCents": amounts["charged"], "cursorTokenFee": amounts["fee"],
+            })
+        })
+        .collect();
+        let records = parse_cursor_usage_records(
+            &serde_json::json!({"usageEventsDisplay": rows}).to_string(),
+            "work",
+        );
+        let data = summarize(&records, now, now - Duration::days(7));
+        let json = serde_json::to_value(&data).unwrap();
+        assert_eq!(json["cost_week_usd"], 0.45);
+        assert_eq!(json["cost_breakdown"]["metered"]["known_usd"], 0.45);
+        assert_eq!(json["cost_breakdown"]["charged"]["known_usd"], 0.215);
+        assert_eq!(json["cost_breakdown"]["charged"]["reported_calls"], 2);
+        assert_eq!(
+            json["cost_breakdown"]["cursor_token_fee"]["known_usd"],
+            0.015
+        );
+        assert_eq!(
+            json["cost_breakdown"]["cursor_token_fee"]["reported_calls"],
+            1
+        );
+        assert_eq!(json["rows"][0]["cost_breakdown"], json["cost_breakdown"]);
+        assert_eq!(ReportedAmount::default().display(3), "unknown");
+        assert_eq!(data.cost_breakdown.charged.display(3), "$0.21 (2/3 calls)");
     }
 
     #[test]
@@ -649,6 +748,7 @@ mod tests {
             rows: vec![],
             calls: 1,
             cost_week_usd: 100.0,
+            cost_breakdown: CostBreakdown::default(),
             cost_24h_usd: 24.0,
             tokens: TokenBreakdown::default(),
             missing_token_usage_calls: 0,

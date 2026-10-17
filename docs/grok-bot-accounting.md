@@ -23,3 +23,9 @@ Bot usage is never folded back into Cursor for compatibility: that could double-
 The cache contains usage events, not a guaranteed one-to-one record of user requests or tool calls. Missing token fields in the existing normalized format become zero; absence is not evidence of zero consumption. Provider metered `totalCents` and wallet `chargedCents` have different meanings. Weekly allowance percentages from `GetSandUsageStatus` are separate from per-event token accounting and from the Grok/SuperGrok billing adapter.
 
 The existing `usage --bots` command is a separate quota-oriented report and still contacts the quota API. Its pooled subtask/schedule breakdown is not a verified parent-child graph. This change does not claim to resolve Bot names, account entitlement linkage, cache completeness, or quota burn-rate accuracy.
+
+## Reported monetary amounts
+
+`usage --bots` retains the provider's metered token cost, wallet charge, and Cursor token fee separately when those fields are present. Each `cost_breakdown` amount has a `known_usd` sum and `reported_calls` count. A count of zero means unknown, not a free event. A smaller count than `calls` means the sum covers only part of the report.
+
+The existing `cost_usd`, weekly cost, and share fields keep their original accounting rule: prefer metered cost and fall back to wallet charge. The token fee is a separate reported component and is never added to the wallet charge again. Included usage can have nonzero metered cost with a zero wallet charge. This local report does not change submitted cost totals or claim that every Cursor endpoint exposes fees.
