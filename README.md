@@ -870,9 +870,9 @@ In the TUI, navigate to the **Usage** tab to see subscription data. Use `[Refres
 | **Z.ai** | API key (env var) | Token limits, Web Searches | Set `ZAI_API_KEY` or `GLM_API_KEY` |
 | **Amp** | API key (`~/.local/share/amp/secrets.json`) | Free tier balance, Credits | Run `amp` to log in |
 | **GitHub Copilot** | GitHub token (keychain or `~/.config/gh/hosts.yml`) | Premium interactions, Chat quotas | Run `gh auth login` |
-| **Cursor** | Desktop `state.vscdb` JWT (or macOS Keychain `cursor-access-token`, or JWT inside a saved `tokscale cursor login` session) | Auto and API plan period remaining | Sign in to Cursor desktop, or run `tokscale cursor login` |
+| **Cursor** | Desktop `state.vscdb` JWT (or macOS Keychain `cursor-access-token`, or JWT inside a saved `tokscale cursor login` session) | Cursor Models and Other Models plan quotas (one Weekly pool on unified plans) | Sign in to Cursor desktop, or run `tokscale cursor login` |
 | **Grok Bot** | Cursor desktop JWT (with macOS Keychain refresh when available) | Weekly personal quota | Sign in to Cursor desktop; shown when a personal quota is available |
-| **Grok** | OAuth (`~/.grok/auth.json`) | Weekly credits, Monthly allowance, subscription plan | Run `grok login` |
+| **Grok** | OAuth (`~/.grok/auth.json`) | Included credits (weekly or monthly), subscription plan | Run `grok login` |
 | **Kimi** | OAuth (`~/.kimi/credentials/kimi-code.json`) | Session, Weekly quotas | Run `kimi` to log in |
 | **MiniMax** | API key (env var) | Prompt quotas per model | Set `MINIMAX_API_KEY` or `MINIMAX_API_TOKEN` |
 | **MiniMax Token Plan** | API key (env var) | Interval + weekly remaining-percent quotas (per region: CN minimaxi.com + Global minimax.io) | Set `MINIMAX_TOKEN_PLAN_CN_KEY` and/or `MINIMAX_TOKEN_PLAN_GLOBAL_KEY` |
