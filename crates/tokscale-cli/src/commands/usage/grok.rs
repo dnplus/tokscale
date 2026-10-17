@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 
 use super::{UsageMetric, UsageOutput};
@@ -12,18 +12,20 @@ use super::{UsageMetric, UsageOutput};
 const SUBSCRIPTIONS_URL: &str = "https://grok.com/rest/subscriptions";
 const TASK_USAGE_URL: &str = "https://grok.com/rest/tasks/usage";
 const BILLING_GRPC_URL: &str = "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig";
-/// SuperGrok / Grok Build weekly credit pool (`~/.grok` OIDC). Distinct from
-/// Cursor-metered Grok Bot (`GetSandUsageStatus`).
+/// SuperGrok / Grok Build included credit pool (`~/.grok` OIDC). Distinct
+/// from Cursor-metered Grok Bot (`GetSandUsageStatus`). The response declares
+/// whether its one current period is weekly or monthly.
 const GROK_CREDITS_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
-/// Monthly included-allowance meter for the same SuperGrok subscription.
-const GROK_MONTHLY_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing";
 const GROK_USER_AGENT: &str = "Grok Build";
+const GROK_TOKEN_AUTH: &str = "xai-grok-cli";
 const WEEKLY_PERIOD_TYPE: &str = "USAGE_PERIOD_TYPE_WEEKLY";
 
 #[derive(Debug, Clone)]
 struct Credentials {
     token: String,
     email: Option<String>,
+    user_id: Option<String>,
+    direct_xai: bool,
 }
 
 #[derive(Debug)]
@@ -55,6 +57,14 @@ fn read_credentials() -> Result<Vec<Credentials>> {
     credential_candidates_from_value(&doc)
 }
 
+fn is_direct_xai_scope(scope: &str) -> bool {
+    scope == "https://accounts.x.ai/sign-in"
+        || scope == "xai::api_key"
+        || scope
+            .strip_prefix("https://auth.x.ai::")
+            .is_some_and(|client_id| !client_id.trim().is_empty())
+}
+
 fn credential_candidates_from_value(doc: &Value) -> Result<Vec<Credentials>> {
     let entries = doc
         .as_object()
@@ -67,22 +77,32 @@ fn credential_candidates_from_value(doc: &Value) -> Result<Vec<Credentials>> {
             let token = entry
                 .get("key")
                 .and_then(Value::as_str)
+                .map(str::trim)
                 .filter(|value| !value.is_empty())?
                 .to_string();
-            let email = entry
-                .get("email")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(ToString::to_string);
-            let priority = if scope.contains("auth.x.ai") { 0 } else { 1 };
-            Some((priority, Credentials { token, email }))
+            let nonempty_field = |key| {
+                entry
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            };
+            let direct_xai = is_direct_xai_scope(scope);
+            let credentials = Credentials {
+                token,
+                email: nonempty_field("email"),
+                user_id: nonempty_field("user_id"),
+                direct_xai,
+            };
+            Some((!direct_xai, scope, credentials))
         })
         .collect();
 
-    candidates.sort_by_key(|(priority, _)| *priority);
+    candidates.sort_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
     let credentials: Vec<_> = candidates
         .into_iter()
-        .map(|(_, credentials)| credentials)
+        .map(|(_, _, credentials)| credentials)
         .collect();
 
     if credentials.is_empty() {
@@ -95,7 +115,7 @@ fn bearer_request(client: &reqwest::Client, token: &str, url: &str) -> reqwest::
     client
         .get(url)
         .header("Authorization", format!("Bearer {token}"))
-        .header("X-XAI-Token-Auth", "xai-grok-cli")
+        .header("X-XAI-Token-Auth", GROK_TOKEN_AUTH)
         .header("Accept", "application/json")
         .header("User-Agent", GROK_USER_AGENT)
 }
@@ -131,7 +151,7 @@ async fn fetch_billing_grpc(client: &reqwest::Client, token: &str) -> Result<Vec
     let resp = client
         .post(BILLING_GRPC_URL)
         .header("Authorization", format!("Bearer {token}"))
-        .header("X-XAI-Token-Auth", "xai-grok-cli")
+        .header("X-XAI-Token-Auth", GROK_TOKEN_AUTH)
         .header("Accept", "application/grpc-web+proto")
         .header("Content-Type", "application/grpc-web+proto")
         .header("User-Agent", GROK_USER_AGENT)
@@ -577,6 +597,14 @@ fn parse_grpc_billing_metric(body: &[u8]) -> Option<UsageMetric> {
 }
 
 fn fetch_network_usage(credentials: &Credentials) -> Result<UsageOutput> {
+    // Hard audience gate: this function only talks to xAI's fixed origins.
+    // A token issued by a custom enterprise IdP scope must never leave the
+    // machine toward those origins, even if a future caller forgets the
+    // same check in `fetch`.
+    anyhow::ensure!(
+        credentials.direct_xai,
+        "credential uses a custom auth scope; refusing direct xAI requests"
+    );
     let mut plan: Option<String> = None;
     let mut metrics = Vec::new();
     let mut errors = Vec::new();
@@ -589,13 +617,7 @@ fn fetch_network_usage(credentials: &Credentials) -> Result<UsageOutput> {
             .timeout(Duration::from_secs(12))
             .build()?;
 
-        let proxy = fetch_proxy_usage(
-            &client,
-            &credentials.token,
-            GROK_CREDITS_URL,
-            GROK_MONTHLY_URL,
-        )
-        .await;
+        let proxy = fetch_proxy_usage(&client, credentials, GROK_CREDITS_URL).await;
         plan = proxy.plan;
         metrics.extend(proxy.metrics);
         errors.extend(proxy.errors);
@@ -652,67 +674,70 @@ struct ProxyUsage {
 
 async fn fetch_proxy_usage(
     client: &reqwest::Client,
-    token: &str,
-    weekly_url: &str,
-    monthly_url: &str,
+    credentials: &Credentials,
+    url: &str,
 ) -> ProxyUsage {
     let mut usage = ProxyUsage::default();
-    // Prefer the cli-chat-proxy SuperGrok meters (weekly credits + monthly
-    // allowance). Grok Bot is a different pool on the Cursor account.
-    match fetch_proxy_billing(client, token, weekly_url).await {
+    // The credits response contains one included pool. Its modern percentage
+    // and period fields replace, rather than supplement, the deprecated
+    // monthlyLimit/used fields in the same config.
+    match fetch_proxy_billing(client, credentials, url).await {
         Ok(credits) => {
-            if let Some(metric) = parse_proxy_weekly_metric(&credits) {
+            if let Some(metric) = parse_proxy_billing_metric(&credits, Utc::now()) {
                 usage.metrics.push(metric);
             } else {
                 usage
                     .errors
-                    .push("Grok weekly credits response was not recognized".to_string());
+                    .push("Grok credits response was not recognized".to_string());
             }
-            if let Some(tier) = credits
-                .get("subscriptionTiers")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|tier| !tier.is_empty())
-            {
+            if let Some(tier) = proxy_subscription_tier(&credits) {
                 usage.plan = Some(normalize_subscription_tier(tier));
             }
         }
         Err(error) => usage
             .errors
-            .push(format!("Grok weekly credits request failed: {error}")),
-    }
-
-    // The monthly allowance remains useful when the weekly endpoint
-    // fails or changes its response shape.
-    match fetch_proxy_billing(client, token, monthly_url).await {
-        Ok(monthly) => {
-            if let Some(metric) = parse_proxy_monthly_metric(&monthly) {
-                usage.metrics.push(metric);
-            }
-            if usage.plan.is_none() {
-                if let Some(tier) = monthly
-                    .get("subscriptionTiers")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|tier| !tier.is_empty())
-                {
-                    usage.plan = Some(normalize_subscription_tier(tier));
-                }
-            }
-        }
-        Err(error) => usage
-            .errors
-            .push(format!("Grok monthly billing request failed: {error}")),
+            .push(format!("Grok credits request failed: {error}")),
     }
     usage
 }
 
-async fn fetch_proxy_billing(client: &reqwest::Client, token: &str, url: &str) -> Result<Value> {
-    let resp = client
+fn proxy_billing_request(
+    client: &reqwest::Client,
+    credentials: &Credentials,
+    url: &str,
+) -> reqwest::RequestBuilder {
+    let request = client
         .get(url)
-        .bearer_auth(token)
+        .bearer_auth(&credentials.token)
+        .header("X-XAI-Token-Auth", GROK_TOKEN_AUTH)
         .header("Accept", "application/json")
-        .header("User-Agent", GROK_USER_AGENT)
+        .header("User-Agent", GROK_USER_AGENT);
+    if let Some(user_id) = credentials.user_id.as_deref() {
+        request.header("x-userid", user_id)
+    } else {
+        request
+    }
+}
+
+fn proxy_subscription_tier(value: &Value) -> Option<&str> {
+    value
+        .pointer("/config/subscriptionTier")
+        .or_else(|| value.get("subscriptionTier"))
+        .or_else(|| value.get("subscription_tier"))
+        // Keep accepting the plural spelling observed by the contributor's
+        // local build while preferring the current Grok response fields.
+        .or_else(|| value.get("subscriptionTiers"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|tier| !tier.is_empty())
+}
+
+async fn fetch_proxy_billing(
+    client: &reqwest::Client,
+    credentials: &Credentials,
+    url: &str,
+) -> Result<Value> {
+    let resp = proxy_billing_request(client, credentials, url)
         .send()
         .await?;
     let status = resp.status();
@@ -729,48 +754,69 @@ async fn fetch_proxy_billing(client: &reqwest::Client, token: &str, url: &str) -
     Ok(serde_json::from_str(&text)?)
 }
 
-fn parse_proxy_weekly_metric(value: &Value) -> Option<UsageMetric> {
+fn parse_proxy_billing_metric(value: &Value, now: DateTime<Utc>) -> Option<UsageMetric> {
     let config = value.get("config")?;
-    let used_percent = match proxy_weekly_used_percent(config) {
-        Some(percent) => percent,
-        None => {
-            // Empty week after reset: period present, percent fields omitted.
-            if proxy_self_contained_weekly_period(config).is_some() {
-                0.0
-            } else {
-                return None;
-            }
-        }
-    };
-    let end = proxy_period_end(config);
-    Some(UsageMetric {
-        label: "Weekly".into(),
-        used_percent,
-        remaining_percent: 100.0 - used_percent,
-        remaining_label: None,
-        resets_at: end,
-    })
+    let used_percent = proxy_credit_used_percent(config)
+        .or_else(|| proxy_active_unified_period(config, now).map(|()| 0.0));
+    if let Some(used_percent) = used_percent {
+        return Some(UsageMetric {
+            label: proxy_period_label(config),
+            used_percent,
+            remaining_percent: 100.0 - used_percent,
+            remaining_label: None,
+            resets_at: proxy_period_end(config),
+        });
+    }
+
+    parse_proxy_legacy_metric(value)
 }
 
-fn proxy_weekly_used_percent(config: &Value) -> Option<f64> {
+fn proxy_credit_used_percent(config: &Value) -> Option<f64> {
     let percent = match config.get("creditUsagePercent")? {
         Value::Number(number) => number.as_f64()?,
         Value::String(raw) => raw.parse::<f64>().ok()?,
         _ => return None,
     };
-    percent.is_finite().then(|| percent.clamp(0.0, 100.0))
+    (percent.is_finite() && percent >= 0.0).then(|| percent.min(100.0))
 }
 
-fn proxy_self_contained_weekly_period(config: &Value) -> Option<()> {
-    let period = config.get("currentPeriod")?;
-    if period.get("type").and_then(Value::as_str) != Some(WEEKLY_PERIOD_TYPE) {
+fn proxy_active_unified_period(config: &Value, now: DateTime<Utc>) -> Option<()> {
+    if config.get("isUnifiedBillingUser").and_then(Value::as_bool) != Some(true) {
         return None;
     }
-    let start = period.get("start").and_then(Value::as_str)?;
-    let end = period.get("end").and_then(Value::as_str)?;
-    let start = chrono::DateTime::parse_from_rfc3339(start).ok()?;
-    let end = chrono::DateTime::parse_from_rfc3339(end).ok()?;
-    (end > start).then_some(())
+    let period = config.get("currentPeriod")?;
+    let period_type = period.get("type").and_then(Value::as_str)?;
+    if !period_type.eq_ignore_ascii_case(WEEKLY_PERIOD_TYPE)
+        && !period_type.eq_ignore_ascii_case("USAGE_PERIOD_TYPE_MONTHLY")
+    {
+        return None;
+    }
+    let start = period
+        .get("start")
+        .and_then(Value::as_str)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())?;
+    let end = period
+        .get("end")
+        .and_then(Value::as_str)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())?;
+    (start <= now && now < end).then_some(())
+}
+
+fn proxy_period_label(config: &Value) -> String {
+    match config
+        .pointer("/currentPeriod/type")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_uppercase)
+        .as_deref()
+    {
+        Some(value) if value.ends_with("WEEKLY") => "Weekly".into(),
+        Some(value) if value.ends_with("MONTHLY") => "Monthly".into(),
+        _ => {
+            let start = string_at(config, &["currentPeriod", "start"]);
+            let end = string_at(config, &["currentPeriod", "end"]);
+            cycle_label(start.as_deref(), end.as_deref())
+        }
+    }
 }
 
 fn proxy_period_end(config: &Value) -> Option<String> {
@@ -784,15 +830,22 @@ fn proxy_period_end(config: &Value) -> Option<String> {
         })
 }
 
-fn parse_proxy_monthly_metric(value: &Value) -> Option<UsageMetric> {
+fn cent_at(value: &Value, path: &[&str]) -> Option<f64> {
+    let mut current = value;
+    for segment in path {
+        current = current.get(*segment)?;
+    }
+    if current.as_object().is_some_and(serde_json::Map::is_empty) {
+        return Some(0.0);
+    }
+    numeric_value(current)
+}
+
+fn parse_proxy_legacy_metric(value: &Value) -> Option<UsageMetric> {
     let config = value.get("config").unwrap_or(value);
-    let limit = number_at(config, &["monthlyLimit", "val"])
-        .or_else(|| number_at(config, &["monthlyLimit"]))
-        .filter(|limit| *limit > 0.0)?;
-    let used = number_at(config, &["used", "val"])
-        .or_else(|| number_at(config, &["used"]))
-        .or_else(|| number_at(config, &["usage", "totalUsed", "val"]))
-        .or_else(|| number_at(config, &["usage", "totalUsed"]))
+    let limit = cent_at(config, &["monthlyLimit"]).filter(|limit| *limit > 0.0)?;
+    let used = cent_at(config, &["used"])
+        .or_else(|| cent_at(config, &["usage", "totalUsed"]))
         .filter(|used| *used >= 0.0)?;
     let used_percent = (used / limit * 100.0).clamp(0.0, 100.0);
     let end = proxy_period_end(config).or_else(|| {
@@ -836,6 +889,16 @@ pub fn fetch() -> Result<UsageOutput> {
     let mut plan_only: Option<UsageOutput> = None;
 
     for (index, credential) in credentials.iter().enumerate() {
+        // A customer IdP token belongs at that deployment's configured proxy.
+        // Never send it to xAI's fixed origins. The official Grok agent below
+        // resolves the active scope and proxy for those installations.
+        if !credential.direct_xai {
+            errors.push(format!(
+                "Grok credential #{} uses a custom auth scope; direct xAI requests skipped",
+                index + 1
+            ));
+            continue;
+        }
         match fetch_network_usage(credential) {
             Ok(output) if !output.metrics.is_empty() => return Ok(output),
             Ok(output) => {
@@ -847,30 +910,34 @@ pub fn fetch() -> Result<UsageOutput> {
         }
     }
 
-    // The `grok agent --no-leader stdio` billing fallback runs without
-    // credential context, so its metrics cannot be attributed to a specific
-    // account. Skip it when auth.json holds multiple credentials to avoid
-    // merging metrics with a plan/email that belongs to a different account.
-    if credentials.len() > 1 {
-        errors
-            .push("Grok agent billing fallback skipped: multiple credentials present".to_string());
-    } else if let Some(billing) = fetch_agent_billing(Duration::from_secs(4)) {
+    // The official agent honors custom auth scopes, credential refresh, and
+    // GROK_CLI_CHAT_PROXY_BASE_URL. Its response is safe to use for every
+    // credential set. With multiple stored accounts, omit identity metadata
+    // rather than attributing the active agent response to a guessed account.
+    if let Some(billing) = fetch_agent_billing(Duration::from_secs(4)) {
         let mut metrics = Vec::new();
         if let Some(metric) = parse_billing_json_metric(&billing) {
             metrics.push(metric);
         }
         collect_task_usage_metrics(&billing, &mut metrics);
         if !metrics.is_empty() {
+            let single_credential = credentials.len() == 1;
             return Ok(usage_output(
-                plan_only.as_ref().and_then(|output| output.plan.clone()),
-                plan_only
-                    .as_ref()
-                    .and_then(|output| output.email.clone())
-                    .or_else(|| {
-                        credentials
-                            .first()
-                            .and_then(|credential| credential.email.clone())
-                    }),
+                single_credential
+                    .then(|| plan_only.as_ref().and_then(|output| output.plan.clone()))
+                    .flatten(),
+                single_credential
+                    .then(|| {
+                        plan_only
+                            .as_ref()
+                            .and_then(|output| output.email.clone())
+                            .or_else(|| {
+                                credentials
+                                    .first()
+                                    .and_then(|credential| credential.email.clone())
+                            })
+                    })
+                    .flatten(),
                 metrics,
             ));
         }
@@ -901,59 +968,114 @@ mod tests {
         assert_eq!(output.provider, "Grok");
     }
 
-    #[test]
-    fn monthly_meter_survives_weekly_failure_or_unrecognized_response() {
-        for weekly_status in [503, 200] {
-            let (base, log) = spawn_server(move |path, _| match path {
-                "/weekly" => (weekly_status, "{}".to_string()),
-                "/monthly" => (
-                    200,
-                    serde_json::json!({
-                        "subscriptionTiers": "super_grok",
-                        "config": {
-                            "monthlyLimit": { "val": 20000 },
-                            "used": { "val": 5000 }
-                        }
-                    })
-                    .to_string(),
-                ),
-                _ => (404, "{}".to_string()),
-            });
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let usage = runtime.block_on(async {
-                let client = reqwest::Client::new();
-                fetch_proxy_usage(
-                    &client,
-                    "test-token",
-                    &format!("{base}/weekly"),
-                    &format!("{base}/monthly"),
-                )
-                .await
-            });
-
-            assert_eq!(usage.metrics.len(), 1, "weekly status {weekly_status}");
-            assert_eq!(usage.metrics[0].label, "Monthly");
-            assert_eq!(usage.metrics[0].remaining_percent, 75.0);
-            assert_eq!(usage.plan.as_deref(), Some("Super Grok"));
-            assert_eq!(log.lock().unwrap().len(), 2);
+    fn direct_credentials() -> Credentials {
+        Credentials {
+            token: "test-token".into(),
+            email: Some("dev@example.com".into()),
+            user_id: Some("user-test".into()),
+            direct_xai: true,
         }
     }
 
     #[test]
-    fn proxy_weekly_subscription_tier_is_normalized() {
-        let (base, _) = spawn_server(move |path, _| match path {
-            "/weekly" => (
+    fn only_first_party_auth_scopes_can_use_fixed_xai_origins() {
+        for scope in [
+            "https://auth.x.ai::client-id",
+            "https://accounts.x.ai/sign-in",
+            "xai::api_key",
+        ] {
+            assert!(is_direct_xai_scope(scope), "{scope}");
+        }
+        for scope in [
+            "https://idp.corp.example::client-id",
+            "https://auth.x.ai.evil.example::client-id",
+            "http://localhost:22255::client-id",
+        ] {
+            assert!(!is_direct_xai_scope(scope), "{scope}");
+        }
+
+        let credentials = credential_candidates_from_value(&serde_json::json!({
+            "https://idp.corp.example::client-id": {
+                "key": "enterprise-secret",
+                "user_id": "corp-user"
+            }
+        }))
+        .unwrap();
+        assert_eq!(credentials.len(), 1);
+        assert!(!credentials[0].direct_xai);
+    }
+
+    #[test]
+    fn custom_scope_credential_is_refused_before_any_transport_exists() {
+        // Regression for the credential-audience privacy gate: the refusal
+        // must fire before `fetch_network_usage` builds a runtime or HTTP
+        // client, so a custom-IdP token can never produce an outbound
+        // request to xAI's fixed origins.
+        let credentials = Credentials {
+            token: "enterprise-secret".into(),
+            email: None,
+            user_id: None,
+            direct_xai: false,
+        };
+        let error = fetch_network_usage(&credentials).unwrap_err().to_string();
+        assert!(
+            error.contains("custom auth scope"),
+            "expected the audience-gate refusal, got: {error}"
+        );
+    }
+
+    #[test]
+    fn proxy_billing_request_sends_official_grok_headers() {
+        let request = proxy_billing_request(
+            &tokscale_core::http::client(),
+            &direct_credentials(),
+            "http://127.0.0.1/billing",
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer test-token"
+        );
+        assert_eq!(
+            request.headers().get("x-xai-token-auth").unwrap(),
+            GROK_TOKEN_AUTH
+        );
+        assert_eq!(request.headers().get("x-userid").unwrap(), "user-test");
+    }
+
+    #[test]
+    fn proxy_plan_reads_current_and_legacy_tier_fields() {
+        for value in [
+            serde_json::json!({"config": {"subscriptionTier": "supergrok"}}),
+            serde_json::json!({"subscriptionTier": "supergrok_heavy"}),
+            serde_json::json!({"subscription_tier": "SuperGrok Heavy"}),
+            serde_json::json!({"subscriptionTiers": "legacy"}),
+        ] {
+            assert!(proxy_subscription_tier(&value).is_some());
+        }
+    }
+
+    #[test]
+    fn proxy_fetch_uses_one_response_and_prefers_modern_period_fields() {
+        let (base, log) = spawn_server(move |path, _| match path {
+            "/credits" => (
                 200,
                 serde_json::json!({
-                    "subscriptionTiers": "super_grok",
-                    "config": { "creditUsagePercent": 25 }
+                    "subscription_tier": "SuperGrok Heavy",
+                    "config": {
+                        "creditUsagePercent": 25,
+                        "currentPeriod": {
+                            "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                            "start": "2026-01-01T00:00:00Z",
+                            "end": "2026-01-08T00:00:00Z"
+                        },
+                        "monthlyLimit": { "val": 20000 },
+                        "used": { "val": 5000 }
+                    }
                 })
                 .to_string(),
             ),
-            "/monthly" => (503, "{}".to_string()),
             _ => (404, "{}".to_string()),
         });
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -961,19 +1083,19 @@ mod tests {
             .build()
             .unwrap();
         let usage = runtime.block_on(async {
-            let client = reqwest::Client::new();
             fetch_proxy_usage(
-                &client,
-                "test-token",
-                &format!("{base}/weekly"),
-                &format!("{base}/monthly"),
+                &tokscale_core::http::client(),
+                &direct_credentials(),
+                &format!("{base}/credits"),
             )
             .await
         });
-        assert_eq!(usage.plan.as_deref(), Some("Super Grok"));
+
         assert_eq!(usage.metrics.len(), 1);
         assert_eq!(usage.metrics[0].label, "Weekly");
         assert_eq!(usage.metrics[0].remaining_percent, 75.0);
+        assert_eq!(usage.plan.as_deref(), Some("Supergrok Heavy"));
+        assert_eq!(log.lock().unwrap().len(), 1);
     }
 
     fn push_varint(mut value: u64, out: &mut Vec<u8>) {
@@ -1028,61 +1150,82 @@ mod tests {
     }
 
     #[test]
-    fn parses_proxy_weekly_and_monthly_metrics() {
-        let weekly = serde_json::json!({
-            "subscriptionTiers": "super_grok",
-            "config": {
-                "creditUsagePercent": 42.5,
-                "currentPeriod": {
-                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
-                    "start": "2026-06-01T00:00:00Z",
-                    "end": "2026-06-08T00:00:00Z"
+    fn parses_weekly_and_monthly_period_types_without_duplicate_pools() {
+        let now = DateTime::parse_from_rfc3339("2026-06-02T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for (period_type, expected_label) in [
+            ("USAGE_PERIOD_TYPE_WEEKLY", "Weekly"),
+            ("USAGE_PERIOD_TYPE_MONTHLY", "Monthly"),
+        ] {
+            let value = serde_json::json!({
+                "config": {
+                    "creditUsagePercent": 42.5,
+                    "currentPeriod": {
+                        "type": period_type,
+                        "start": "2026-06-01T00:00:00Z",
+                        "end": "2026-06-08T00:00:00Z"
+                    },
+                    // Deprecated fields describe the same pool and must not
+                    // produce a second metric.
+                    "monthlyLimit": { "val": 20000 },
+                    "used": { "val": 5000 }
                 }
-            }
-        });
-        let weekly_metric = parse_proxy_weekly_metric(&weekly).expect("weekly");
-        assert_eq!(weekly_metric.label, "Weekly");
-        assert!((weekly_metric.used_percent - 42.5).abs() < f64::EPSILON);
-        assert_eq!(
-            weekly_metric.resets_at.as_deref(),
-            Some("2026-06-08T00:00:00Z")
-        );
+            });
+            let metric = parse_proxy_billing_metric(&value, now).expect("credits metric");
+            assert_eq!(metric.label, expected_label);
+            assert!((metric.used_percent - 42.5).abs() < f64::EPSILON);
+            assert_eq!(metric.resets_at.as_deref(), Some("2026-06-08T00:00:00Z"));
+        }
+    }
 
-        let weekly_string = serde_json::json!({
-            "config": {
-                "creditUsagePercent": "18",
-                "currentPeriod": {
-                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
-                    "start": "2026-06-01T00:00:00Z",
-                    "end": "2026-06-08T00:00:00Z"
+    #[test]
+    fn legacy_cent_objects_treat_omitted_zero_value_as_zero() {
+        for used in [serde_json::json!({}), serde_json::json!({"val": 0})] {
+            let value = serde_json::json!({
+                "config": {
+                    "monthlyLimit": { "val": 20000 },
+                    "used": used,
+                    "billingPeriodEnd": "2026-07-01T00:00:00Z"
                 }
-            }
-        });
-        let string_metric = parse_proxy_weekly_metric(&weekly_string).expect("weekly string");
-        assert!((string_metric.used_percent - 18.0).abs() < f64::EPSILON);
+            });
+            let metric = parse_proxy_legacy_metric(&value).expect("legacy metric");
+            assert_eq!(metric.label, "Monthly");
+            assert_eq!(metric.used_percent, 0.0);
+            assert_eq!(
+                metric.remaining_label.as_deref(),
+                Some("$200.00/$200.00 left")
+            );
+        }
+    }
 
-        let monthly = serde_json::json!({
-            "config": {
-                "monthlyLimit": { "val": 20000 },
-                "used": { "val": 5000 },
-                "billingPeriodEnd": "2026-07-01T00:00:00Z"
-            }
-        });
-        let monthly_metric = parse_proxy_monthly_metric(&monthly).expect("monthly");
-        assert_eq!(monthly_metric.label, "Monthly");
-        assert!((monthly_metric.used_percent - 25.0).abs() < f64::EPSILON);
-        assert_eq!(
-            monthly_metric.remaining_label.as_deref(),
-            Some("$150.00/$200.00 left")
-        );
+    #[test]
+    fn omitted_percent_requires_an_active_unified_period() {
+        let now = DateTime::parse_from_rfc3339("2026-06-02T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let response = |start: &str, end: &str, unified: bool| {
+            serde_json::json!({
+                "config": {
+                    "isUnifiedBillingUser": unified,
+                    "currentPeriod": {
+                        "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                        "start": start,
+                        "end": end
+                    }
+                }
+            })
+        };
 
-        let zero_monthly = serde_json::json!({
-            "config": {
-                "monthlyLimit": { "val": 0 },
-                "used": { "val": 0 }
-            }
-        });
-        assert!(parse_proxy_monthly_metric(&zero_monthly).is_none());
+        let active = response("2026-06-01T00:00:00Z", "2026-06-08T00:00:00Z", true);
+        let metric = parse_proxy_billing_metric(&active, now).expect("active empty week");
+        assert_eq!(metric.used_percent, 0.0);
+
+        let expired = response("2026-05-20T00:00:00Z", "2026-05-27T00:00:00Z", true);
+        assert!(parse_proxy_billing_metric(&expired, now).is_none());
+
+        let unrelated = response("2026-06-01T00:00:00Z", "2026-06-08T00:00:00Z", false);
+        assert!(parse_proxy_billing_metric(&unrelated, now).is_none());
     }
 
     #[test]
