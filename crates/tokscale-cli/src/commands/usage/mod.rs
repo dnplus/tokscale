@@ -512,6 +512,9 @@ fn filter_disabled_outputs(
 }
 
 fn provider_id_for_label(label: &str) -> Option<&'static str> {
+    if matches!(label, "Grok" | "Grok Build") {
+        return Some("grok");
+    }
     usage_providers(Fetch::Multi(codex::fetch_all))
         .into_iter()
         .find_map(|(id, provider, _, _)| (provider == label).then_some(id))
@@ -901,6 +904,48 @@ mod tests {
         assert_eq!(provider_id_for_label("Colab"), Some("colab"));
         let disabled = std::collections::HashSet::from(["colab".to_string()]);
         assert!(filter_disabled_outputs(vec![sample_output("Colab")], &disabled).is_empty());
+    }
+
+    #[test]
+    fn disabled_grok_filters_legacy_and_current_labels_only() {
+        let disabled = std::collections::HashSet::from(["grok".to_string()]);
+        let outputs = filter_disabled_outputs(
+            vec![
+                sample_output("Grok Build"),
+                sample_output("Grok"),
+                sample_output("Grok Bot"),
+                sample_output("Codex"),
+            ],
+            &disabled,
+        );
+        let labels = outputs
+            .iter()
+            .map(|output| output.provider.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["Grok Bot", "Codex"]);
+        assert_eq!(provider_id_for_label("Grok Build"), Some("grok"));
+        assert_eq!(provider_id_for_label("Grok"), Some("grok"));
+        assert_eq!(provider_id_for_label("Grok Other"), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn disabled_grok_skips_credential_probe_and_fetch() {
+        *counters().lock().unwrap() = (0, 0);
+        let disabled = std::collections::HashSet::from(["grok".to_string()]);
+        let report = fetch_all_report_from_providers(
+            vec![(
+                "grok",
+                "Grok",
+                counted_has_credentials,
+                Fetch::Single(counted_fetch),
+            )],
+            &disabled,
+            empty_codex_fetch,
+        );
+        assert!(report.outputs.is_empty());
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(*counters().lock().unwrap(), (0, 0));
     }
 
     #[test]
