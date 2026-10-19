@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Tokscale](./.github/assets/hero-v2.png)](https://tokscale.ai)
+[![Tokscale](./.github/assets/hero-v3.png)](https://tokscale.ai)
 
 </div>
 
@@ -13,11 +13,11 @@
 > **v2 已发布 — 原生 Rust TUI、跨平台支持等。** <br />
 > 我每周都会发布新的开源项目。不要错过下一个。
 >
-> | [<img alt="GitHub Follow" src="https://img.shields.io/github/followers/junhoyeo?style=flat-square&logo=github&labelColor=black&color=24292f" width="156px" />](https://github.com/junhoyeo) | 在 GitHub 上关注 [@junhoyeo](https://github.com/junhoyeo) 获取更多项目。涉及 AI、基础设施等各个领域。 |
+> [<img alt="X follow" src="https://img.shields.io/badge/follow-%40Tokscale-000000?style=flat-square&logo=x&logoColor=white&labelColor=black" width="156px" />](https://x.com/Tokscale) | 在 X 上关注 [@Tokscale](https://x.com/Tokscale)，获取版本发布和最新动态。 |
 > | :-----| :----- |
 > [<img alt="Discord link" src="https://img.shields.io/discord/1480206352755458110?color=5865F2&label=discord&labelColor=black&logo=discord&logoColor=white&style=flat-square" width="156px" />](https://discord.gg/h6DUGWdBbm) | 加入我们的 [Discord](https://discord.gg/h6DUGWdBbm) — 与全球顶尖的开发者一起交流。 |
-> [<img alt="X follow" src="https://img.shields.io/badge/follow-%40Tokscale-000000?style=flat-square&logo=x&logoColor=white&labelColor=black" width="156px" />](https://x.com/Tokscale) | 在 X 上关注 [@Tokscale](https://x.com/Tokscale)，获取版本发布和最新动态。 |
 > [<img alt="Sponsor Tokscale" src="https://img.shields.io/badge/sponsor-Tokscale-EA4AAA?style=flat-square&logo=githubsponsors&logoColor=white&labelColor=black" width="156px" />](https://github.com/sponsors/junhoyeo) | 通过 [GitHub Sponsors](https://github.com/sponsors/junhoyeo) 支持 Tokscale 的持续开发。 |
+> | [<img alt="GitHub Follow" src="https://img.shields.io/github/followers/junhoyeo?style=flat-square&logo=github&labelColor=black&color=24292f" width="156px" />](https://github.com/junhoyeo) | 在 GitHub 上关注 [@junhoyeo](https://github.com/junhoyeo) 获取更多项目。涉及 AI、基础设施等各个领域。 |
 
 <div align="center">
 
@@ -418,7 +418,7 @@ tokscale --client opencode,claude
 # 重复使用：效果相同（与 shell 别名搭配使用很方便）
 tokscale -c opencode -c claude
 
-# Cursor IDE 需要先运行 `tokscale cursor login`
+# Cursor IDE 使用 Tokscale 的 API 缓存；尚未保存登录时会导入桌面端会话
 tokscale --client cursor
 
 # Synthetic（synthetic.new）从其他 agent 会话中检测
@@ -494,7 +494,6 @@ tokscale pricing list-overrides
 
 ```json
 {
-  "$schema": "https://tokscale.ai/custom-pricing.schema.json",
   "models": {
     "accounts/fireworks/routers/kimi-k2p6-turbo": {
       "input_cost_per_million_tokens": 2.00,
@@ -516,6 +515,8 @@ tokscale pricing list-overrides
 }
 ```
 
+JSON Schema 位于仓库中的 [schemas/custom-pricing.schema.json](schemas/custom-pricing.schema.json)。如需编辑器校验，请使用该 Schema 的本地副本。
+
 覆盖价格以每百万 Token 的美元数输入，这与大多数 API 提供商公布价格的方式一致；Tokscale 会在内部将其转换为每 Token 的费率。`input_cost_per_million_tokens` 或 `output_cost_per_million_tokens` 中至少要有一个存在，缓存读取/缓存创建字段为可选。显式的 `0` 是允许的，这正是声明免费模型的方式——`0` 是一个陈述（“这不收费”），而省略字段表示费率未知，会导致该用量未被定价。为兼容复制粘贴，也接受 LiteLLM 风格的每 Token 字段名，例如 `input_cost_per_token`、`output_cost_per_token` 和 `cache_read_input_token_cost`，但推荐面向用户使用每百万的命名形式。要省略某个层级或缓存价格，直接不写该字段即可；负值或非有限值会被视为无效，并跳过整个模型条目，以免拼写错误悄悄改变统计。可选的 `source` 和 `notes` 字段会被 Tokscale 忽略，可用于您自己的记账。
 
 覆盖是仅精确匹配且不区分大小写的。Tokscale 先检查原始模型 ID，再检查现有的合成 `/models/` 归一化，然后才在没有覆盖匹配时回退到 LiteLLM、OpenRouter、Cursor 定价和模糊匹配。原始精确匹配优先于归一化精确匹配，因此 `accounts/fireworks/routers/kimi-k2p6-turbo` 可以覆盖某个特定网关的模型，而 `kimi-k2p6-turbo` 可以覆盖归一化的 `/models/` 路径。覆盖在启动时仅加载一次；编辑文件后请重启命令。这是在等待上游 LiteLLM 价格更新期间，针对错误模型定价 Bug 的推荐本地修复方案。
@@ -533,6 +534,12 @@ tokscale pricing list-overrides
 | `meta-llama/` | `fireworks_ai/` |
 
 示例：`grok-code` 匹配 `xai/grok-code-fast-1`（$0.20/$1.50）而非 `azure_ai/grok-code-fast-1`（$3.50/$17.50）。
+
+#### 按计费渠道设置价格
+
+自定义价格保留原有全局 `models`，新增 `provider_overrides`。查询示例：`tokscale pricing MODEL --billing-provider vertex --source custom --json --no-spinner`。旧 `--provider` 仍表示价格表来源。渠道按日志完整标签匹配（去首尾空白、ASCII 大小写不敏感），不从模型厂商推断，也不代表已验证的账户或真实收款商。未知渠道只使用全局规则或上游估价。
+
+用 `tokscale pricing validate-overrides --strict --json --no-spinner` 离线校验；用 `tokscale pricing explain --json --no-spinner` 查看本地逐消息渠道、覆盖情况、倍率和费用状态。自定义费率为基础价；日志权威金额（包括零）始终保留。编辑后重启，历史估价按当前价格重算，失效旧估价不混入合计。降级旧二进制会忽略渠道规则。匹配顺序为渠道原始模型→全局原始模型→渠道 synthetic 归一模型→全局归一模型。重复渠道选择器整组禁用，缺少费用桶不会借用其他渠道。缓存升级保留 compacted 历史，不上传私有渠道诊断。[完整说明与示例](docs/provider-pricing.md)。
 
 ### 社交平台命令
 
@@ -616,15 +623,15 @@ tokscale autosubmit disable
 
 ### Cursor IDE 命令
 
-Cursor IDE 通过 Cursor 的网页用量 API 获取数据，并缓存在 `~/.config/tokscale/cursor-cache/usage*.json`。Tokscale **不会**解析 `~/.cursor` 下的 Cursor Agent CLI 本地会话，也不会把桌面端 SQLite 当作用量账本。
+Cursor IDE 使用 Cursor 的 usage-events API。当前账户缓存在 `~/.config/tokscale/cursor-cache/usage.json`，其他账户使用 `usage.account-<sha256-of-exact-account-id>.json`，并记录所有者元数据。无法确认所有者的旧 JSON/CSV 会在同步或切换账户前保存在 `cursor-cache/archive/`。Tokscale 不解析本地 `~/.cursor` 记录，也不把桌面端 SQLite DB 当作用量账本。
 
-若本机已安装并登录 Cursor 桌面端，`tokscale cursor login` 会优先从 Cursor 的 `state.vscdb` 读取 `cursorAuth/accessToken` 并自动构造会话 cookie；`tokscale cursor sync` 在可用时也会刷新该 token。用量数据仍只来自 Cursor 的用量 API。
+本机已安装并登录 Cursor 桌面端时，如果还没有已保存的 Cursor 登录，报告、submit 和 wrapped 可以从 `state.vscdb` 导入 `cursorAuth/accessToken`。wrapped 仅在请求的客户端包含 Cursor 时导入。用量缓存仍新鲜时，报告会跳过同步。每次实际同步时，包括显式运行 `tokscale cursor sync`，都会在桌面会话可用时刷新其令牌，并可能将活动账号切换到该桌面登录。缺少桌面会话时，已保存的登录仍可使用。用量数据仍只来自 Cursor 的 usage-events API，而不是本地 `~/.cursor` 记录。
 
 设置（桌面端自动登录）：
 
 1. 登录 Cursor 桌面端。
-2. 运行 `tokscale cursor login --name work`（有本地桌面会话时会自动检测）。
-3. 运行 `tokscale cursor sync --json`，填充 `~/.config/tokscale/cursor-cache/usage.json`。
+2. 可选：运行 `tokscale cursor login --name work`，把该桌面会话保存为一个名称。尚未保存 Cursor 登录时，报告、提交和同步会自动导入它。
+3. 可选：运行 `tokscale cursor sync --json`，立即刷新 `~/.config/tokscale/cursor-cache/usage.json`。缓存过期时，报告自己会同步。
 4. 运行 `tokscale --client cursor` 或任意报告命令。
 
 回退（手动粘贴浏览器 cookie）：桌面端不可用时：
@@ -668,9 +675,9 @@ tokscale cursor logout --all
 tokscale cursor logout --all --purge-cache
 ```
 
-**凭据存储**：Cursor 账户保存到 `~/.config/tokscale/cursor-credentials.json`。使用量数据缓存在 `~/.config/tokscale/cursor-cache/`（活动账户使用 `usage.json`，其他账户使用 `usage.<account>.json`）。
+**凭据存储**：Cursor 账户保存到 `~/.config/tokscale/cursor-credentials.json`。使用量数据缓存在 `~/.config/tokscale/cursor-cache/`（活动账户使用 `usage.json`，其他账户使用 `usage.account-<sha256-of-exact-account-id>.json`）。
 
-默认情况下，tokscale 会 **合并统计所有已保存 Cursor 账户的使用量**（`cursor-cache/usage*.json`）。对于尚无 JSON 缓存的账户，仍会读取旧版 Tokscale 生成的旧格式 CSV 缓存（`usage.csv`、`usage.<account>.csv`）；该账户下次同步成功后，会写入 JSON 缓存，并将 CSV 移动到 `cursor-cache/archive/`。
+默认合计所有已保存 Cursor 账户的 `cursor-cache/usage*.json`。文件名使用精确账户 ID 的 SHA-256，并验证所有者，避免旧文件名冲突导致共享历史或同步进度。无法确认所有者的旧 JSON/CSV 会按原始字节和文件名保存在 `cursor-cache/archive/` 内的唯一目录中，然后各账户独立从头获取。备份不参与报告，获取失败后仍可恢复；备份失败会在覆盖前停止。迁移前的离线报告仍可读取旧缓存。同步获取新用量及最新有效事件前一小时内的更正，并保留更旧的记录。超时的获取不会写入缓存，已有缓存保持不变，避免下次同步跳过未完成的区间。
 
 登出时，tokscale 会将缓存的历史记录移动到 `cursor-cache/archive/`（因此不会参与合并统计）。如需彻底删除缓存，请使用 `--purge-cache`。
 
@@ -1223,9 +1230,9 @@ Tokscale 包含一个社交平台，您可以在其中分享使用数据并与�
 
 生成一张精美的年度回顾图片，总结您的 AI 编程助手使用情况——灵感来自 Spotify Wrapped。
 
-| `bunx tokscale@latest wrapped` | `bunx tokscale@latest wrapped --clients` | `bunx tokscale@latest wrapped --agents --disable-pinned` |
-|:---:|:---:|:---:|
-| ![Wrapped 2025 (Agents + Pin Sisyphus)](.github/assets/wrapped-2025-agents.png) | ![Wrapped 2025 (Clients)](.github/assets/wrapped-2025-clients.png) | ![Wrapped 2025 (Agents + Disable Pinned)](.github/assets/wrapped-2025-agents-disable-pinned.png) |
+| `bunx tokscale@latest wrapped` | `bunx tokscale@latest wrapped --clients` |
+|:---:|:---:|
+| ![Wrapped 2025 (Agents)](.github/assets/wrapped-2025-agents.png) | ![Wrapped 2025 (Clients)](.github/assets/wrapped-2025-clients.png) |
 
 ### 命令
 

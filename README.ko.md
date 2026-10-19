@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Tokscale](./.github/assets/hero-v2.png)](https://tokscale.ai)
+[![Tokscale](./.github/assets/hero-v3.png)](https://tokscale.ai)
 
 </div>
 
@@ -13,11 +13,11 @@
 > **v2 출시 — 네이티브 Rust TUI, 크로스 플랫폼 지원 등.** <br />
 > 저는 매주 새로운 오픈소스 프로젝트를 공개합니다. 놓치지 마세요.
 >
-> | [<img alt="GitHub Follow" src="https://img.shields.io/github/followers/junhoyeo?style=flat-square&logo=github&labelColor=black&color=24292f" width="156px" />](https://github.com/junhoyeo) | GitHub에서 [@junhoyeo](https://github.com/junhoyeo)를 팔로우하고 더 많은 프로젝트를 만나보세요. AI, 인프라 등 다양한 분야를 다룹니다. |
+> [<img alt="X follow" src="https://img.shields.io/badge/follow-%40Tokscale-000000?style=flat-square&logo=x&logoColor=white&labelColor=black" width="156px" />](https://x.com/Tokscale) | X에서 [@Tokscale](https://x.com/Tokscale)을 팔로우하고 릴리스 소식과 업데이트를 받아보세요. |
 > | :-----| :----- |
 > [<img alt="Discord link" src="https://img.shields.io/discord/1480206352755458110?color=5865F2&label=discord&labelColor=black&logo=discord&logoColor=white&style=flat-square" width="156px" />](https://discord.gg/h6DUGWdBbm) | [Discord](https://discord.gg/h6DUGWdBbm)에서 함께해요 — 세계 최고의 바이버들과 어울리세요. |
-> [<img alt="X follow" src="https://img.shields.io/badge/follow-%40Tokscale-000000?style=flat-square&logo=x&logoColor=white&labelColor=black" width="156px" />](https://x.com/Tokscale) | X에서 [@Tokscale](https://x.com/Tokscale)을 팔로우하고 릴리스 소식과 업데이트를 받아보세요. |
 > [<img alt="Sponsor Tokscale" src="https://img.shields.io/badge/sponsor-Tokscale-EA4AAA?style=flat-square&logo=githubsponsors&logoColor=white&labelColor=black" width="156px" />](https://github.com/sponsors/junhoyeo) | [GitHub Sponsors](https://github.com/sponsors/junhoyeo)를 통해 Tokscale의 지속적인 개발을 후원해 주세요. |
+> | [<img alt="GitHub Follow" src="https://img.shields.io/github/followers/junhoyeo?style=flat-square&logo=github&labelColor=black&color=24292f" width="156px" />](https://github.com/junhoyeo) | GitHub에서 [@junhoyeo](https://github.com/junhoyeo)를 팔로우하고 더 많은 프로젝트를 만나보세요. AI, 인프라 등 다양한 분야를 다룹니다. |
 
 <div align="center">
 
@@ -417,7 +417,7 @@ tokscale --client opencode,claude
 # 반복: 같은 효과 (쉘 alias와 함께 쓰기 좋음)
 tokscale -c opencode -c claude
 
-# Cursor IDE는 Tokscale의 API 캐시를 사용; 먼저 login + sync --json 실행
+# Cursor IDE는 Tokscale의 API 캐시를 사용; 저장된 로그인이 없으면 데스크톱 세션을 가져옴
 tokscale --client cursor
 
 # Synthetic (synthetic.new) 은 다른 에이전트 세션에서 검출됨
@@ -493,7 +493,6 @@ tokscale pricing list-overrides
 
 ```json
 {
-  "$schema": "https://tokscale.ai/custom-pricing.schema.json",
   "models": {
     "accounts/fireworks/routers/kimi-k2p6-turbo": {
       "input_cost_per_million_tokens": 2.00,
@@ -515,6 +514,8 @@ tokscale pricing list-overrides
 }
 ```
 
+JSON 스키마는 이 저장소의 [schemas/custom-pricing.schema.json](schemas/custom-pricing.schema.json)에 있습니다. 편집기 검증에는 해당 스키마의 로컬 사본을 사용하세요.
+
 오버라이드 가격은 대부분의 API 프로바이더가 가격을 공개하는 방식과 같이 백만 토큰당 달러 단위로 입력하며, Tokscale은 내부적으로 토큰당 요율로 변환합니다. `input_cost_per_million_tokens` 또는 `output_cost_per_million_tokens` 중 적어도 하나는 존재해야 하며, 캐시 읽기/캐시 생성 필드는 선택 사항입니다. 명시적인 `0`도 허용되며, 무료 모델을 선언하는 방법입니다 — `0`은 "비용이 없다"는 진술이고, 필드를 생략하는 것은 요율을 모른다는 뜻이라 사용량이 가격 미책정으로 남습니다. 복사/붙여넣기 호환성을 위해 `input_cost_per_token`, `output_cost_per_token`, `cache_read_input_token_cost` 같은 LiteLLM 스타일의 토큰당 필드명도 허용되지만, 백만 토큰당 이름이 권장되는 사용자용 형식입니다. 티어나 캐시 가격을 생략하려면 해당 필드를 비워 두세요. 음수이거나 유한하지 않은 값은 잘못된 것으로 처리되어 오타가 회계를 조용히 바꾸지 않도록 해당 모델 항목 전체를 건너뜁니다. 선택적 `source` 및 `notes` 필드는 Tokscale이 무시하므로 사용자 자신의 기록용으로 사용할 수 있습니다.
 
 오버라이드는 정확 일치 전용이며 대소문자를 구분하지 않습니다. Tokscale은 원본 모델 ID를 먼저 확인하고, 그다음 기존 합성 `/models/` 정규화를 확인한 뒤, 일치하는 오버라이드가 없으면 LiteLLM, OpenRouter, Cursor 가격, 퍼지 매칭으로 넘어갑니다. 원본 정확 일치가 정규화된 정확 일치보다 우선하므로, `accounts/fireworks/routers/kimi-k2p6-turbo`는 특정 게이트웨이 모델을 오버라이드할 수 있고 `kimi-k2p6-turbo`는 정규화된 `/models/` 경로를 커버할 수 있습니다. 오버라이드는 시작 시 한 번 로드되므로 파일을 편집한 후에는 명령을 다시 실행하세요. 업스트림 LiteLLM 가격 업데이트를 기다리는 동안 잘못된 모델 가격 버그를 로컬에서 수정하는 권장 방법입니다.
@@ -532,6 +533,12 @@ tokscale pricing list-overrides
 | `meta-llama/` | `fireworks_ai/` |
 
 예시: `grok-code`는 `azure_ai/grok-code-fast-1` ($3.50/$17.50) 대신 `xai/grok-code-fast-1` ($0.20/$1.50)와 일치합니다.
+
+#### 결제 채널별 가격
+
+기존 전역 `models`와 함께 `provider_overrides`를 설정할 수 있습니다. `tokscale pricing MODEL --billing-provider vertex --source custom --json --no-spinner`로 조회합니다. 기존 `--provider`는 여전히 가격표 출처를 뜻합니다. 채널은 로그의 전체 라벨을 공백 제거 및 ASCII 대소문자 무시로 비교하며 모델 제조사에서 추론하지 않습니다. 실제 결제 계정이나 판매자를 검증하는 기능은 아닙니다.
+
+`tokscale pricing validate-overrides --strict --json --no-spinner`로 오프라인 검증하고, `tokscale pricing explain --json --no-spinner`로 메시지별 채널·요율 배수·커버리지·추정 상태를 로컬에서 확인하세요. 사용자 요율은 기본 요율이며 기록된 확정 비용은 0도 유지합니다. 설정 수정 후 재시작하면 과거 추정액도 현재 가격으로 재계산하고 만료된 추정액은 합계에서 제외합니다. 구버전으로 내려가면 채널별 규칙은 무시됩니다. [우선순위, 캐시 이전 및 예제](docs/provider-pricing.md).
 
 ### 소셜 플랫폼 명령어
 
@@ -616,15 +623,15 @@ tokscale autosubmit disable
 
 ### Cursor IDE 명령어
 
-Cursor IDE 지원은 Cursor의 웹 사용량 API를 사용하며, Tokscale이 `~/.config/tokscale/cursor-cache/usage*.json`에 캐싱합니다. Tokscale은 `~/.cursor` 아래의 로컬 Cursor Agent CLI 상태를 파싱하지 않으며, 데스크톱 SQLite DB를 사용량 원장으로 취급하지도 않습니다.
+Cursor IDE는 Cursor의 usage-events API를 사용합니다. 활성 계정은 `~/.config/tokscale/cursor-cache/usage.json`에, 다른 계정은 `usage.account-<sha256-of-exact-account-id>.json`에 소유자 메타데이터와 함께 저장합니다. 소유자를 확인할 수 없는 이전 JSON/CSV는 동기화나 계정 변경 전에 `cursor-cache/archive/`에 보관합니다. Tokscale은 로컬 `~/.cursor` 기록을 파싱하거나 데스크톱 SQLite DB를 사용량 원장으로 취급하지 않습니다.
 
-Cursor 데스크톱 앱이 설치되어 있고 로그인되어 있으면, `tokscale cursor login`은 Cursor의 `state.vscdb`에서 `cursorAuth/accessToken`을 우선 읽어 세션 쿠키를 자동으로 만듭니다. `tokscale cursor sync`도 가능할 때 이 토큰을 갱신합니다. 사용량 행은 계속 Cursor 사용량 API에서만 가져옵니다.
+Cursor 데스크톱 앱이 설치되어 있고 로그인되어 있으면, 저장된 Cursor 로그인이 없을 때 리포트, submit, wrapped가 `state.vscdb`의 `cursorAuth/accessToken`을 가져올 수 있습니다. wrapped는 요청한 클라이언트에 Cursor가 포함된 경우에만 가져옵니다. 사용량 캐시가 아직 최신이면 리포트는 동기화를 건너뜁니다. 명시적인 `tokscale cursor sync`를 포함해 동기화가 실행될 때마다 사용 가능한 데스크톱 토큰을 갱신하며, 활성 계정이 해당 데스크톱 로그인으로 전환될 수 있습니다. 데스크톱 세션이 없어도 저장된 로그인은 계속 사용할 수 있습니다. 사용량 행은 Cursor usage-events API에서만 가져오며, 로컬 `~/.cursor` 기록은 파싱하지 않습니다.
 
 설정 (데스크톱 자동 로그인):
 
 1. Cursor 데스크톱 앱에 로그인하세요.
-2. `tokscale cursor login --name work`를 실행하세요 (로컬 데스크톱 세션이 있으면 자동 감지).
-3. `tokscale cursor sync --json`을 실행해 `~/.config/tokscale/cursor-cache/usage.json`을 채우세요.
+2. 선택: `tokscale cursor login --name work`를 실행해 그 데스크톱 세션을 이름으로 저장하세요. 저장된 Cursor 로그인이 아직 없으면 리포트, submit, sync가 자동으로 가져옵니다.
+3. 선택: `tokscale cursor sync --json`을 실행해 `~/.config/tokscale/cursor-cache/usage.json`을 지금 새로 고치세요. 캐시가 오래되면 리포트가 직접 동기화합니다.
 4. `tokscale --client cursor` 또는 아무 리포트 명령을 실행하세요.
 
 대체 방법 (브라우저 쿠키 수동 붙여넣기) — 데스크톱 로그인을 쓸 수 없을 때:
@@ -671,7 +678,7 @@ tokscale cursor logout --all
 tokscale cursor logout --all --purge-cache
 ```
 
-기본적으로 Tokscale은 `cursor-cache/usage*.json`을 읽어 저장된 모든 Cursor 계정의 사용량을 합산합니다. 활성 계정은 `usage.json`에 동기화되고, 추가 계정은 `usage.<account>.json`에 동기화됩니다. 이전 버전의 Tokscale이 만든 레거시 CSV 캐시(`usage.csv`, `usage.<account>.csv`)도 아직 JSON 캐시가 없는 계정이라면 계속 읽습니다. 해당 계정이 다음에 동기화에 성공하면 JSON 캐시를 쓰고 CSV는 `cursor-cache/archive/`로 옮깁니다.
+기본적으로 저장된 모든 Cursor 계정의 `cursor-cache/usage*.json`을 합산합니다. 파일명은 정확한 계정 ID의 SHA-256을 사용하며 소유자를 검증하므로 이전 파일명이 충돌해도 기록이나 동기화 진행 상태를 공유하지 않습니다. 소유자를 확인할 수 없는 이전 JSON/CSV는 원래 바이트와 파일명 그대로 `cursor-cache/archive/` 안의 고유 디렉터리에 보관하고 각 계정을 처음부터 가져옵니다. 백업은 리포트에서 제외되며 가져오기가 실패해도 복구할 수 있습니다. 보관 실패 시 덮어쓰기 전에 중단합니다. 이전 캐시는 이 전환 전까지 오프라인 리포트에서 읽을 수 있습니다. 새로운 사용량과 최신 유효 이벤트의 1시간 전까지의 정정 내역을 가져오고 더 오래된 기록은 유지합니다. 시간 초과 시 가져온 페이지를 저장하지 않고 기존 캐시를 유지하여 다음 동기화에서 누락 구간을 건너뛰지 않게 합니다.
 
 로그아웃 시 Tokscale은 캐시된 사용량을 `cursor-cache/archive/`로 옮겨 더 이상 합산되지 않도록 합니다. 캐시된 사용량을 대신 삭제하려면 `--purge-cache`를 사용하세요.
 
@@ -1222,9 +1229,9 @@ shields.io 스타일의 더 간결한 뱃지를 사용할 수도 있습니다:
 
 Spotify Wrapped에서 영감을 받아, AI 코딩 어시스턴트 사용량을 요약한 아름다운 연간 리뷰 이미지를 생성합니다.
 
-| `bunx tokscale@latest wrapped` | `bunx tokscale@latest wrapped --clients` | `bunx tokscale@latest wrapped --agents --disable-pinned` |
-|:---:|:---:|:---:|
-| ![Wrapped 2025 (Agents + Pin Sisyphus)](.github/assets/wrapped-2025-agents.png) | ![Wrapped 2025 (Clients)](.github/assets/wrapped-2025-clients.png) | ![Wrapped 2025 (Agents + Disable Pinned)](.github/assets/wrapped-2025-agents-disable-pinned.png) |
+| `bunx tokscale@latest wrapped` | `bunx tokscale@latest wrapped --clients` |
+|:---:|:---:|
+| ![Wrapped 2025 (Agents)](.github/assets/wrapped-2025-agents.png) | ![Wrapped 2025 (Clients)](.github/assets/wrapped-2025-clients.png) |
 
 ### 명령어
 

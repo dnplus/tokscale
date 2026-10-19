@@ -5,7 +5,6 @@ import {
 } from "./antigravityStateCoverage";
 import {
   foldParserClientSnapshot,
-  modelsForHighWater,
   SUPPORTED_VERSIONED_PARSERS,
   type DeviceParserStates,
   type IncomingParserContribution,
@@ -60,17 +59,11 @@ function addCoverage(target: Coverage, source: Partial<Coverage>): void {
 
 function familyCoverage(cells: Array<ClientBreakdownData | undefined>) {
   const total = emptyCoverage();
-  const models = new Map<string, Coverage>();
   for (const cell of cells) {
     if (!cell) continue;
     addCoverage(total, cell);
-    for (const [modelId, model] of Object.entries(modelsForHighWater(cell))) {
-      const coverage = models.get(modelId) ?? emptyCoverage();
-      addCoverage(coverage, model);
-      models.set(modelId, coverage);
-    }
   }
-  return { total, models };
+  return { total };
 }
 
 function covers(previous: Coverage, incoming?: Coverage): boolean {
@@ -167,19 +160,16 @@ export function planAntigravityTransition(args: {
   if (previous.unverifiable) {
     return freeze("a prior Antigravity parser high-water state cannot be verified");
   }
-  // Date changes are expected as providers expose per-generation timestamps.
-  // Compare family lifetime/model coverage across dates, then replace all
-  // source layouts atomically. This retains the credited total while allowing
-  // the latest source label and day layout to follow the parser.
+  // Date and model-ID re-attributions are expected across parser improvements
+  // (per-generation timestamps, tier model resolution from gemini-default /
+  // gemini-3.5-flash, SessionModels backfills for unknown turns, and Claude
+  // thinking-variant canonicalization). Compare the seven-field family
+  // lifetime coverage across dates and models, matching SNAPSHOT_LAYOUT_CLIENTS
+  // in parserHighWater, then replace all source layouts atomically.
   const incoming = familyCoverage(
     ANTIGRAVITY_FAMILY.flatMap((client) => Object.values(layouts[client]))
   );
-  if (
-    !covers(previous.total, incoming.total) ||
-    [...previous.models].some(([modelId, coverage]) =>
-      !covers(coverage, incoming.models.get(modelId))
-    )
-  ) {
+  if (!covers(previous.total, incoming.total)) {
     return freeze("the full snapshot does not cover this device's credited Antigravity family usage");
   }
 

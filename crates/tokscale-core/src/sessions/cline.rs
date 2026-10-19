@@ -186,13 +186,17 @@ pub fn parse_cline_cli_file(path: &Path) -> Vec<UnifiedMessage> {
             continue;
         }
 
+        let record_provider = entry
+            .model_info
+            .as_ref()
+            .and_then(|model_info| non_empty_string(model_info.provider.as_deref()));
         if let Some(model_info) = entry.model_info.as_ref() {
             if let Some(model) = non_empty_string(model_info.id.as_deref()) {
                 current_model = model;
             }
-            if let Some(provider) = non_empty_string(model_info.provider.as_deref()) {
-                current_provider = provider;
-            }
+        }
+        if let Some(provider) = record_provider.as_ref() {
+            current_provider.clone_from(provider);
         }
 
         let Some(metrics) = entry.metrics else {
@@ -251,6 +255,14 @@ pub fn parse_cline_cli_file(path: &Path) -> Vec<UnifiedMessage> {
             },
             cost,
             file.agent.clone(),
+        )
+        .with_billing(
+            Some(&current_provider),
+            if record_provider.is_some() {
+                super::BillingIdentityOrigin::ExplicitRecord
+            } else {
+                super::BillingIdentityOrigin::ExplicitSession
+            },
         );
         message.dedup_key = Some(dedup_key);
         message.is_turn_start = pending_turn_start;
@@ -308,6 +320,10 @@ mod tests {
         assert_eq!(messages[0].model_id, "claude-sonnet-4");
         assert_eq!(messages[0].session_id, "cline-task-1");
         assert_eq!(messages[0].agent.as_deref(), Some("ClineAgent"));
+        // Cline keeps `tokensIn`, `cacheReads` and `cacheWrites` disjoint
+        // (upstream `message-translator.ts` subtracts before persisting), so
+        // input is used as written -- unlike the Roo/Kilo Code logs that share
+        // this parser.
         assert_eq!(messages[0].tokens.input, 40);
         assert_eq!(messages[0].tokens.output, 15);
         assert_eq!(messages[0].tokens.cache_read, 7);
@@ -405,6 +421,33 @@ mod tests {
         assert_eq!(
             messages[0].dedup_key.as_deref(),
             Some("cline-cli:cline-cli-session:msg-1")
+        );
+    }
+
+    #[test]
+    fn test_cline_cli_manifest_provider_is_session_billing_evidence() {
+        let dir = TempDir::new().unwrap();
+        let session_dir = dir.path().join("sessions").join("manifest-provider");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("manifest-provider.json"),
+            r#"{"provider":"private-gateway","model":"atlas"}"#,
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("manifest-provider.messages.json"),
+            r#"{"messages":[{"id":"reply","role":"assistant","modelInfo":{"id":"atlas"},"metrics":{"inputTokens":1}}]}"#,
+        )
+        .unwrap();
+
+        let messages = parse_cline_file(&session_dir.join("manifest-provider.messages.json"));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].billing_identity,
+            crate::sessions::BillingIdentity::Known {
+                id: "private-gateway".into(),
+                origin: crate::sessions::BillingIdentityOrigin::ExplicitSession,
+            }
         );
     }
 

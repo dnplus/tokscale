@@ -52,6 +52,12 @@ use std::path::Path;
 ///
 /// v3 retained assistant `durationMs`; v4 prefers the assistant message's
 /// authoritative request-start `timestamp` over the later persistence time.
+///
+/// Counting the billed operations that are not assistant replies (`compaction`,
+/// `branch_summary`, `usage`, `toolResult`) moved the Pi-family member offsets
+/// in `message_cache.rs` instead: Prime Agent rides on this parser with
+/// `count_operations` off, so its own caches are unaffected and a base bump
+/// would re-decode them for nothing.
 pub const PI_FORMAT_PARSER_BASE_VERSION: u32 = 4;
 
 /// Pi session header (first line of JSONL)
@@ -238,6 +244,15 @@ pub struct PiSessionEntry {
     pub parent_id: Option<String>,
     pub timestamp: Option<String>,
     pub message: Option<PiMessage>,
+    /// Present on billed operation entries (`compaction`, `branch_summary`,
+    /// `usage`): the API call behind them has no `message` record of its own.
+    pub usage: Option<PiUsage>,
+    /// Standalone `usage` records identify their billed provider and model.
+    /// `model_change` records use `provider` plus `modelId` instead.
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    #[serde(rename = "modelId")]
+    pub model_id: Option<String>,
     pub name: Option<String>,
     /// Present on `title_change` entries.
     pub title: Option<String>,
@@ -288,8 +303,14 @@ pub struct PiUsage {
     pub output: Option<i64>,
     pub cache_read: Option<i64>,
     pub cache_write: Option<i64>,
+    /// Subset of `cache_write` billed at the 1-hour retention rate.
+    pub cache_write_1h: Option<i64>,
     #[allow(dead_code)]
     pub total_tokens: Option<i64>,
+    /// Pi's authoritative cost breakdown for this call. The operation rows
+    /// newly emitted by this parser use `total` directly so custom or routed
+    /// models do not become unpriced merely because Tokscale lacks a rate.
+    pub cost: Option<PiUsageCost>,
     /// Parsed so the omission in `PiUsage::to_breakdown` is a real decision
     /// rather than an accident of the schema, but never summed.
     #[allow(dead_code)]
@@ -298,7 +319,19 @@ pub struct PiUsage {
     extra_fields: BTreeMap<String, serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct PiUsageCost {
+    pub total: Option<f64>,
+}
+
 impl PiUsage {
+    fn reported_cost(&self) -> Option<f64> {
+        self.cost
+            .as_ref()
+            .and_then(|cost| cost.total)
+            .filter(|total| total.is_finite() && *total >= 0.0)
+    }
+
     /// Token breakdown with every field clamped at zero, in the spelling
     /// `utils::CamelUsage` uses for the same wire shape.
     ///
@@ -308,12 +341,25 @@ impl PiUsage {
     /// tokscale totals `reasoning` as its own additive bucket. Mapping it
     /// through would double count.
     pub(crate) fn to_breakdown(&self) -> TokenBreakdown {
+        self.to_breakdown_inner(false)
+    }
+
+    fn to_operation_breakdown(&self) -> TokenBreakdown {
+        self.to_breakdown_inner(true)
+    }
+
+    fn to_breakdown_inner(&self, include_cache_write_1h: bool) -> TokenBreakdown {
+        let cache_write = self.cache_write.unwrap_or(0).max(0);
         TokenBreakdown {
             input: self.input.unwrap_or(0).max(0),
             output: self.output.unwrap_or(0).max(0),
             cache_read: self.cache_read.unwrap_or(0).max(0),
-            cache_write: self.cache_write.unwrap_or(0).max(0),
-            cache_write_1h: 0,
+            cache_write,
+            cache_write_1h: if include_cache_write_1h {
+                self.cache_write_1h.unwrap_or(0).max(0).min(cache_write)
+            } else {
+                0
+            },
             reasoning: 0,
         }
     }
@@ -504,6 +550,12 @@ struct PiParseOptions {
     rlm_session_name_as_agent: bool,
     cross_session_dedup: bool,
     lossy_line_reader: bool,
+    /// Whether the transcript bills work outside assistant replies
+    /// (`compaction`, `branch_summary`, `usage`, `toolResult`). Prime Agent
+    /// keeps this off: its RLM accounting matches emitted messages against
+    /// `child_usage_attributed` records positionally, so widening what the
+    /// shared parser emits there is a separate decision from Pi's totals.
+    count_operations: bool,
 }
 
 impl PiParseOptions {
@@ -516,6 +568,7 @@ impl PiParseOptions {
             rlm_session_name_as_agent: false,
             cross_session_dedup: false,
             lossy_line_reader: false,
+            count_operations: true,
         }
     }
 
@@ -527,6 +580,7 @@ impl PiParseOptions {
             rlm_session_name_as_agent: false,
             cross_session_dedup: true,
             lossy_line_reader: false,
+            count_operations: true,
         }
     }
 
@@ -535,6 +589,7 @@ impl PiParseOptions {
             rlm_session_name_as_agent: true,
             cross_session_dedup: true,
             lossy_line_reader: true,
+            count_operations: false,
         }
     }
 }
@@ -568,24 +623,104 @@ fn damaged_session_placeholder(path: &Path) -> String {
 /// re-targets Prime's usage reconciliation. Both therefore ask this function
 /// rather than restating the rules, so neither can drift from the other.
 struct PiEmittedRecord<'a> {
-    message: &'a PiMessage,
+    /// The message behind the record. `None` for a billed operation entry,
+    /// which has usage but no message.
+    message: Option<&'a PiMessage>,
     usage: &'a PiUsage,
-    recorded_model: &'a str,
+    /// Model/provider attribution carried by this record. Standalone `usage`
+    /// entries carry both at their root; compactions and branch summaries carry
+    /// neither and stay in Pi's separate tools/summary bucket.
+    recorded_model: Option<&'a str>,
+    recorded_provider: Option<&'a str>,
+    /// Of emitted records, only assistant replies advance the session model;
+    /// `model_change` records do so separately. Cache-warm usage or tool
+    /// summaries can use other attribution without changing the selection.
+    updates_current_model: bool,
+    /// Official Pi intentionally separates un-attributed tool and summary
+    /// usage from model-attributed calls. Do not charge it to the preceding
+    /// conversation model merely because the record follows that reply.
+    uses_tools_summary_bucket: bool,
+    /// These rows did not exist in the parser before this change. Preserve
+    /// their authoritative Pi `usage.cost.total` instead of trying to infer a
+    /// possibly custom/routed model's price from Tokscale's catalog.
+    uses_reported_cost: bool,
 }
+
+const PI_TOOLS_SUMMARIES_MODEL: &str = "tools/summaries";
+
+/// Trimmed field value, or `None` when it is absent or only whitespace.
+/// Applied to the record types this parser newly counts, whose identifiers
+/// have no stored spelling to stay compatible with.
+fn non_blank_trimmed(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// The entry types that bill an API call without being an assistant reply.
+/// Pi's `/compact` writes `compaction`, a branch summarization writes
+/// `branch_summary`, and standalone accounting (e.g. cache warming) writes
+/// `usage`. All three carry the call's usage at the record root.
+const PI_OPERATION_ENTRY_TYPES: &[&str] = &["compaction", "branch_summary", "usage"];
 
 fn pi_emitted_record<'a>(
     entry: &'a PiSessionEntry,
     options: PiParseOptions,
     is_rlm_subagent: bool,
 ) -> Option<PiEmittedRecord<'a>> {
-    if entry.entry_type != "message" {
+    let message = entry.message.as_ref();
+    let role = message.and_then(|message| message.role.as_deref());
+    let is_message = entry.entry_type == "message";
+    let is_operation = PI_OPERATION_ENTRY_TYPES.contains(&entry.entry_type.as_str());
+    let (
+        usage,
+        recorded_model,
+        recorded_provider,
+        updates_current_model,
+        uses_tools_summary_bucket,
+        uses_reported_cost,
+    ) = if is_message && role == Some("assistant") {
+        // A reply names the model it was billed against. Pi always records
+        // one; a record without a model has no price, so it stays out as
+        // before. Existing assistant output remains unchanged.
+        let message = message?;
+        (
+            message.usage.as_ref()?,
+            Some(message.model.as_deref()?),
+            // Historical behaviour: a reply's recorded spellings are kept as
+            // they are, and only a fully empty provider falls back to
+            // inference, so cached assistant rows stay byte-identical.
+            message.provider.as_deref().filter(|p| !p.is_empty()),
+            true,
+            false,
+            false,
+        )
+    } else if is_message && role == Some("toolResult") && options.count_operations {
+        // A tool result can report the usage of the call that produced it.
+        // These records are new to this parser, so surrounding whitespace is
+        // normalized away rather than stored as part of an identifier.
+        let message = message?;
+        let recorded_model = non_blank_trimmed(message.model.as_deref());
+        (
+            message.usage.as_ref()?,
+            recorded_model,
+            non_blank_trimmed(message.provider.as_deref()),
+            false,
+            recorded_model.is_none(),
+            true,
+        )
+    } else if options.count_operations && is_operation {
+        // Current Pi UsageEntry records carry concrete root-level model and
+        // provider fields. Older compaction/branch-summary records do not.
+        (
+            entry.usage.as_ref()?,
+            non_blank_trimmed(entry.model.as_deref()),
+            non_blank_trimmed(entry.provider.as_deref()),
+            false,
+            entry.entry_type != "usage",
+            true,
+        )
+    } else {
         return None;
-    }
-
-    let message = entry.message.as_ref()?;
-    if message.role.as_deref() != Some("assistant") {
-        return None;
-    }
+    };
 
     // An RLM child's completion timestamp participates in matching its
     // usage back to the parent attribution. Recovering a replacement-
@@ -604,16 +739,20 @@ fn pi_emitted_record<'a>(
         return None;
     }
 
-    let usage = message.usage.as_ref()?;
     if options.lossy_line_reader && usage.has_damaged_key() {
         return None;
     }
 
-    let recorded_model = message.model.as_deref()?;
+    // The caller resolves explicit attribution, the official tools/summary
+    // bucket, or the legacy current-model fallback for this emitted record.
     Some(PiEmittedRecord {
         message,
         usage,
         recorded_model,
+        recorded_provider,
+        updates_current_model,
+        uses_tools_summary_bucket,
+        uses_reported_cost,
     })
 }
 
@@ -646,6 +785,11 @@ fn parse_pi_format_file_inner(
     let mut workspace_key: Option<String> = None;
     let mut workspace_label: Option<String> = None;
     let mut agent: Option<String> = None;
+    // The session's current model/provider selection. Official tool and
+    // summary operations use their own bucket; these values remain the fallback
+    // for legacy model-less standalone usage records.
+    let mut last_model: Option<String> = None;
+    let mut last_provider: Option<String> = None;
     let mut is_rlm_subagent = false;
     // A header this parser rejects discards the whole transcript, not one
     // record, so the sink stops the scan and nothing is returned.
@@ -733,6 +877,26 @@ fn parse_pi_format_file_inner(
             return ControlFlow::Continue(());
         };
 
+        if entry.entry_type == "model_change" {
+            // Pi persists the selected model immediately. Keep the selection
+            // accurate for backward-compatible attribution of a legacy
+            // model-less usage record before the next assistant reply.
+            let clean_model = entry.model_id.as_deref().filter(|model| {
+                !model.trim().is_empty()
+                    && accepts_replacement_field(model, options.lossy_line_reader)
+            });
+            let clean_provider = entry.provider.as_deref().filter(|provider| {
+                !provider.trim().is_empty()
+                    && accepts_replacement_field(provider, options.lossy_line_reader)
+            });
+            if let (Some(model), Some(provider)) = (clean_model, clean_provider) {
+                last_model = Some(model.to_string());
+                last_provider = Some(provider.to_string());
+            }
+            observer.observe_entry(&entry, None);
+            return ControlFlow::Continue(());
+        }
+
         if entry.entry_type == "session_info" {
             agent = if options.rlm_session_name_as_agent && is_rlm_subagent {
                 entry
@@ -765,34 +929,67 @@ fn parse_pi_format_file_inner(
             message,
             usage,
             recorded_model,
+            recorded_provider,
+            updates_current_model,
+            uses_tools_summary_bucket,
+            uses_reported_cost,
         }) = pi_emitted_record(&entry, options, is_rlm_subagent)
         else {
             observer.observe_entry(&entry, None);
             return ControlFlow::Continue(());
         };
 
-        let model = if !accepts_replacement_field(recorded_model, options.lossy_line_reader) {
-            "unknown"
+        // Standalone `usage` rows and non-standard tool results can name their
+        // own billed model. Official model-less tool/summary work stays in its
+        // own bucket. Only legacy model-less `usage` rows inherit the current
+        // session selection updated by `model_change` and assistant replies.
+        let clean_recorded_provider = recorded_provider
+            .filter(|provider| accepts_replacement_field(provider, options.lossy_line_reader));
+        // Pi itself groups model-less tool results, compactions, and branch
+        // summaries as Tools/summaries. Keep that billed work separate rather
+        // than falsely charging the preceding conversation model. Standalone
+        // usage rows name their actual model; legacy model-less usage inherits
+        // the current selection as an atomic model/provider pair.
+        let (model, provider) = if uses_tools_summary_bucket {
+            (
+                PI_TOOLS_SUMMARIES_MODEL.to_string(),
+                fallback_provider.to_string(),
+            )
         } else {
-            recorded_model
+            match recorded_model {
+                Some(recorded_model) => {
+                    let model =
+                        if accepts_replacement_field(recorded_model, options.lossy_line_reader) {
+                            recorded_model.to_string()
+                        } else {
+                            "unknown".to_string()
+                        };
+                    let provider =
+                        clean_recorded_provider
+                            .map(str::to_string)
+                            .unwrap_or_else(|| {
+                                inferred_provider_from_model(&model)
+                                    .unwrap_or(fallback_provider)
+                                    .to_string()
+                            });
+                    (model, provider)
+                }
+                None => {
+                    let model = last_model.clone().unwrap_or_else(|| "unknown".to_string());
+                    let provider = last_provider.clone().unwrap_or_else(|| {
+                        inferred_provider_from_model(&model)
+                            .unwrap_or(fallback_provider)
+                            .to_string()
+                    });
+                    (model, provider)
+                }
+            }
         };
 
-        // A missing/blank provider field is recoverable: infer it from the
-        // model name (e.g. a Pi "gpt-5" message with no provider maps to
-        // "openai"), falling back to "pi" only when inference can't
-        // identify the model, rather than dropping a message that carries
-        // valid tokens.
-        let provider = match message.provider.as_deref() {
-            Some(provider)
-                if !provider.is_empty()
-                    && accepts_replacement_field(provider, options.lossy_line_reader) =>
-            {
-                provider.to_string()
-            }
-            _ => inferred_provider_from_model(model)
-                .unwrap_or(fallback_provider)
-                .to_string(),
-        };
+        if updates_current_model {
+            last_model = Some(model.clone());
+            last_provider = Some(provider.clone());
+        }
 
         let recorded_timestamp = entry
             .timestamp
@@ -800,13 +997,11 @@ fn parse_pi_format_file_inner(
             .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
             .map(|timestamp| timestamp.timestamp_millis());
         let duration_ms = message
-            .duration_ms
-            .as_ref()
+            .and_then(|message| message.duration_ms.as_ref())
             .and_then(serde_json::Value::as_i64)
             .filter(|duration| *duration > 0);
         let message_start_timestamp = message
-            .timestamp
-            .as_ref()
+            .and_then(|message| message.timestamp.as_ref())
             .and_then(serde_json::Value::as_i64)
             .filter(|timestamp| *timestamp > 0);
         // Pi's assistant timestamp is the authoritative request start. Older
@@ -818,23 +1013,40 @@ fn parse_pi_format_file_inner(
                 .unwrap_or(fallback_timestamp),
             None => recorded_timestamp.unwrap_or(fallback_timestamp),
         };
+        // A billed operation has no response of its own, so its dedup key falls
+        // back to the entry id below.
+        let response_id = message.and_then(|message| message.response_id.as_deref());
 
+        let reported_cost = uses_reported_cost.then(|| usage.reported_cost()).flatten();
         let mut unified = UnifiedMessage::new_with_agent(
             client,
-            model,
+            model.as_str(),
             provider.as_str(),
             session_id.clone().unwrap_or_else(|| "unknown".to_string()),
             timestamp,
-            usage.to_breakdown(),
-            0.0,
+            if uses_reported_cost {
+                usage.to_operation_breakdown()
+            } else {
+                usage.to_breakdown()
+            },
+            reported_cost.unwrap_or(0.0),
             agent.clone(),
+        )
+        .with_billing(
+            // Record-level evidence only: a reply or tool result names its
+            // provider on the message, a standalone operation at the root.
+            // Legacy model-less usage rows inherit the session selection for
+            // attribution but supply no billing evidence.
+            clean_recorded_provider,
+            super::BillingIdentityOrigin::ExplicitRecord,
         );
+        if reported_cost.is_some() {
+            unified.mark_provider_reported_cost();
+        }
         unified.duration_ms = duration_ms;
         if let Some(namespace) = dedup_namespace {
             if options.cross_session_dedup {
-                let clean_response_key = message
-                    .response_id
-                    .as_deref()
+                let clean_response_key = response_id
                     .filter(|id| {
                         !id.trim().is_empty()
                             && accepts_replacement_field(id, options.lossy_line_reader)
@@ -861,7 +1073,7 @@ fn parse_pi_format_file_inner(
                 if unified.dedup_key.is_none() && options.lossy_line_reader {
                     let has_damaged_id = entry.id.as_deref().is_some_and(|id| {
                         !accepts_replacement_field(id, options.lossy_line_reader)
-                    }) || message.response_id.as_deref().is_some_and(|id| {
+                    }) || response_id.is_some_and(|id| {
                         !accepts_replacement_field(id, options.lossy_line_reader)
                     });
                     if has_damaged_id {
@@ -1308,6 +1520,180 @@ mod tests {
             Some("context-builder")
         );
         assert_eq!(pi_subagent_name("Refactor auth module"), None);
+    }
+
+    #[test]
+    fn test_parse_pi_counts_billed_operations_with_official_attribution() {
+        // given: Pi bills work outside assistant replies on their own records —
+        // `/compact` writes `compaction`, branch summarization `branch_summary`,
+        // standalone accounting (cache warming) `usage`. These legacy-shaped
+        // records name no model, and a summary without usage bills nothing.
+        let content = r#"{"type":"session","id":"pi_ses_ops","timestamp":"2026-10-12T02:27:31.079Z","cwd":"/tmp"}
+{"type":"message","id":"m1","timestamp":"2026-10-12T02:28:43.068Z","message":{"role":"assistant","model":"deepseek-flash","provider":"deepseek","usage":{"input":100,"output":50,"cacheRead":0,"cacheWrite":0,"totalTokens":150}}}
+{"type":"compaction","id":"c1","timestamp":"2026-10-12T03:38:44.507Z","summary":"summarized","firstKeptEntryId":"m1","tokensBefore":150,"usage":{"input":184302,"output":3627,"cacheRead":0,"cacheWrite":0,"reasoning":108,"totalTokens":187929,"cost":{"total":0.059643}}}
+{"type":"branch_summary","id":"b1","timestamp":"2026-10-12T04:00:00.000Z","summary":"branch","usage":{"input":29964,"output":882,"cacheRead":0,"cacheWrite":0,"totalTokens":30846}}
+{"type":"usage","id":"w1","timestamp":"2026-10-12T04:30:00.000Z","kind":"cache_warm","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":512}}
+{"type":"compaction","id":"c2","timestamp":"2026-10-12T05:00:00.000Z","summary":"no usage here"}"#;
+        let file = create_test_file(content);
+
+        // when
+        let messages = parse_pi_file(file.path());
+
+        // then
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1].model_id, PI_TOOLS_SUMMARIES_MODEL);
+        assert_eq!(messages[1].provider_id, "pi");
+        assert_eq!(messages[1].tokens.input, 184302);
+        assert_eq!(messages[1].tokens.output, 3627);
+        // reasoning is a subset of output and is never added to the buckets.
+        assert_eq!(messages[1].tokens.reasoning, 0);
+        assert_eq!(messages[2].tokens.input, 29964);
+        assert_eq!(messages[2].model_id, PI_TOOLS_SUMMARIES_MODEL);
+        assert_eq!(messages[3].tokens.cache_write, 512);
+        // The old model-less UsageEntry shape keeps its compatibility fallback.
+        assert_eq!(messages[3].model_id, "deepseek-flash");
+        assert_eq!(messages[3].provider_id, "deepseek");
+        // The usage-free summary is not emitted at all, so nothing else follows.
+        assert_eq!(messages[3].session_id, "pi_ses_ops");
+    }
+
+    #[test]
+    fn test_parse_pi_uses_standalone_usage_model_provider_and_cost() {
+        // Pi's current UsageEntry schema records the concrete billed model and
+        // provider at the root. Cache warming may intentionally use a model
+        // other than the active conversation model.
+        let content = r#"{"type":"session","id":"pi_ses_usage","timestamp":"2026-10-12T02:27:31.079Z","cwd":"/tmp"}
+{"type":"message","id":"m1","timestamp":"2026-10-12T02:28:43.068Z","message":{"role":"assistant","model":"claude-sonnet-4-5","provider":"anthropic","usage":{"input":100,"output":50,"cacheRead":0,"cacheWrite":0,"totalTokens":150}}}
+{"type":"usage","id":"w1","timestamp":"2026-10-12T04:30:00.000Z","kind":"cache_warm","provider":"openrouter","model":"vendor/custom-warm-model","usage":{"input":7,"output":0,"cacheRead":900,"cacheWrite":100,"cacheWrite1h":80,"totalTokens":1007,"cost":{"input":0.01,"output":0,"cacheRead":0.02,"cacheWrite":0,"total":0.03}}}"#;
+        let file = create_test_file(content);
+
+        let messages = parse_pi_file(file.path());
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].model_id, "vendor/custom-warm-model");
+        assert_eq!(messages[1].provider_id, "openrouter");
+        assert_eq!(messages[1].tokens.input, 7);
+        assert_eq!(messages[1].tokens.cache_read, 900);
+        assert_eq!(messages[1].tokens.cache_write, 100);
+        assert_eq!(messages[1].tokens.cache_write_1h, 80);
+        assert_eq!(messages[1].cost, 0.03);
+        assert_eq!(
+            messages[1].cost_source,
+            super::super::CostSource::ProviderReported
+        );
+    }
+
+    #[test]
+    fn test_parse_pi_operation_blank_attribution_falls_back() {
+        // A whitespace-only model/provider is not an identifier, so the row
+        // must reach the normal inference and fallback paths.
+        let content = r#"{"type":"session","id":"pi_ses_blank","timestamp":"2026-10-12T02:27:31.079Z","cwd":"/tmp"}
+{"type":"usage","id":"u1","timestamp":"2026-10-12T03:00:00.000Z","kind":"cache_warm","provider":"  ","model":"  gpt-5  ","usage":{"input":1,"output":1}}
+{"type":"usage","id":"u2","timestamp":"2026-10-12T03:05:00.000Z","kind":"cache_warm","provider":"   ","model":"   ","usage":{"input":2,"output":2}}"#;
+        let file = create_test_file(content);
+
+        let messages = parse_pi_file(file.path());
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].model_id, "gpt-5");
+        assert_eq!(messages[0].provider_id, "openai");
+        assert_eq!(messages[1].model_id, "unknown");
+        assert_eq!(messages[1].provider_id, "pi");
+    }
+
+    #[test]
+    fn test_parse_pi_preserves_operation_cost_and_1h_cache_split() {
+        let content = r#"{"type":"session","id":"pi_ses_cost_split","timestamp":"2026-10-12T02:27:31.079Z","cwd":"/tmp"}
+{"type":"compaction","id":"c1","timestamp":"2026-10-12T03:38:44.507Z","summary":"summarized","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":100,"cacheWrite1h":80,"totalTokens":115,"cost":{"total":0.059643}}}"#;
+        let file = create_test_file(content);
+
+        let messages = parse_pi_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.cache_write, 100);
+        assert_eq!(messages[0].tokens.cache_write_1h, 80);
+        assert_eq!(messages[0].cost, 0.059643);
+        assert_eq!(
+            messages[0].cost_source,
+            super::super::CostSource::ProviderReported
+        );
+    }
+
+    #[test]
+    fn test_parse_pi_model_change_attributes_legacy_model_less_usage() {
+        // A model change updates Pi's selected model immediately. This keeps
+        // compatibility for old model-less UsageEntry records before the next
+        // assistant reply, while summaries use their separate official bucket.
+        let content = r#"{"type":"session","id":"pi_ses_model_change","timestamp":"2026-10-12T02:27:31.079Z","cwd":"/tmp"}
+{"type":"message","id":"m1","timestamp":"2026-10-12T02:28:43.068Z","message":{"role":"assistant","model":"old-model","provider":"old-provider","usage":{"input":100,"output":50}}}
+{"type":"model_change","id":"mc1","timestamp":"2026-10-12T03:00:00.000Z","provider":"new-provider","modelId":"new-model"}
+{"type":"usage","id":"u1","timestamp":"2026-10-12T03:01:00.000Z","kind":"legacy","usage":{"input":10,"output":5,"cost":{"total":0.25}}}"#;
+        let file = create_test_file(content);
+
+        let messages = parse_pi_file(file.path());
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].model_id, "new-model");
+        assert_eq!(messages[1].provider_id, "new-provider");
+        assert_eq!(messages[1].cost, 0.25);
+        assert_eq!(
+            messages[1].cost_source,
+            super::super::CostSource::ProviderReported
+        );
+    }
+
+    #[test]
+    fn test_parse_pi_keeps_summary_before_any_reply_in_tools_bucket() {
+        // given: a transcript whose first billed record is a summary operation.
+        let content = r#"{"type":"session","id":"pi_ses_ops2","timestamp":"2026-10-12T02:27:31.079Z","cwd":"/tmp"}
+{"type":"compaction","id":"c1","timestamp":"2026-10-12T03:38:44.507Z","summary":"early","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":15}}"#;
+        let file = create_test_file(content);
+
+        // when
+        let messages = parse_pi_file(file.path());
+
+        // then
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, PI_TOOLS_SUMMARIES_MODEL);
+        assert_eq!(messages[0].provider_id, "pi");
+        assert_eq!(messages[0].tokens.input, 10);
+    }
+
+    #[test]
+    fn test_parse_pi_counts_a_tool_result_that_bills_usage() {
+        // given: a tool result reporting the usage of the call behind it, after
+        // a reply that named the model.
+        let content = r#"{"type":"session","id":"pi_ses_tool","timestamp":"2026-10-12T02:27:31.079Z","cwd":"/tmp"}
+{"type":"message","id":"m1","timestamp":"2026-10-12T02:28:43.068Z","message":{"role":"assistant","model":"gpt-5","provider":"openai","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":15}}}
+{"type":"message","id":"t1","parentId":"m1","timestamp":"2026-10-12T02:28:44.000Z","message":{"role":"toolResult","toolCallId":"call_1","content":"output","usage":{"input":7,"output":3,"cacheRead":0,"cacheWrite":0,"totalTokens":10}}}"#;
+        let file = create_test_file(content);
+
+        // when
+        let messages = parse_pi_file(file.path());
+
+        // then
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].tokens.input, 7);
+        assert_eq!(messages[1].model_id, PI_TOOLS_SUMMARIES_MODEL);
+        assert_eq!(messages[1].provider_id, "pi");
+    }
+
+    #[test]
+    fn test_parse_prime_agent_leaves_billed_operations_out() {
+        // given: Prime Agent rides on the shared parser but reconciles emitted
+        // messages against its own `child_usage_attributed` records, so its lane
+        // keeps the operation records out.
+        let content = r#"{"type":"session","id":"prime_ses_ops","timestamp":"2026-10-12T02:27:31.079Z","cwd":"/tmp"}
+{"type":"message","id":"m1","timestamp":"2026-10-12T02:28:43.068Z","message":{"role":"assistant","model":"gpt-5","provider":"openai","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":15}}}
+{"type":"compaction","id":"c1","timestamp":"2026-10-12T03:38:44.507Z","summary":"summarized","usage":{"input":184302,"output":3627,"cacheRead":0,"cacheWrite":0,"totalTokens":187929}}"#;
+        let file = create_test_file(content);
+
+        // when
+        let messages = parse_prime_test_file(file.path());
+
+        // then
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 10);
     }
 
     #[test]
