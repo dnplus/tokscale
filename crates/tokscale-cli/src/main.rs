@@ -199,7 +199,9 @@ enum Commands {
     },
     #[command(about = "Show pricing for a model")]
     Pricing {
-        #[arg(help = "Model ID to look up, or `list-overrides`")]
+        #[arg(
+            help = "Model ID, `list-overrides`, `validate-overrides`, or `explain` (local per-message pricing report)"
+        )]
         model_id: String,
         #[arg(long, help = "Output as JSON")]
         json: bool,
@@ -208,6 +210,22 @@ enum Commands {
             help = "Force specific pricing source (custom, litellm, openrouter, or models.dev)"
         )]
         provider: Option<String>,
+        #[arg(
+            long,
+            conflicts_with = "provider",
+            help = "Pricing source (custom, litellm, openrouter, models.dev)"
+        )]
+        source: Option<String>,
+        #[arg(
+            long,
+            help = "Exact log-declared billing channel; trim and ASCII case-insensitive"
+        )]
+        billing_provider: Option<String>,
+        #[arg(
+            long,
+            help = "Fail validate-overrides on configuration errors (validation is always offline)"
+        )]
+        strict: bool,
         #[arg(long, help = "Disable spinner")]
         no_spinner: bool,
     },
@@ -358,8 +376,6 @@ enum Commands {
             help = "Show Top Clients instead of Top OpenCode Agents"
         )]
         show_clients: bool,
-        #[arg(long, help = "Disable pinning of Sisyphus agents in rankings")]
-        disable_pinned: bool,
         #[arg(long, help = "Disable loading spinner (for scripting)")]
         no_spinner: bool,
     },
@@ -867,10 +883,20 @@ fn main() -> Result<()> {
             model_id,
             json,
             provider,
+            source,
+            billing_provider,
+            strict,
             no_spinner,
         }) => {
             reject_unsupported_home_override(&cli.home, "pricing")?;
-            run_pricing_lookup(&model_id, json, provider.as_deref(), no_spinner)
+            run_pricing_lookup(
+                &model_id,
+                json,
+                source.as_deref().or(provider.as_deref()),
+                billing_provider.as_deref(),
+                strict,
+                no_spinner,
+            )
         }
         Some(Commands::Clients { json }) => run_clients_command(json, cli.home.clone()),
         Some(Commands::Login {
@@ -991,20 +1017,11 @@ fn main() -> Result<()> {
             short,
             agents,
             show_clients,
-            disable_pinned,
             no_spinner: _,
         }) => {
             reject_unsupported_home_override(&cli.home, "wrapped")?;
             let client_filter = build_client_filter(client_flags, &cli.home);
-            run_wrapped_command(
-                output,
-                year,
-                client_filter,
-                short,
-                agents,
-                show_clients,
-                disable_pinned,
-            )
+            run_wrapped_command(output, year, client_filter, short, agents, show_clients)
         }
         Some(Commands::Amp { subcommand }) => {
             reject_unsupported_home_override(&cli.home, "amp")?;
@@ -1664,11 +1681,11 @@ fn cursor_setup_state(home_dir: &Option<String>) -> Option<CursorSetupState> {
     let has_cache = cursor::has_cursor_usage_cache_in_home(&home_path);
     let cache_glob = if home_override {
         home_path
-            .join(".config/tokscale/cursor-cache/usage*.csv")
+            .join(".config/tokscale/cursor-cache/usage*.json")
             .to_string_lossy()
             .to_string()
     } else {
-        "~/.config/tokscale/cursor-cache/usage*.csv".to_string()
+        "~/.config/tokscale/cursor-cache/usage*.json".to_string()
     };
 
     Some(CursorSetupState {
@@ -1871,7 +1888,7 @@ fn auto_sync_cursor_for_local_report(
     clients: &Option<Vec<String>>,
 ) -> Option<cursor::SyncCursorResult> {
     if !should_auto_sync_cursor_for_local_report(home_dir, clients)
-        || !cursor::is_cursor_logged_in()
+        || !cursor::ensure_cursor_session_for_sync()
     {
         return None;
     }
@@ -3881,7 +3898,6 @@ fn run_wrapped_command(
     short: bool,
     agents: bool,
     show_clients: bool,
-    disable_pinned: bool,
 ) -> Result<()> {
     use colored::Colorize;
 
@@ -3897,7 +3913,6 @@ fn run_wrapped_command(
         clients: client_filter,
         short,
         include_agents,
-        pin_sisyphus: !disable_pinned,
     };
 
     match commands::wrapped::run(wrapped_options) {
@@ -3921,6 +3936,8 @@ fn run_pricing_lookup(
     model_id: &str,
     json: bool,
     provider: Option<&str>,
+    billing_provider: Option<&str>,
+    strict: bool,
     no_spinner: bool,
 ) -> Result<()> {
     use colored::Colorize;
@@ -3929,8 +3946,79 @@ fn run_pricing_lookup(
     use tokio::runtime::Runtime;
     use tokscale_core::pricing::PricingService;
 
+    // An explicitly supplied invalid channel must not become "no filter".
+    // Validate before loading configuration or enumerating local usage rows.
+    let billing_provider = billing_provider
+        .map(|raw| {
+            tokscale_core::sessions::normalize_billing_provider(raw).ok_or_else(|| {
+                anyhow::anyhow!("--billing-provider must be nonempty and cannot be \"unknown\"")
+            })
+        })
+        .transpose()?;
+    let billing_provider = billing_provider.as_deref();
+
     if model_id.eq_ignore_ascii_case("list-overrides") {
         return run_pricing_list_overrides(json);
+    }
+
+    if model_id.eq_ignore_ascii_case("validate-overrides") {
+        let overrides = tokscale_core::pricing::custom::CustomPricing::load_from_default_path();
+        let valid = overrides.diagnostics().is_empty();
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"valid": valid, "count": overrides.len(), "diagnostics": overrides.diagnostics()})
+                )?
+            );
+        } else {
+            println!(
+                "Custom pricing: {} ({} usable rules)",
+                if valid { "valid" } else { "invalid" },
+                overrides.len()
+            );
+        }
+        if strict && !valid {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    if model_id.eq_ignore_ascii_case("explain") {
+        if provider.is_some() {
+            anyhow::bail!("--source/--provider applies to model queries; explain reports the active local pricing configuration");
+        }
+        let svc = PricingService::load_cached_any_age().unwrap_or_else(|| {
+            PricingService::new_with_custom(
+                tokscale_core::pricing::custom::CustomPricing::load_from_default_path(),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            )
+        });
+        let messages = Runtime::new()?
+            .block_on(tokscale_core::parse_local_unified_messages_with_pricing(
+                tokscale_core::LocalParseOptions {
+                    use_env_roots: true,
+                    ..Default::default()
+                },
+                Some(&svc),
+            ))
+            .map_err(anyhow::Error::msg)?;
+        let explanations: Vec<_> = messages
+            .iter()
+            .filter(|message| {
+                billing_provider.is_none_or(|id| message.billing_identity.id() == Some(id))
+            })
+            .map(|message| svc.explain_message(message))
+            .collect();
+        if json {
+            println!("{}", serde_json::to_string_pretty(&explanations)?);
+        } else {
+            for row in explanations {
+                println!("{} / {} billing={} {:?}: ${:.8} source={} scope={} matched={} normalized={} base ×{} coverage={}", row.client, row.raw_model_id, row.billing_provider_id.as_deref().unwrap_or("unknown"), row.estimate_status, row.final_estimate, row.price_source.as_deref().unwrap_or("unpriced"), row.scope, row.matched_model_id.as_deref().unwrap_or("none"), row.normalized, row.effective_multiplier, row.coverage);
+            }
+        }
+        return Ok(());
     }
 
     let provider_normalized = provider.map(|p| p.to_lowercase());
@@ -3961,8 +4049,27 @@ fn run_pricing_lookup(
 
     let rt = Runtime::new()?;
     let result = match rt.block_on(async {
+        // A billing label selects custom rules, not a public catalog namespace.
+        let context = tokscale_core::pricing::PricingContext {
+            upstream_hint: None,
+            ..tokscale_core::pricing::PricingContext::explicit(model_id, billing_provider)
+        };
+        // A private custom-only query must not contact public catalogs.
+        let local = PricingService::new_with_custom(
+            tokscale_core::pricing::custom::CustomPricing::load_from_default_path(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        );
+        if provider_normalized.as_deref() == Some("custom") {
+            return Ok::<_, String>(local.lookup_context(&context, Some("custom")));
+        }
+        if provider_normalized.is_none() {
+            if let Some(result) = local.lookup_context(&context, Some("custom")) {
+                return Ok(Some(result));
+            }
+        }
         let svc = PricingService::get_or_init().await?;
-        Ok::<_, String>(svc.lookup_with_source(model_id, provider_normalized.as_deref()))
+        Ok::<_, String>(svc.lookup_context(&context, provider_normalized.as_deref()))
     }) {
         Ok(result) => result,
         Err(err) => {
@@ -4013,6 +4120,12 @@ fn run_pricing_lookup(
                     model_id: String,
                     matched_key: String,
                     source: String,
+                    billing_provider_id: Option<String>,
+                    scope: &'static str,
+                    matched_provider_id: Option<String>,
+                    rate_basis: &'static str,
+                    missing_rates: Vec<&'static str>,
+                    all_rates: tokscale_core::pricing::ModelPricing,
                     resolution: ResolutionOutput,
                     pricing: PricingValues,
                 }
@@ -4032,6 +4145,27 @@ fn run_pricing_lookup(
 
                 let output = PricingOutput {
                     model_id: model_id.to_string(),
+                    billing_provider_id: billing_provider
+                        .and_then(tokscale_core::sessions::normalize_billing_provider),
+                    scope: if pricing.source == "Custom" {
+                        if pricing.matched_provider_id.is_some() {
+                            "provider"
+                        } else {
+                            "global"
+                        }
+                    } else {
+                        "upstream"
+                    },
+                    matched_provider_id: pricing.matched_provider_id,
+                    rate_basis: "base",
+                    missing_rates: [
+                        ("input", pricing.pricing.input_cost_per_token),
+                        ("output", pricing.pricing.output_cost_per_token),
+                    ]
+                    .into_iter()
+                    .filter_map(|(name, value)| value.is_none().then_some(name))
+                    .collect(),
+                    all_rates: pricing.pricing.clone(),
                     matched_key: pricing.matched_key,
                     source: pricing.source,
                     resolution: ResolutionOutput {
@@ -4078,6 +4212,16 @@ fn run_pricing_lookup(
             Some(pricing) => {
                 println!("\n  Pricing for: {}", model_id.bold());
                 println!("  Matched key: {}", pricing.matched_key);
+                println!(
+                    "  Scope: {} (base rates)",
+                    pricing.matched_provider_id.as_deref().unwrap_or(
+                        if pricing.source == "Custom" {
+                            "global"
+                        } else {
+                            "upstream"
+                        }
+                    )
+                );
                 let source_label = match pricing.source.to_lowercase().as_str() {
                     "custom" => "Custom",
                     "litellm" => "LiteLLM",
@@ -4150,6 +4294,9 @@ fn run_pricing_list_overrides(json: bool) -> Result<()> {
     #[serde(rename_all = "camelCase")]
     struct OverrideEntry {
         model_id: String,
+        provider_id: Option<String>,
+        scope: &'static str,
+        rates: ModelPricing,
         #[serde(skip_serializing_if = "Option::is_none")]
         input_cost_per_million_tokens: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -4160,9 +4307,16 @@ fn run_pricing_list_overrides(json: bool) -> Result<()> {
         cache_creation_input_token_cost_per_million_tokens: Option<f64>,
     }
 
-    fn entry(model_id: &str, pricing: &ModelPricing) -> OverrideEntry {
+    fn entry(provider_id: Option<&str>, model_id: &str, pricing: &ModelPricing) -> OverrideEntry {
         OverrideEntry {
             model_id: model_id.to_string(),
+            provider_id: provider_id.map(str::to_string),
+            scope: if provider_id.is_some() {
+                "provider"
+            } else {
+                "global"
+            },
+            rates: pricing.clone(),
             input_cost_per_million_tokens: per_million(pricing.input_cost_per_token),
             output_cost_per_million_tokens: per_million(pricing.output_cost_per_token),
             cache_read_input_token_cost_per_million_tokens: per_million(
@@ -4177,10 +4331,10 @@ fn run_pricing_list_overrides(json: bool) -> Result<()> {
     let path = CustomPricing::default_path();
     let overrides = CustomPricing::load_from_path(&path);
     let mut entries: Vec<OverrideEntry> = overrides
-        .entries()
-        .map(|(model_id, pricing)| entry(model_id, pricing))
+        .all_entries()
+        .map(|(provider_id, model_id, pricing)| entry(provider_id, model_id, pricing))
         .collect();
-    entries.sort_by(|a, b| a.model_id.cmp(&b.model_id));
+    entries.sort_by(|a, b| (&a.provider_id, &a.model_id).cmp(&(&b.provider_id, &b.model_id)));
 
     if json {
         #[derive(serde::Serialize)]
@@ -4217,7 +4371,11 @@ fn run_pricing_list_overrides(json: bool) -> Result<()> {
     println!();
 
     for entry in entries {
-        println!("  {}", entry.model_id.bold());
+        println!(
+            "  {} [{}]",
+            entry.model_id.bold(),
+            entry.provider_id.as_deref().unwrap_or("Global")
+        );
         if let Some(input) = entry.input_cost_per_million_tokens {
             println!("    Input:  ${} / 1M tokens", format_per_million(input));
         }
@@ -6665,7 +6823,7 @@ fn report_unpriced_submission_usage(unpriced: &[tokscale_core::UnpricedSubmissio
     println!(
         "{}",
         format!(
-            "  Hint: unpriced usage is included in token totals with zero cost. Add exact-match entries to\n          {}\n          keyed by the model id alone (the `model` half of the `provider/model` above),\n          where an explicit 0 declares a free model or a known routing-label rate. Re-check\n          with `tokscale submit --dry-run` and `tokscale pricing <model-id>`, then resubmit\n          to replace the temporary cost floor with a complete total.",
+            "  Hint: unpriced usage is included in token totals with zero cost. Add exact-match entries to\n          {}\n          using global `models` or scoped `provider_overrides`; explicit 0 declares a free rate.\n          Run `tokscale pricing explain --json --no-spinner` to copy the log billing channel\n          and raw model, then query `pricing <model-id> --billing-provider <id> --source custom`.\n          Re-check with `tokscale submit --dry-run`, then resubmit\n          to replace the temporary cost floor with a complete total.",
             pricing_path.display(),
         )
         .bright_black()
@@ -6799,7 +6957,7 @@ fn run_submit_command(
         .is_none_or(|s| s.iter().any(|src| src == "cursor"));
     let report_home: Option<String> = None;
     let has_cursor_cache = has_cursor_usage_cache_for_report(&report_home);
-    if include_cursor && cursor::is_cursor_logged_in() {
+    if include_cursor && cursor::ensure_cursor_session_for_sync() {
         println!("{}", "  Syncing Cursor usage data...".bright_black());
         let rt_sync = Runtime::new()?;
         let sync_result = rt_sync.block_on(async { cursor::sync_cursor_cache(false).await });
@@ -10753,6 +10911,35 @@ mod tests {
             &None,
             &group_by,
         );
+    }
+    #[test]
+    fn submit_payload_never_contains_private_billing_diagnostics() {
+        let message = tokscale_core::UnifiedMessage::new(
+            "codex",
+            "gpt-5",
+            "openai",
+            "s",
+            1780000000000,
+            tokscale_core::TokenBreakdown {
+                input: 10,
+                ..Default::default()
+            },
+            0.25,
+        )
+        .with_billing(
+            Some("PRIVATE_BILLING_SENTINEL"),
+            tokscale_core::sessions::BillingIdentityOrigin::ExplicitRecord,
+        );
+        let private_json = serde_json::to_string(&message).unwrap();
+        assert!(private_json.contains("private_billing_sentinel"));
+        let contributions = tokscale_core::aggregate_by_date_v2(vec![message]);
+        let graph = graph_result_with_contributions(contributions);
+        let payload =
+            serde_json::to_string(&to_ts_token_contribution_data(&graph, None, None)).unwrap();
+        assert!(!payload.to_lowercase().contains("private_billing_sentinel"));
+        assert!(!payload.contains("billingIdentity"));
+        assert!(!payload.contains("matchedProviderId"));
+        assert!(payload.contains("openai"));
     }
 
     #[test]

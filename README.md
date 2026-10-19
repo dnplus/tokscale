@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Tokscale](./.github/assets/hero-v2.png)](https://tokscale.ai)
+[![Tokscale](./.github/assets/hero-v3.png)](https://tokscale.ai)
 
 </div>
 
@@ -49,11 +49,11 @@ tokscale autosubmit status
 >
 > I drop new open-source work every week. Don't miss the next one.
 >
-> | [<img alt="GitHub Follow" src="https://img.shields.io/github/followers/junhoyeo?style=flat-square&logo=github&labelColor=black&color=24292f" width="156px" />](https://github.com/junhoyeo) | Follow [@junhoyeo](https://github.com/junhoyeo) on GitHub for more projects. Hacking on AI, infra, and everything in between. |
+> [<img alt="X follow" src="https://img.shields.io/badge/follow-%40Tokscale-000000?style=flat-square&logo=x&logoColor=white&labelColor=black" width="156px" />](https://x.com/Tokscale) | Follow [@Tokscale](https://x.com/Tokscale) on X for release notes and updates. |
 > | :-----| :----- |
 > [<img alt="Discord link" src="https://img.shields.io/discord/1480206352755458110?color=5865F2&label=discord&labelColor=black&logo=discord&logoColor=white&style=flat-square" width="156px" />](https://discord.gg/h6DUGWdBbm) | Come hang out in our [Discord](https://discord.gg/h6DUGWdBbm) — and surround yourself with the world's top-tier vibers. |
-> [<img alt="X follow" src="https://img.shields.io/badge/follow-%40Tokscale-000000?style=flat-square&logo=x&logoColor=white&labelColor=black" width="156px" />](https://x.com/Tokscale) | Follow [@Tokscale](https://x.com/Tokscale) on X for release notes and updates. |
 > [<img alt="Sponsor Tokscale" src="https://img.shields.io/badge/sponsor-Tokscale-EA4AAA?style=flat-square&logo=githubsponsors&logoColor=white&labelColor=black" width="156px" />](https://github.com/sponsors/junhoyeo) | Support Tokscale's continued development through [GitHub Sponsors](https://github.com/sponsors/junhoyeo). |
+> | [<img alt="GitHub Follow" src="https://img.shields.io/github/followers/junhoyeo?style=flat-square&logo=github&labelColor=black&color=24292f" width="156px" />](https://github.com/junhoyeo) | Follow [@junhoyeo](https://github.com/junhoyeo) on GitHub for more projects. Hacking on AI, infra, and everything in between. |
 
 <div align="center">
 
@@ -456,7 +456,7 @@ tokscale --client opencode,claude
 # Repeated: same effect, useful with shell aliases
 tokscale -c opencode -c claude
 
-# Cursor IDE uses Tokscale's API cache; run login + sync --json first
+# Cursor IDE uses Tokscale's API cache; a signed-in desktop session is imported when no login is saved
 tokscale --client cursor
 
 # Synthetic (synthetic.new) is detected from other agent sessions
@@ -532,7 +532,6 @@ Create `custom-pricing.json` in Tokscale's config directory (`~/.config/tokscale
 
 ```json
 {
-  "$schema": "https://tokscale.ai/custom-pricing.schema.json",
   "models": {
     "accounts/fireworks/routers/kimi-k2p6-turbo": {
       "input_cost_per_million_tokens": 2.00,
@@ -554,6 +553,8 @@ Create `custom-pricing.json` in Tokscale's config directory (`~/.config/tokscale
 }
 ```
 
+The JSON schema is available at [schemas/custom-pricing.schema.json](schemas/custom-pricing.schema.json) in this repository. For editor validation, use a local copy of that schema.
+
 Override prices are entered in dollars per million tokens, matching how most API providers publish pricing; Tokscale converts them to per-token rates internally. At least one of `input_cost_per_million_tokens` or `output_cost_per_million_tokens` must be present, and cache-read/cache-creation fields are optional. An explicit `0` is allowed and is the way to declare a free model — it is a statement ("this costs nothing"), unlike an omitted field, which means the rate is unknown and leaves the usage unpriced. LiteLLM-style per-token field names such as `input_cost_per_token`, `output_cost_per_token`, and `cache_read_input_token_cost` are also accepted for copy/paste compatibility, but the per-million names are the recommended user-facing form. To omit a tier or cache price, leave the field out; negative or non-finite values are treated as invalid and the whole model entry is skipped so typos do not silently alter accounting. Optional `source` and `notes` fields are ignored by Tokscale and can be used for your own bookkeeping.
 
 Overrides are exact-only and case-insensitive. Tokscale checks the raw model ID first, then the existing synthetic `/models/` normalization, then falls through to LiteLLM, OpenRouter, Cursor pricing, and fuzzy matching if no override matches. Raw exact matches beat normalized exact matches, so `accounts/fireworks/routers/kimi-k2p6-turbo` can override one gateway-specific model while `kimi-k2p6-turbo` can cover normalized `/models/` paths. Overrides are loaded once at startup; restart the command after editing the file. This is the recommended local fix for wrong-model pricing bugs while waiting on upstream LiteLLM pricing updates.
@@ -571,6 +572,12 @@ When multiple matches exist, original model creators are preferred over reseller
 | `meta-llama/` | `fireworks_ai/` |
 
 Example: `grok-code` matches `xai/grok-code-fast-1` ($0.20/$1.50) instead of `azure_ai/grok-code-fast-1` ($3.50/$17.50).
+
+#### Billing-channel pricing
+
+Custom pricing now supports `provider_overrides` alongside the existing global `models` object. Use `tokscale pricing MODEL --billing-provider vertex --source custom --json --no-spinner`; the old `--provider` flag still means pricing source. Channels are exact whole log labels (trim + ASCII case-insensitive), not inferred model vendors or verified billing accounts. Unknown channels only use global/upstream estimates.
+
+Run `tokscale pricing validate-overrides --strict --json --no-spinner` to check configuration offline and `tokscale pricing explain --json --no-spinner` for local per-message scope, coverage, multiplier and estimate status. Rules are base rates; authoritative costs including zero are preserved. Restart after editing: historical estimates use current rates, while missing/stale prices do not remain in totals. Older binaries ignore scoped rules on downgrade. [Full contract, precedence, cache behavior and example](docs/provider-pricing.md).
 
 ### Social
 
@@ -655,15 +662,15 @@ Scheduled runs are non-interactive: they never prompt for GitHub auth or star co
 
 ### Cursor IDE Commands
 
-Cursor IDE support uses Cursor's web usage API, cached by Tokscale at `~/.config/tokscale/cursor-cache/usage*.json`. Tokscale does not parse local Cursor Agent CLI state under `~/.cursor`, and it does not treat the desktop SQLite DB as a usage ledger.
+Cursor IDE support uses Cursor's usage-events API. Tokscale caches usage at `~/.config/tokscale/cursor-cache/usage.json` for the active account and `usage.account-<sha256-of-exact-account-id>.json` for each other account, with verified ownership metadata. Unmarked legacy JSON/CSV caches are preserved in `cursor-cache/archive/` before sync or an account change; see the migration details below. Tokscale does not parse local Cursor Agent CLI state under `~/.cursor`, and it does not treat the desktop SQLite DB as a usage ledger.
 
-When the Cursor desktop app is installed and signed in, `tokscale cursor login` prefers the local `cursorAuth/accessToken` from Cursor's `state.vscdb` and builds the session cookie automatically. `tokscale cursor sync` also refreshes that token when available. Usage rows still come only from Cursor's usage API.
+When the Cursor desktop app is installed and signed in, reports, submit, and wrapped can import `cursorAuth/accessToken` from `state.vscdb` when no Cursor login is saved yet. Wrapped only does this when Cursor is included in the requested clients. Reports skip syncing while the usage cache is fresh. Whenever a sync runs, including explicit `tokscale cursor sync`, it refreshes the desktop token when available and can switch the active account to that desktop login. A saved login remains usable when no desktop session is available. Usage rows still come only from Cursor's usage-events API, not from local `~/.cursor` transcripts.
 
 Setup (desktop auto-login):
 
 1. Sign in to the Cursor desktop app.
-2. Run `tokscale cursor login --name work` (auto-detects the local desktop session when available).
-3. Run `tokscale cursor sync --json` to populate `~/.config/tokscale/cursor-cache/usage.json`.
+2. Optional: run `tokscale cursor login --name work` to save that desktop session under a name. Reports, submit, and sync import it automatically when no Cursor login is saved yet.
+3. Optional: run `tokscale cursor sync --json` to refresh `~/.config/tokscale/cursor-cache/usage.json` now. A report syncs on its own when the cache is stale.
 4. Run `tokscale --client cursor` or any report command.
 
 Fallback (manual browser cookie), if desktop login is unavailable:
@@ -932,10 +939,11 @@ In the TUI, navigate to the **Usage** tab to see subscription data. Use `[Refres
 | **Z.ai** | API key (env var) | Token limits, Web Searches | Set `ZAI_API_KEY` or `GLM_API_KEY` |
 | **Amp** | API key (`~/.local/share/amp/secrets.json`) | Free tier balance, Credits | Run `amp` to log in |
 | **GitHub Copilot** | GitHub token (keychain or `~/.config/gh/hosts.yml`) | Premium interactions, Chat quotas | Run `gh auth login` |
-| **Cursor** | Desktop `state.vscdb` JWT (or macOS Keychain `cursor-access-token`, or JWT inside a saved `tokscale cursor login` session) | Plan period remaining | Sign in to Cursor desktop, or run `tokscale cursor login` |
+| **Cursor** | Desktop `state.vscdb` JWT (or macOS Keychain `cursor-access-token`, or JWT inside a saved `tokscale cursor login` session) | Cursor Models and Other Models plan quotas (one Weekly pool on unified plans) | Sign in to Cursor desktop, or run `tokscale cursor login` |
+| **Grok Bot** | Cursor desktop JWT (with macOS Keychain refresh when available) | Weekly personal quota | Sign in to Cursor desktop; shown when a personal quota is available |
 | **Antigravity** | Running language server (loopback RPC) | Per model-group weekly / 5-hour remaining | Start the Antigravity CLI or IDE and sign in manually |
 | **Colab** | OAuth (`~/.config/colab-cli/token.json`) | Compute-unit balance, hourly burn rate, active runtimes | Log in with `colab-cli`; override with `TOKSCALE_COLAB_TOKEN_PATH` |
-| **Grok Build** | OAuth (`~/.grok/auth.json`) | Credits, subscription plan | Run `grok login` |
+| **Grok** | OAuth (`~/.grok/auth.json`) | Included credits (weekly or monthly), subscription plan | Run `grok login` |
 | **Kimi** | OAuth (`~/.kimi/credentials/kimi-code.json`) | Session, Weekly quotas | Run `kimi` to log in |
 | **MiniMax** | API key (env var) | Prompt quotas per model | Set `MINIMAX_API_KEY` or `MINIMAX_API_TOKEN` |
 | **MiniMax Token Plan** | API key (env var) | Interval + weekly remaining-percent quotas (per region: CN minimaxi.com + Global minimax.io) | Set `MINIMAX_TOKEN_PLAN_CN_KEY` and/or `MINIMAX_TOKEN_PLAN_GLOBAL_KEY` |
@@ -1041,7 +1049,7 @@ Tokscale stores settings in `settings.json` in its config directory. By default 
 | `autoRefreshMs` | number | `60000` | Auto-refresh interval (30000-3600000ms) |
 | `nativeTimeoutMs` | number | `300000` | Maximum time for native subprocess processing (5000-3600000ms) |
 | `defaultClients` | string[] | `[]` | Client filter applied when no `--client/-c` flag is passed. Accepts the same ids as `--client` (e.g. `["opencode", "claude", "synthetic"]`). Unknown ids are silently dropped. CLI flags always override this list completely — no merging. |
-| `usage.disabledProviders` | string[] | `[]` | Subscription-usage providers to skip before credential discovery or network access. Valid ids (case-insensitive; surrounding whitespace ignored): `claude`, `codex`, `zai`, `amp`, `antigravity`, `copilot`, `cursor`, `grok`, `kimi`, `minimax`, `minimax-token-plan`, `colab`, `warp`, `sakana`, and `opencode-go`. Unknown ids are ignored. Disabled providers are also hidden from cached TUI cards and diagnostics. Changes apply to the next `tokscale usage` run or TUI launch/refresh. |
+| `usage.disabledProviders` | string[] | `[]` | Subscription-usage providers to skip before credential discovery or network access. Valid ids (case-insensitive; surrounding whitespace ignored): `claude`, `codex`, `zai`, `amp`, `antigravity`, `copilot`, `cursor`, `grok-bot`, `grok`, `kimi`, `minimax`, `minimax-token-plan`, `colab`, `warp`, `sakana`, and `opencode-go`. Legacy `grok-build`, `grok_build`, and `Grok Build` aliases also select `grok`. Unknown ids are ignored. Disabled providers are also hidden from cached TUI cards and diagnostics. Changes apply to the next `tokscale usage` run or TUI launch/refresh. |
 | `light.writeCache` | boolean | `false` | When true, `tokscale --light` overwrites the TUI cache atomically after rendering. CLI flags `--write-cache` / `--no-write-cache` override per-invocation. |
 | `minutelyTabEnabled` | boolean | `false` | Show the per-minute Minutely tab in the TUI and aggregate per-minute usage during data loading. Default-off because minute-granularity is a niche/diagnostic view for most users and the per-minute bucketing has a non-trivial cost on large datasets. |
 | `autosubmit` | object | disabled | Saved `tokscale autosubmit` state: interval, client/date filters, scheduler backend, last run time, and last error. Prefer `tokscale autosubmit enable/status/disable` over editing this object by hand. |
@@ -1132,6 +1140,7 @@ Environment variables override config file values. For CI/CD or one-off use:
 | `TOKSCALE_API_TOKEN` | unset | Tokscale personal API token for non-interactive `submit` and `delete-submitted-data` runs. Create one from Settings > API Tokens or save it locally with `tokscale login --token tt_xxx`. |
 | `TOKSCALE_EXTRA_DIRS` | unset | One-off extra session roots as `client:/abs/path,client:/abs/path` |
 | `TOKSCALE_CONFIG_DIR` | unset | Overrides the config directory root (where `settings.json`, `star-cache.json`, `cache/`, `antigravity-cache/`, and `trae-cache/` live). Absolute path recommended; relative paths resolve against the process CWD. Useful for CI sandboxes or pinning a non-default location. When set, tokscale will not fall back to the legacy macOS `~/Library/Application Support/tokscale/` path. |
+| `TOKSCALE_CODEX_MAX_DECODED_BYTES` | `1073741824` (1 GiB) | Sets the decoded-size ceiling, in bytes, for compressed Codex `.jsonl.zst` rollouts. Accepts positive integers below `u64::MAX`; invalid values use the default. Raising it increases the work Tokscale permits for one archive. |
 | `TOKSCALE_FM_DEBUG` | unset | When set, prints Apple Foundation Models diagnostics (macOS version gate, dlopen dylib path, load/symbol errors) to stderr to explain why on-device apple-fm did or didn't engage. |
 | `TOKSCALE_RECOVERY_DISABLE` | unset | When set, disables the local usage recovery ledger (`recovered-usage-v1.json`) even if the file exists. |
 
@@ -1329,9 +1338,9 @@ Submitted data goes through Level 1 validation:
 
 Generate a beautiful year-in-review image summarizing your AI coding assistant usage—inspired by Spotify Wrapped.
 
-| `bunx tokscale@latest wrapped` | `bunx tokscale@latest wrapped --clients` | `bunx tokscale@latest wrapped --agents --disable-pinned` |
-|:---:|:---:|:---:|
-| ![Wrapped 2025 (Agents + Pin Sisyphus)](.github/assets/wrapped-2025-agents.png) | ![Wrapped 2025 (Clients)](.github/assets/wrapped-2025-clients.png) | ![Wrapped 2025 (Agents + Disable Pinned)](.github/assets/wrapped-2025-agents-disable-pinned.png) |
+| `bunx tokscale@latest wrapped` | `bunx tokscale@latest wrapped --clients` |
+|:---:|:---:|
+| ![Wrapped 2025 (Agents)](.github/assets/wrapped-2025-agents.png) | ![Wrapped 2025 (Clients)](.github/assets/wrapped-2025-clients.png) |
 
 ### Command
 
@@ -1982,6 +1991,8 @@ JSONL format with session header and message entries:
 {"type":"session","id":"pi_ses_001","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}
 {"type":"message","id":"msg_001","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","model":"claude-3-5-sonnet","provider":"anthropic","usage":{"input":100,"output":50,"cacheRead":10,"cacheWrite":5,"totalTokens":165}}}
 ```
+
+Pi also bills work that is not an assistant reply: `/compact` writes a `compaction` record, branch summarization a `branch_summary` record, and standalone accounting (e.g. cache warming) a `usage` record, while a `toolResult` message can carry usage for the call behind it. Tokscale counts each of those as its own request and preserves its reported cost when present. A current-format standalone `usage` record names its billed provider and model explicitly, while an older model-less one inherits the session's current selection (the last `model_change` or reply). Model-less tool results, compactions, and branch summaries stay in Pi's separate `tools/summaries` bucket instead of being charged to the preceding conversation model. A record without usage bills nothing.
 
 ### Senpi (OmO Native)
 

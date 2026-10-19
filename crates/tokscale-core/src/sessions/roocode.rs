@@ -6,6 +6,7 @@
 
 use super::utils::{extract_i64, parse_timestamp_str, read_file_or_none};
 use super::UnifiedMessage;
+use crate::provider_identity;
 use crate::TokenBreakdown;
 use serde::Deserialize;
 use serde_json::Value;
@@ -19,7 +20,13 @@ use std::path::{Path, PathBuf};
 /// happens; `message_cache::parser_version()` derives each member's version
 /// from it (base plus a per-client offset that preserves independent history)
 /// so no member can be left serving stale cache entries.
-pub(crate) const ROO_KILO_TASK_LOG_PARSER_BASE_VERSION: u32 = 2;
+///
+/// v2->v3: a positive `cost` is marked provider-reported so submission keeps it
+/// instead of re-pricing (and zeroing) the row, Roo/Kilo Code `tokensIn` has
+/// the cache buckets it already contains subtracted out once the row is new
+/// enough to be gross of them (Cline's stay disjoint at every age), and a bare
+/// `apiProtocol` no longer outranks the provider named by the model id.
+pub(crate) const ROO_KILO_TASK_LOG_PARSER_BASE_VERSION: u32 = 3;
 
 #[derive(Debug, Deserialize)]
 struct UiMessageEntry {
@@ -100,30 +107,71 @@ pub(crate) fn parse_roo_kilo_file(path: &Path, source: &str) -> Vec<UnifiedMessa
             .map(|model| model.trim().to_string())
             .filter(|model| !model.is_empty())
             .unwrap_or_else(|| model_id.clone());
-        // Provider is the other way around: a nested `apiProtocol`
-        // ("bedrock/anthropic") carries reseller routing that the bare
-        // `modelInfo.providerId` would flatten to its last segment, so the
-        // legacy field keeps precedence whenever it says anything, and
-        // `modelInfo` fills the silence current Cline leaves (#1321).
-        let provider = match provider_from_api_protocol(payload.api_protocol.as_deref()) {
-            protocol if protocol != "unknown" => protocol,
-            _ => entry
-                .model_info
-                .as_ref()
-                .and_then(|info| info.provider_id.clone())
-                .map(|provider| provider.trim().to_string())
-                .filter(|provider| !provider.is_empty())
-                .unwrap_or_else(|| "unknown".to_string()),
-        };
+        // A bare `apiProtocol` ("openai", "anthropic") names the wire format
+        // the extension spoke, not who served the request: Kilo Code's own
+        // gateway logs `openai` for `anthropic/claude-sonnet-4`. So the
+        // provider resolves, in order, from:
+        // 1. a nested `apiProtocol` ("bedrock/anthropic"), which carries
+        //    reseller routing that `modelInfo.providerId` would flatten;
+        // 2. `modelInfo.providerId`, current Cline's per-message identity
+        //    (#1321);
+        // 3. the model id itself: its vendor prefix (`anthropic/...`) or, for
+        //    a bare id, its model family;
+        // 4. the bare `apiProtocol`, as a last resort.
+        let api_protocol = payload
+            .api_protocol
+            .as_deref()
+            .map(str::trim)
+            .filter(|protocol| !protocol.is_empty());
+        let model_info_provider = entry
+            .model_info
+            .as_ref()
+            .and_then(|info| info.provider_id.as_deref())
+            .map(str::trim)
+            .filter(|provider| !provider.is_empty());
+        let provider = api_protocol
+            .filter(|protocol| protocol.contains('/'))
+            .or(model_info_provider)
+            .map(str::to_string)
+            .or_else(|| provider_from_model_id(&model))
+            .or_else(|| api_protocol.map(str::to_string))
+            .unwrap_or_else(|| "unknown".to_string());
 
-        messages.push(UnifiedMessage::new_with_agent(
+        // On Roo and Kilo Code, `tokensIn` became gross of cache when Roo
+        // `416fa5727e` (2025-10-31, released in v3.29.5) changed `Task.ts` to
+        // persist `tokensIn: costResult.totalInputTokens`; current Roo's
+        // `consolidateTokenUsage.ts` says the same ("tokensIn now stores TOTAL
+        // input tokens ... applies to both Anthropic and OpenAI protocols").
+        // So the cache buckets come out of input to stop counting them twice,
+        // and the wire protocol is NOT the discriminator.
+        //
+        // Before that change, an Anthropic-protocol row recorded `input_tokens`
+        // net of cache, and subtracting there would undercount real input
+        // (1000 net with 600 + 100 cache would report 300, not 1000). Those
+        // rows are identified by their own timestamp, which is the request
+        // time, so the schema is read from the row rather than guessed.
+        //
+        // Cline forked this format and did NOT follow that change: it keeps
+        // the three buckets disjoint on purpose ("Classic Cline/webview
+        // metrics expect tokensIn, cacheReads, and cacheWrites to be disjoint
+        // buckets" -- `apps/vscode/src/sdk/message-translator.ts`), and its own
+        // totals add all three. Subtracting there would undercount real input,
+        // so the client decides.
+        let input =
+            if gross_input_includes_cache(source, timestamp, payload.api_protocol.as_deref()) {
+                residual_input(payload.tokens_in, payload.cache_reads, payload.cache_writes)
+            } else {
+                payload.tokens_in
+            };
+
+        let mut message = UnifiedMessage::new_with_agent(
             source,
             model,
             provider,
             session_id.clone(),
             timestamp,
             TokenBreakdown {
-                input: payload.tokens_in,
+                input,
                 output: payload.tokens_out,
                 cache_read: payload.cache_reads,
                 cache_write: payload.cache_writes,
@@ -132,7 +180,29 @@ pub(crate) fn parse_roo_kilo_file(path: &Path, source: &str) -> Vec<UnifiedMessa
             },
             payload.cost,
             agent.clone(),
-        ));
+        )
+        .with_billing(
+            entry
+                .model_info
+                .as_ref()
+                .and_then(|info| info.provider_id.as_deref()),
+            super::BillingIdentityOrigin::ExplicitRecord,
+        );
+        // The task log's `cost` is computed by the extension from its own
+        // bundled price sheet (Roo `Task.ts` persists
+        // `cost: totalCost ?? costResult.totalCost`), so a positive value is
+        // the charge the client itself recorded and is kept for models
+        // tokscale may not price. A zero is different: it is also what the
+        // extension writes when *it* has no rate for the model, and that is
+        // indistinguishable here from a genuinely free request. Marking it
+        // authoritative would submit a known-priced request as a complete $0,
+        // so zero is left for repricing -- the same rule
+        // `CostProvenance::WhenPositive` applies to the opencode-schema
+        // clients.
+        if payload.cost_reported && payload.cost > 0.0 {
+            message.mark_provider_reported_cost();
+        }
+        messages.push(message);
     }
 
     messages
@@ -231,6 +301,7 @@ fn parse_entry_timestamp(ts: Option<&Value>) -> Option<i64> {
 
 struct ApiReqStartedPayload {
     cost: f64,
+    cost_reported: bool,
     tokens_in: i64,
     tokens_out: i64,
     cache_reads: i64,
@@ -238,11 +309,57 @@ struct ApiReqStartedPayload {
     api_protocol: Option<String>,
 }
 
+/// First millisecond at which a Roo/Kilo Code task row records `tokensIn`
+/// gross of the cache buckets.
+///
+/// Roo `416fa5727e` landed on 2025-10-31 and shipped in v3.29.5 (2025-11-01).
+/// The boundary is deliberately the release day rather than the commit day, so
+/// a row written by the last pre-release build is still read with the old
+/// schema; the cost of erring this way is counting cache twice for at most one
+/// day of history, against silently undercounting real input.
+const GROSS_INPUT_FROM_MS: i64 = 1_762_041_600_000; // 2025-11-02T00:00:00Z
+
+/// Whether this row's `tokensIn` includes the cache buckets.
+///
+/// Three different producers write this one format:
+///
+/// - Cline keeps `tokensIn`, `cacheReads` and `cacheWrites` disjoint on
+///   purpose, at every age, so it never subtracts. (The standalone Cline CLI
+///   lane in `cline.rs` does subtract, because the SDK usage event it reads is
+///   itself gross -- a different source, not a disagreement.)
+/// - Roo and Kilo Code are gross of cache from [`GROSS_INPUT_FROM_MS`] on.
+/// - Before that, only the OpenAI protocol was gross; Anthropic-protocol rows
+///   were net, and an absent `apiProtocol` on a row that old means the field
+///   predates being written at all, which is the Anthropic-style schema.
+fn gross_input_includes_cache(source: &str, timestamp: i64, api_protocol: Option<&str>) -> bool {
+    if source == "cline" {
+        return false;
+    }
+    if timestamp >= GROSS_INPUT_FROM_MS {
+        return true;
+    }
+    api_protocol
+        .map(str::trim)
+        .and_then(|protocol| protocol.rsplit('/').next())
+        .is_some_and(|protocol| protocol.eq_ignore_ascii_case("openai"))
+}
+
+/// Non-cached input tokens for a task-log row whose `tokensIn` is gross of
+/// the cache buckets, clamped at zero so a corrupt row whose buckets exceed
+/// its own input cannot report negative input.
+fn residual_input(tokens_in: i64, cache_reads: i64, cache_writes: i64) -> i64 {
+    tokens_in
+        .saturating_sub(cache_reads)
+        .saturating_sub(cache_writes)
+        .max(0)
+}
+
 fn parse_api_req_started_payload(text: &str) -> Option<ApiReqStartedPayload> {
     let mut bytes = text.as_bytes().to_vec();
     let value: Value = simd_json::from_slice(&mut bytes).ok()?;
 
-    let cost = extract_f64(value.get("cost")).unwrap_or(0.0).max(0.0);
+    let reported_cost = extract_f64(value.get("cost")).filter(|v| v.is_finite() && *v >= 0.0);
+    let cost = reported_cost.unwrap_or(0.0);
     let tokens_in = extract_i64(value.get("tokensIn")).unwrap_or(0).max(0);
     let tokens_out = extract_i64(value.get("tokensOut")).unwrap_or(0).max(0);
     let cache_reads = extract_i64(value.get("cacheReads")).unwrap_or(0).max(0);
@@ -254,6 +371,7 @@ fn parse_api_req_started_payload(text: &str) -> Option<ApiReqStartedPayload> {
 
     Some(ApiReqStartedPayload {
         cost,
+        cost_reported: reported_cost.is_some(),
         tokens_in,
         tokens_out,
         cache_reads,
@@ -271,12 +389,49 @@ fn extract_f64(value: Option<&Value>) -> Option<f64> {
     })
 }
 
-fn provider_from_api_protocol(api_protocol: Option<&str>) -> String {
-    api_protocol
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("unknown")
-        .to_string()
+/// First path segments that route a request rather than name the vendor that
+/// served it. `ollama/` is a local runtime, and `kilo-auto/` is Kilo's own
+/// Auto router (Kilo stores those turns as provider `kilo`, model
+/// `kilo-auto/<tier>` -- see `kilo-vscode/src/shared/provider-model.ts`), so
+/// canonicalizing either as a vendor invents a provider.
+const MODEL_ID_ROUTING_PREFIXES: &[(&str, Option<&str>)] =
+    &[("ollama", None), ("kilo-auto", Some("kilo"))];
+
+fn provider_from_model_id(model: &str) -> Option<String> {
+    if let Some((vendor, rest)) = model.split_once('/') {
+        let vendor = vendor.trim();
+        if !rest.is_empty() {
+            if let Some((_, provider)) = MODEL_ID_ROUTING_PREFIXES
+                .iter()
+                .find(|(prefix, _)| vendor.eq_ignore_ascii_case(prefix))
+            {
+                // A routing prefix names the router, not the vendor: either
+                // the router is itself the billed provider (`kilo`), or the
+                // routed model has to speak for itself (`ollama`), which
+                // family inference below already handles.
+                return provider
+                    .map(str::to_string)
+                    .or_else(|| infer_provider_from_family(model));
+            }
+            if let Some(provider) = provider_identity::canonical_provider(vendor) {
+                return Some(provider);
+            }
+        }
+    }
+    infer_provider_from_family(model)
+}
+
+/// Family inference for a bare model id.
+///
+/// Delimited matching only, as in the Cursor and Reasonix lanes: an ordinary
+/// word that merely contains a family name (`engroked`) must not be
+/// attributed to that vendor. The trade is deliberate -- `contains`-style
+/// matching would also resolve mid-word families (`chatgpt-4o-latest`,
+/// `CodeLlama-34b-Instruct-hf`), but here a wrong vendor is worse than
+/// `unknown`, because this value becomes both the report label and the
+/// pricing hint, and `main` resolved none of these ids at all.
+fn infer_provider_from_family(model: &str) -> Option<String> {
+    provider_identity::inferred_provider_from_model_delimited(model).map(str::to_string)
 }
 
 #[cfg(test)]
@@ -298,6 +453,202 @@ mod tests {
             fs::write(task_dir.join("api_conversation_history.json"), history).unwrap();
         }
         task_dir.join("ui_messages.json")
+    }
+
+    /// From Roo v3.29.5 (2025-11) on, `tokensIn` is gross of cache on both
+    /// protocols, so the buckets come out of input regardless of
+    /// `apiProtocol` -- including when the row omits the field, which is what
+    /// current Cline-style writers do.
+    #[test]
+    fn test_parse_roocode_cache_overlap_and_cost_provenance() {
+        let dir = TempDir::new().unwrap();
+        let ui_messages = r#"[
+  {"type":"say","say":"api_req_started","ts":1789022955199,
+   "text":"{\"cost\":0,\"tokensIn\":1000,\"tokensOut\":10,\"cacheReads\":600,\"cacheWrites\":100,\"apiProtocol\":\"openai\"}"},
+  {"type":"say","say":"api_req_started","ts":1789022955200,
+   "text":"{\"cost\":0.5,\"tokensIn\":1000,\"tokensOut\":10,\"cacheReads\":600,\"cacheWrites\":100,\"apiProtocol\":\"anthropic\"}"},
+  {"type":"say","say":"api_req_started","ts":1789022955201,
+   "text":"{\"tokensIn\":1000,\"tokensOut\":10}"},
+  {"type":"say","say":"api_req_started","ts":1789022955202,
+   "text":"{\"cost\":0.25,\"tokensIn\":1000,\"tokensOut\":10,\"cacheReads\":600,\"cacheWrites\":100}",
+   "modelInfo":{"providerId":"openai","modelId":"gpt-5"}}
+]"#;
+        let path = setup_task(&dir, "task-overlap", ui_messages, None);
+
+        let messages = parse_roocode_file(&path);
+        assert_eq!(messages.len(), 4);
+
+        // `tokensIn` is gross of cache, so input is the residual.
+        assert_eq!(messages[0].tokens.input, 300);
+        assert_eq!(messages[0].tokens.cache_read, 600);
+        assert_eq!(messages[0].tokens.cache_write, 100);
+        // An explicit zero is what the extension writes when *it* had no rate
+        // for the model, so it stays estimable rather than authoritative.
+        assert_eq!(messages[0].cost, 0.0);
+        assert!(!messages[0].has_authoritative_cost());
+
+        // Anthropic protocol: modern logs are gross of cache here too.
+        assert_eq!(messages[1].tokens.input, 300);
+        assert_eq!(messages[1].cost, 0.5);
+        assert!(messages[1].has_authoritative_cost());
+
+        // No `cost` key: left for the pricing service to estimate.
+        assert!(!messages[2].has_authoritative_cost());
+
+        // No `apiProtocol` at all: a modern row is still de-overlapped.
+        assert_eq!(messages[3].tokens.input, 300);
+        assert_eq!(messages[3].tokens.cache_read, 600);
+        assert_eq!(messages[3].provider_id, "openai");
+        assert!(messages[3].has_authoritative_cost());
+    }
+
+    #[test]
+    fn test_shared_task_parser_keeps_billing_identity_with_cache_and_reported_cost() {
+        // The upstream cache accounting change and provider-scoped pricing must
+        // survive together for all three consumers of this parser.
+        for source in ["roocode", "kilocode", "cline"] {
+            for (timestamp, protocol, expected_input) in [
+                (
+                    1789022955199_i64,
+                    "openai",
+                    if source == "cline" { 1000 } else { 300 },
+                ),
+                (
+                    1789022955199,
+                    "bedrock/anthropic",
+                    if source == "cline" { 1000 } else { 300 },
+                ),
+                (1748038758034, "anthropic", 1000),
+            ] {
+                for (cost, authoritative) in [(0.25, true), (0.0, false)] {
+                    let dir = TempDir::new().unwrap();
+                    let rows = serde_json::json!([{
+                        "type": "say", "say": "api_req_started", "ts": timestamp,
+                        "modelInfo": {"providerId": " Gateway-A ", "modelId": "anthropic/claude-sonnet-4"},
+                        "text": serde_json::json!({"cost":cost,"tokensIn":1000,"tokensOut":10,
+                            "cacheReads":600,"cacheWrites":100,"apiProtocol":protocol}).to_string()
+                    }]);
+                    let path = setup_task(&dir, "billing-cache", &rows.to_string(), None);
+                    let messages = parse_roo_kilo_file(&path, source);
+                    assert_eq!(messages.len(), 1);
+                    let message = &messages[0];
+                    assert_eq!(message.tokens.input, expected_input, "{source}/{protocol}");
+                    assert_eq!(message.tokens.cache_read, 600);
+                    assert_eq!(message.tokens.cache_write, 100);
+                    assert_eq!(
+                        message.billing_identity,
+                        super::super::BillingIdentity::Known {
+                            id: "gateway-a".into(),
+                            origin: super::super::BillingIdentityOrigin::ExplicitRecord,
+                        }
+                    );
+                    assert_eq!(message.has_authoritative_cost(), authoritative);
+                    assert_eq!(message.cost, cost);
+                    assert_eq!(
+                        message.provider_id,
+                        if protocol.contains('/') {
+                            protocol
+                        } else {
+                            "Gateway-A"
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_model_inferred_provider_does_not_become_billing_identity() {
+        let dir = TempDir::new().unwrap();
+        let rows = serde_json::json!([{
+            "type":"say", "say":"api_req_started", "ts":1789022955199_i64,
+            "modelInfo":{"modelId":"anthropic/claude-sonnet-4"},
+            "text":serde_json::json!({"cost":0.25,"tokensIn":1000,"tokensOut":10,
+                "cacheReads":600,"cacheWrites":100,"apiProtocol":"openai"}).to_string()
+        }]);
+        let path = setup_task(&dir, "unknown-billing", &rows.to_string(), None);
+        for source in ["roocode", "kilocode", "cline"] {
+            let messages = parse_roo_kilo_file(&path, source);
+            assert_eq!(messages[0].provider_id, "anthropic");
+            assert_eq!(
+                messages[0].billing_identity,
+                super::super::BillingIdentity::Unknown
+            );
+            assert!(messages[0].has_authoritative_cost());
+        }
+    }
+
+    /// Before Roo v3.29.5, an Anthropic-protocol row recorded `input_tokens`
+    /// net of cache. Subtracting there would undercount real input, so a row
+    /// that old keeps `tokensIn` as written -- while an OpenAI-protocol row of
+    /// the same age, which was always gross, is still de-overlapped.
+    #[test]
+    fn test_parse_roocode_legacy_anthropic_input_is_already_net_of_cache() {
+        let dir = TempDir::new().unwrap();
+        let ui_messages = r#"[
+  {"type":"say","say":"api_req_started","ts":1748038758034,
+   "text":"{\"cost\":0.1,\"tokensIn\":1000,\"tokensOut\":10,\"cacheReads\":600,\"cacheWrites\":100,\"apiProtocol\":\"anthropic\"}"},
+  {"type":"say","say":"api_req_started","ts":1748038758035,
+   "text":"{\"cost\":0.1,\"tokensIn\":1000,\"tokensOut\":10,\"cacheReads\":600,\"cacheWrites\":100,\"apiProtocol\":\"openai\"}"},
+  {"type":"say","say":"api_req_started","ts":1748038758036,
+   "text":"{\"cost\":0.1,\"tokensIn\":300,\"tokensOut\":10,\"cacheReads\":600,\"cacheWrites\":100,\"apiProtocol\":\"anthropic\"}"}
+]"#;
+        let path = setup_task(&dir, "task-legacy-net", ui_messages, None);
+
+        let messages = parse_roocode_file(&path);
+        assert_eq!(messages.len(), 3);
+
+        // Legacy Anthropic: already net of cache, so left alone. Subtracting
+        // would have reported 300 for 1000 real input tokens.
+        assert_eq!(messages[0].tokens.input, 1000);
+        assert_eq!(messages[0].tokens.cache_read, 600);
+        assert_eq!(messages[0].tokens.cache_write, 100);
+
+        // Legacy OpenAI: gross even then, so the buckets still come out.
+        assert_eq!(messages[1].tokens.input, 300);
+
+        // A legacy Anthropic row whose input is smaller than the cache sum is
+        // simply reported as written; nothing is clamped away.
+        assert_eq!(messages[2].tokens.input, 300);
+        assert_eq!(messages[2].tokens.cache_read, 600);
+    }
+
+    #[test]
+    fn test_provider_from_model_id() {
+        assert_eq!(
+            provider_from_model_id("anthropic/claude-sonnet-4").as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            provider_from_model_id("x-ai/grok-code-fast-1").as_deref(),
+            Some("xai")
+        );
+        // `ollama/` is a routing prefix: the routed model names the vendor.
+        assert_eq!(
+            provider_from_model_id("ollama/claude-sonnet-4").as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            provider_from_model_id("ollama/qwen3-coder").as_deref(),
+            Some("qwen")
+        );
+        // An unknown routed model resolves to nothing rather than to the
+        // runtime that served it.
+        assert_eq!(provider_from_model_id("ollama/my-local-finetune"), None);
+        // `kilo-auto/` is Kilo's own router, and Kilo is the billed provider.
+        for model in ["kilo-auto/frontier", "kilo-auto/free", "KILO-AUTO/small"] {
+            assert_eq!(
+                provider_from_model_id(model).as_deref(),
+                Some("kilo"),
+                "{model}"
+            );
+        }
+        // A family name inside a longer word is not a family match.
+        assert_eq!(provider_from_model_id("engroked"), None);
+        assert_eq!(
+            provider_from_model_id("claude-sonnet-3-7").as_deref(),
+            Some("anthropic")
+        );
     }
 
     #[test]
@@ -332,7 +683,8 @@ after"#;
         assert_eq!(messages[0].model_id, "claude-sonnet-4");
         assert_eq!(messages[0].provider_id, "anthropic");
         assert_eq!(messages[0].session_id, "task-abc");
-        assert_eq!(messages[0].tokens.input, 100);
+        // 100 gross input less the 20 + 5 cache buckets it contains.
+        assert_eq!(messages[0].tokens.input, 75);
         assert_eq!(messages[0].tokens.output, 50);
         assert_eq!(messages[0].tokens.cache_read, 20);
         assert_eq!(messages[0].tokens.cache_write, 5);

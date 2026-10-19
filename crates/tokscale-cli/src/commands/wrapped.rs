@@ -28,8 +28,6 @@ const FIGTREE_BOLD_FILE: &str = "Figtree-Bold.ttf";
 const FIGTREE_BOLD_URL: &str =
     "https://fonts.gstatic.com/s/figtree/v9/_Xmz-HUzqDCFdgfMsYiV_F7wfS-Bs_eYR15e.ttf";
 
-const PINNED_AGENTS: [&str; 2] = ["Sisyphus", "Planner-Sisyphus"];
-
 const COLOR_BACKGROUND: Rgba<u8> = Rgba([0x10, 0x12, 0x1C, 0xFF]);
 const COLOR_TEXT_PRIMARY: Rgba<u8> = Rgba([0xFF, 0xFF, 0xFF, 0xFF]);
 const COLOR_TEXT_SECONDARY: Rgba<u8> = Rgba([0x88, 0x88, 0x88, 0xFF]);
@@ -38,7 +36,6 @@ const COLOR_GRADE1: Rgba<u8> = Rgba([0x00, 0xB2, 0xFF, 0x44]);
 const COLOR_GRADE2: Rgba<u8> = Rgba([0x00, 0xB2, 0xFF, 0x88]);
 const COLOR_GRADE3: Rgba<u8> = Rgba([0x00, 0xB2, 0xFF, 0xCC]);
 const COLOR_GRADE4: Rgba<u8> = Rgba([0x00, 0xB2, 0xFF, 0xFF]);
-const COLOR_SISYPHUS: Rgba<u8> = Rgba([0x00, 0xCE, 0xD1, 0xFF]);
 
 #[derive(Debug, Clone)]
 pub struct WrappedOptions {
@@ -47,7 +44,6 @@ pub struct WrappedOptions {
     pub clients: Option<Vec<String>>,
     pub short: bool,
     pub include_agents: bool,
-    pub pin_sisyphus: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -94,7 +90,6 @@ struct FontSet {
 struct RenderOptions {
     short: bool,
     include_agents: bool,
-    pin_sisyphus: bool,
 }
 
 pub fn run(options: WrappedOptions) -> Result<String> {
@@ -134,7 +129,6 @@ async fn generate_wrapped(options: WrappedOptions) -> Result<String> {
         &RenderOptions {
             short: options.short,
             include_agents: effective_include_agents,
-            pin_sisyphus: options.pin_sisyphus,
         },
     )
     .await?;
@@ -178,7 +172,7 @@ async fn load_wrapped_data(options: &WrappedOptions) -> Result<WrappedData> {
     let until = format!("{}-12-31", year);
 
     let has_cursor_cache = cursor::has_cursor_usage_cache();
-    let cursor_logged_in = cursor::is_cursor_logged_in();
+    let cursor_logged_in = include_cursor && cursor::ensure_cursor_session_for_sync();
     let mut cursor_sync_result: Option<cursor::SyncCursorResult> = None;
 
     if include_cursor && cursor_logged_in {
@@ -403,29 +397,13 @@ fn build_top_agents(parsed: &tokscale_core::ParsedMessages) -> Vec<WrappedAgentE
     }
 
     let mut agents: Vec<WrappedAgentEntry> = agent_map.into_values().collect();
-
-    let mut pinned = agents
-        .iter()
-        .filter(|agent| PINNED_AGENTS.contains(&agent.name.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut unpinned = agents
-        .drain(..)
-        .filter(|agent| !PINNED_AGENTS.contains(&agent.name.as_str()))
-        .collect::<Vec<_>>();
-
-    pinned.sort_by_key(|agent| {
-        PINNED_AGENTS
-            .iter()
-            .position(|name| *name == agent.name)
-            .unwrap_or(usize::MAX)
+    agents.sort_by(|a, b| {
+        b.messages
+            .cmp(&a.messages)
+            .then_with(|| a.name.cmp(&b.name))
     });
-    unpinned.sort_by_key(|b| std::cmp::Reverse(b.messages));
-
-    let mut combined = Vec::new();
-    combined.extend(pinned);
-    combined.extend(unpinned.into_iter().take(2));
-    combined
+    agents.truncate(3);
+    agents
 }
 
 async fn generate_wrapped_image(data: &WrappedData, options: &RenderOptions) -> Result<RgbaImage> {
@@ -574,47 +552,24 @@ async fn generate_wrapped_image(data: &WrappedData, options: &RenderOptions) -> 
         y_pos += 48 * SCALE;
 
         let agents = data.top_agents.clone().unwrap_or_default();
-        let mut rank_index = 1;
 
-        for agent in agents {
-            let is_sisyphus_agent = PINNED_AGENTS.contains(&agent.name.as_str());
-            let show_with_dash = options.pin_sisyphus && is_sisyphus_agent;
-            let prefix = if show_with_dash {
-                "\u{2022}".to_string()
-            } else {
-                rank_index.to_string()
-            };
-            let prefix_color = if show_with_dash {
-                COLOR_SISYPHUS
-            } else {
-                COLOR_TEXT_PRIMARY
-            };
-
+        for (index, agent) in agents.iter().enumerate() {
             draw_text_mut_baseline(
                 &mut canvas,
                 &fonts.bold,
                 (32 * SCALE) as f32,
-                prefix_color,
+                COLOR_TEXT_PRIMARY,
                 PADDING,
                 y_pos,
-                &prefix,
+                &(index + 1).to_string(),
             );
 
-            if !show_with_dash {
-                rank_index += 1;
-            }
-
             let name_x = PADDING + 40 * SCALE;
-            let name_color = if is_sisyphus_agent {
-                COLOR_SISYPHUS
-            } else {
-                COLOR_TEXT_PRIMARY
-            };
             draw_text_mut_baseline(
                 &mut canvas,
                 &fonts.regular,
                 (32 * SCALE) as f32,
-                name_color,
+                COLOR_TEXT_PRIMARY,
                 name_x,
                 y_pos,
                 &agent.name,
@@ -765,7 +720,7 @@ async fn generate_wrapped_image(data: &WrappedData, options: &RenderOptions) -> 
     if let Ok(logo_path) = fetch_svg_and_convert_to_png(
         &client,
         TOKSCALE_LOGO_SVG_URL,
-        "tokscale-logo@2x.png",
+        "tokscale-logo-v2@2x.png",
         TOKSCALE_LOGO_PNG_SIZE * SCALE,
     )
     .await
@@ -1265,8 +1220,15 @@ fn ensure_cache_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Decodes by content, not by file extension. Remote icons are cached under a
+/// `.png` name even when the source is a JPEG (claude.jpg, cursor.jpg, ...), and
+/// `image::open` picks the PNG decoder from the extension and fails on those.
 fn load_rgba_image(path: &Path) -> Result<RgbaImage> {
-    Ok(image::open(path)
+    Ok(image::ImageReader::open(path)
+        .with_context(|| format!("Failed to open image {}", path.display()))?
+        .with_guessed_format()
+        .with_context(|| format!("Failed to read image {}", path.display()))?
+        .decode()
         .with_context(|| format!("Failed to decode image {}", path.display()))?
         .to_rgba8())
 }
@@ -1861,6 +1823,19 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::env;
+
+    #[test]
+    fn load_rgba_image_decodes_a_jpeg_cached_under_a_png_name() {
+        // Client icons such as claude.jpg are cached as `client-claude-code@2x.png`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client-claude-code@2x.png");
+        image::RgbImage::from_pixel(4, 4, image::Rgb([200, 100, 50]))
+            .save_with_format(&path, image::ImageFormat::Jpeg)
+            .unwrap();
+
+        let loaded = load_rgba_image(&path).expect("JPEG bytes behind a .png name must decode");
+        assert_eq!((loaded.width(), loaded.height()), (4, 4));
+    }
     use tempfile::TempDir;
 
     fn restore_env_var(key: &str, value: Option<std::ffi::OsString>) {
@@ -3049,7 +3024,7 @@ fn cursor_setup_warning_for_wrapped(
     };
 
     Some(format!(
-        "Cursor usage requires Tokscale's Cursor API cache at `~/.config/tokscale/cursor-cache/usage*.csv`; {action}. Tokscale does not parse local `~/.cursor` session data."
+        "Cursor usage requires Tokscale's Cursor API cache at `~/.config/tokscale/cursor-cache/usage*.json`; {action}. Tokscale does not parse local `~/.cursor` session data."
     ))
 }
 
@@ -3062,6 +3037,10 @@ mod cursor_setup_warning_tests {
         let warning = cursor_setup_warning_for_wrapped(true, false, false).unwrap();
         assert!(warning.contains("tokscale cursor login"));
         assert!(warning.contains("tokscale cursor sync --json"));
+        assert!(
+            warning.contains("cursor-cache/usage*.json"),
+            "the warning must name the maintained JSON cache: {warning}"
+        );
     }
 
     #[test]

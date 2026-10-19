@@ -203,6 +203,84 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_kilo_sqlite_skips_rows_migrated_from_vscode_extension() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_kilo_sqlite_db(&dir);
+        let conn = Connection::open(&db_path).unwrap();
+
+        // Shape the Kilo CLI writes when it imports Kilo Code extension tasks.
+        insert_kilo_message(
+            &conn,
+            "msg_migrated_1",
+            "ses_migrated_1",
+            r#"{"role":"assistant","time":{"created":1748038767854,"completed":1748038767854},"modelID":"legacy","providerID":"legacy","mode":"code","agent":"main","cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}"#,
+        );
+        insert_kilo_message(
+            &conn,
+            "msg_native_1",
+            "ses_native_1",
+            r#"{"role":"assistant","time":{"created":1768678556423},"modelID":"kilo-auto/frontier","providerID":"kilo","cost":0.01,"tokens":{"input":100,"output":20,"reasoning":0,"cache":{"read":0,"write":0}}}"#,
+        );
+        drop(conn);
+
+        let messages = parse_kilo_sqlite_with_fallback(&db_path, 42);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].session_id, "ses_native_1");
+        assert_eq!(messages[0].model_id, "kilo-auto/frontier");
+    }
+
+    /// The skip is for the migration's zero-usage stubs, identified by the
+    /// whole shape. A row that merely spells its provider and model `legacy`
+    /// is somebody's real spend and must still be counted.
+    #[test]
+    fn test_parse_kilo_sqlite_keeps_legacy_named_rows_that_carry_usage() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_kilo_sqlite_db(&dir);
+        let conn = Connection::open(&db_path).unwrap();
+
+        // `legacy/legacy` ids, but real tokens: not a migration stub.
+        insert_kilo_message(
+            &conn,
+            "msg_legacy_usage",
+            "ses_migrated_2",
+            r#"{"role":"assistant","time":{"created":1748038767854},"modelID":"legacy","providerID":"legacy","cost":0,"tokens":{"input":500,"output":20,"reasoning":0,"cache":{"read":0,"write":0}}}"#,
+        );
+        // Zero tokens but a real charge: also not a stub.
+        insert_kilo_message(
+            &conn,
+            "msg_legacy_cost",
+            "ses_migrated_3",
+            r#"{"role":"assistant","time":{"created":1748038767855},"modelID":"legacy","providerID":"legacy","cost":0.02,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}"#,
+        );
+        // Zero usage and `legacy/legacy`, but outside the migration namespace.
+        insert_kilo_message(
+            &conn,
+            "msg_legacy_native_session",
+            "ses_native_2",
+            r#"{"role":"assistant","time":{"created":1748038767856},"modelID":"legacy","providerID":"legacy","cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}"#,
+        );
+        drop(conn);
+
+        let messages = parse_kilo_sqlite_with_fallback(&db_path, 42);
+        let sessions: Vec<&str> = messages
+            .iter()
+            .map(|message| message.session_id.as_str())
+            .collect();
+        assert!(
+            sessions.contains(&"ses_migrated_2"),
+            "a `legacy` row with real tokens was dropped: {sessions:?}"
+        );
+        assert!(
+            sessions.contains(&"ses_migrated_3"),
+            "a `legacy` row with a real cost was dropped: {sessions:?}"
+        );
+        assert!(
+            sessions.contains(&"ses_native_2"),
+            "a non-migrated `legacy` row was dropped: {sessions:?}"
+        );
+    }
+
+    #[test]
     fn test_parse_kilo_sqlite_returns_empty_for_missing_db() {
         let messages = parse_kilo_sqlite(std::path::Path::new("/nonexistent/kilo.db"));
         assert!(messages.is_empty());

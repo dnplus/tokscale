@@ -717,6 +717,10 @@ pub fn parse_cursor_usage_records(content: &str, account_id: &str) -> Vec<Cursor
             timestamp,
             token_usage.token_breakdown(),
             cost.unwrap_or(0.0).max(0.0),
+        )
+        .with_billing(
+            Some("cursor"),
+            super::BillingIdentityOrigin::KnownHostedChannel,
         );
         if cost.is_some() {
             message.mark_provider_reported_cost();
@@ -852,6 +856,10 @@ fn parse_cursor_csv_file(path: &Path) -> Vec<UnifiedMessage> {
                 reasoning: 0,
             },
             cost.unwrap_or(0.0).max(0.0),
+        )
+        .with_billing(
+            Some("cursor"),
+            super::BillingIdentityOrigin::KnownHostedChannel,
         );
         if cost.is_some() {
             message.mark_provider_reported_cost();
