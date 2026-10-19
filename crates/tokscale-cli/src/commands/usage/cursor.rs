@@ -157,10 +157,26 @@ pub fn fetch() -> Result<UsageOutput> {
 }
 
 /// One Grok Bot card per signed-in Cursor account in Grok Bot.app when that
-/// store decrypts; otherwise a single card from Cursor desktop auth.
+/// store decrypts; otherwise a single card from Cursor desktop auth. A pool
+/// the Cursor card already shows is omitted, so one pool renders one card.
 pub fn fetch_grok_bot_report() -> Result<UsageFetchReport> {
+    grok_bot_report(true)
+}
+
+/// Every account's own Grok Bot pool, including one the Cursor card shows,
+/// for the per-bot breakdown.
+pub fn fetch_grok_bot_breakdown_report() -> Result<UsageFetchReport> {
+    grok_bot_report(false)
+}
+
+fn grok_bot_report(omit_cursor_pool: bool) -> Result<UsageFetchReport> {
     match load_grok_bot_app_accounts() {
         Ok(accounts) if !accounts.is_empty() => {
+            // The Cursor card renders the pool of the locally signed-in account.
+            let cursor_access = omit_cursor_pool
+                .then(|| resolve_local_auth().ok())
+                .flatten()
+                .map(|auth| auth.access_token);
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
@@ -168,20 +184,38 @@ pub fn fetch_grok_bot_report() -> Result<UsageFetchReport> {
                 let client = plan_http_client()?;
                 let mut results = Vec::new();
                 for account in accounts {
-                    let result = fetch_sand_for_token(&client, &account.access_token).await;
+                    let mut result = fetch_sand_for_token(&client, &account.access_token).await;
+                    if let (Ok(Some(parsed)), Some(cursor)) = (&result, cursor_access.as_deref()) {
+                        let plan = if parsed.is_unified
+                            || !same_cursor_principal(cursor, &account.access_token)
+                        {
+                            None
+                        } else {
+                            connect_post(&client, PLAN_URL, &account.access_token, "GetPlanInfo")
+                                .await
+                                .ok()
+                        };
+                        if pool_on_cursor_card(
+                            Some(cursor),
+                            &account.access_token,
+                            &parse_plan_info(plan.as_ref()),
+                            parsed,
+                        ) {
+                            result = Ok(None);
+                        }
+                    }
                     results.push((account, result));
                 }
                 Ok(grok_bot_account_report(results))
             })
         }
-        Ok(_) | Err(_) => {
-            fetch_grok_bot_desktop().map(|output| UsageFetchReport::from_outputs(vec![output]))
-        }
+        Ok(_) | Err(_) => fetch_grok_bot_desktop(omit_cursor_pool)
+            .map(|output| UsageFetchReport::from_outputs(output.into_iter().collect())),
     }
 }
 
 fn grok_bot_account_report(
-    results: impl IntoIterator<Item = (GrokBotAppAccount, Result<ParsedSandUsage>)>,
+    results: impl IntoIterator<Item = (GrokBotAppAccount, Result<Option<ParsedSandUsage>>)>,
 ) -> UsageFetchReport {
     let mut report = UsageFetchReport::default();
     for (account, result) in results {
@@ -191,7 +225,9 @@ fn grok_bot_account_report(
             is_active: account.is_active,
         };
         match result {
-            Ok(parsed) => report.outputs.push(UsageOutput {
+            // No personal allowance is a successful empty result, not a failure.
+            Ok(None) => {}
+            Ok(Some(parsed)) => report.outputs.push(UsageOutput {
                 provider: GROK_BOT_PROVIDER.to_string(),
                 account: Some(identity),
                 credential_source: Some("grok-bot-app".into()),
@@ -218,7 +254,20 @@ fn grok_bot_account_report(
     report
 }
 
-fn fetch_grok_bot_desktop() -> Result<UsageOutput> {
+/// True when the Cursor card already renders this account's Grok Bot pool:
+/// the account is the Cursor card's own (proved by token or JWT subject) and
+/// the pool replaces its Auto/API tracks. An unprovable account keeps its card.
+fn pool_on_cursor_card(
+    cursor_access: Option<&str>,
+    account_access: &str,
+    plan: &ParsedPlanInfo,
+    sand: &ParsedSandUsage,
+) -> bool {
+    cursor_access.is_some_and(|cursor| same_cursor_principal(cursor, account_access))
+        && sand_replaces_cursor_tracks(plan, sand)
+}
+
+fn fetch_grok_bot_desktop(omit_cursor_pool: bool) -> Result<Option<UsageOutput>> {
     let auth = resolve_local_auth()?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -227,6 +276,13 @@ fn fetch_grok_bot_desktop() -> Result<UsageOutput> {
         let now = Utc::now().timestamp();
         let mut access = bearer_for_request(&auth, now).await?;
         let client = plan_http_client()?;
+        let plan = if omit_cursor_pool {
+            connect_post_with_retry(&client, PLAN_URL, &auth, &mut access, "GetPlanInfo")
+                .await
+                .ok()
+        } else {
+            None
+        };
         let sand = connect_post_with_retry(
             &client,
             SAND_USAGE_URL,
@@ -235,8 +291,21 @@ fn fetch_grok_bot_desktop() -> Result<UsageOutput> {
             "GetSandUsageStatus",
         )
         .await?;
-        let parsed = sand_usage_or_error(&sand)?;
-        Ok(UsageOutput {
+        let Some(parsed) = parse_sand_usage(&sand)? else {
+            return Ok(None);
+        };
+        // Desktop auth is the Cursor card's own account.
+        if omit_cursor_pool
+            && pool_on_cursor_card(
+                Some(&access),
+                &access,
+                &parse_plan_info(plan.as_ref()),
+                &parsed,
+            )
+        {
+            return Ok(None);
+        }
+        Ok(Some(UsageOutput {
             provider: GROK_BOT_PROVIDER.to_string(),
             account: None,
             credential_source: Some(auth.credential_source.into()),
@@ -246,36 +315,16 @@ fn fetch_grok_bot_desktop() -> Result<UsageOutput> {
             reset_credits: None,
             credit_status: None,
             spend_control: None,
-        })
+        }))
     })
 }
 
-async fn fetch_sand_for_token(client: &reqwest::Client, access: &str) -> Result<ParsedSandUsage> {
+async fn fetch_sand_for_token(
+    client: &reqwest::Client,
+    access: &str,
+) -> Result<Option<ParsedSandUsage>> {
     let sand = connect_post(client, SAND_USAGE_URL, access, "GetSandUsageStatus").await?;
-    sand_usage_or_error(&sand)
-}
-
-/// A Grok Bot card reports a missing personal allowance as a diagnostic so
-/// each account's state stays visible, rather than silently omitting it.
-fn sand_usage_or_error(value: &Value) -> Result<ParsedSandUsage> {
-    parse_sand_usage(value)?.ok_or_else(|| {
-        if value
-            .get("usesPooledEnterpriseAllowance")
-            .and_then(Value::as_bool)
-            == Some(true)
-        {
-            anyhow::anyhow!("Grok Bot uses a pooled enterprise allowance with no personal share")
-        } else if value
-            .get("hasNonZeroIncludedLimit")
-            .and_then(Value::as_bool)
-            == Some(false)
-            || value.get("includedLimitZero").and_then(Value::as_bool) == Some(true)
-        {
-            anyhow::anyhow!("Grok Bot has no included weekly allowance on this Cursor account")
-        } else {
-            anyhow::anyhow!("Grok Bot GetSandUsageStatus had no usagePercent")
-        }
-    })
+    parse_sand_usage(&sand)
 }
 
 #[derive(Debug, Clone)]
@@ -741,8 +790,8 @@ fn record_matches_access(access_token: &str, record: &[Option<String>]) -> bool 
 /// falls through to the next source. Cursor can split one account's access and
 /// refresh JWTs between state.vscdb and Keychain, so a missing refresh token
 /// is transferred only when a JWT subject proves both records belong to the
-/// same account. Keychain is read only when the desktop record cannot stand
-/// alone.
+/// same account. The desktop email labels a fallback token under the same
+/// rule. Keychain is read only when the desktop record cannot stand alone.
 fn select_local_auth(
     db_access: Option<&str>,
     db_refresh: Option<&str>,
@@ -755,6 +804,14 @@ fn select_local_auth(
         .map(str::trim)
         .filter(|token| access_token_usable(token));
     let mut db_refresh = nonempty(db_refresh);
+    // The desktop email names another source's token only when a JWT subject
+    // proves both belong to the same account.
+    let desktop_email_for = |access: &str| {
+        db_access
+            .is_some_and(|desktop| same_cursor_principal(desktop, access))
+            .then(|| account_label(db_email))
+            .flatten()
+    };
     let desktop = |access: &str, refresh_token: Option<String>| LocalCursorAuth {
         access_token: access.to_string(),
         refresh_token,
@@ -789,8 +846,8 @@ fn select_local_auth(
         if !needs_refresh(access, now_unix) || keychain_refresh.is_some() {
             return Ok(LocalCursorAuth {
                 access_token: access.to_string(),
+                email: desktop_email_for(access),
                 refresh_token: keychain_refresh,
-                email: None,
                 credential_source: "keychain",
             });
         }
@@ -800,10 +857,12 @@ fn select_local_auth(
         if let Some(access) = jwt_from_session_token(&creds.session_token)
             .filter(|access| !needs_refresh(access, now_unix))
         {
+            let email =
+                account_label(creds.email.as_deref()).or_else(|| desktop_email_for(&access));
             return Ok(LocalCursorAuth {
                 access_token: access,
                 refresh_token: None,
-                email: account_label(creds.email.as_deref()),
+                email,
                 credential_source: "stored",
             });
         }
@@ -1196,8 +1255,93 @@ mod tests {
         }
     }
 
-    fn sand_fixture() -> Result<ParsedSandUsage> {
-        sand_usage_or_error(&json!({"hasNonZeroIncludedLimit": true, "usagePercent": 25}))
+    fn sand_fixture() -> Result<Option<ParsedSandUsage>> {
+        parse_sand_usage(&json!({"hasNonZeroIncludedLimit": true, "usagePercent": 25}))
+    }
+
+    #[test]
+    fn grok_bot_pool_is_omitted_only_when_the_cursor_card_shows_it() {
+        let account = future_jwt("auth0|account-a");
+        let same_subject = future_jwt("auth0|account-a").replace("signature", "other-signature");
+        let other_subject = future_jwt("auth0|account-b");
+        let sand = |unified: bool| {
+            parse_sand_usage(&json!({
+                "hasNonZeroIncludedLimit": true,
+                "usagePercent": 25,
+                "isUnified": unified
+            }))
+            .unwrap()
+            .unwrap()
+        };
+        let plan = |period: Option<&str>| {
+            parse_plan_info(
+                period
+                    .map(|period| json!({"planInfo": {"includedUsagePeriod": period}}))
+                    .as_ref(),
+            )
+        };
+        // (Cursor card token, unified, plan period, omitted)
+        let cases = [
+            (Some(account.as_str()), true, None, true),
+            (Some(same_subject.as_str()), true, None, true),
+            (
+                Some(same_subject.as_str()),
+                false,
+                Some("INCLUDED_USAGE_PERIOD_WEEKLY"),
+                true,
+            ),
+            (
+                Some(same_subject.as_str()),
+                false,
+                Some("INCLUDED_USAGE_PERIOD_MONTHLY"),
+                false,
+            ),
+            (Some(same_subject.as_str()), false, None, false),
+            (Some(other_subject.as_str()), true, None, false),
+            (
+                Some(other_subject.as_str()),
+                false,
+                Some("INCLUDED_USAGE_PERIOD_WEEKLY"),
+                false,
+            ),
+            (Some("opaque-cursor-token"), true, None, false),
+            (None, true, Some("INCLUDED_USAGE_PERIOD_WEEKLY"), false),
+        ];
+        for (cursor, unified, period, omitted) in cases {
+            assert_eq!(
+                pool_on_cursor_card(cursor, &account, &plan(period), &sand(unified)),
+                omitted,
+                "cursor={cursor:?} unified={unified} period={period:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn grok_bot_account_without_personal_quota_is_hidden_not_reported() {
+        let no_personal = [
+            json!({"usesPooledEnterpriseAllowance": true, "usagePercent": 10.0}),
+            json!({"hasNonZeroIncludedLimit": false, "usagePercent": 10.0}),
+            json!({"includedLimitZero": true, "usagePercent": 0.0}),
+        ];
+        for response in no_personal {
+            let report = grok_bot_account_report([
+                (bot_account("pooled", false), parse_sand_usage(&response)),
+                (bot_account("personal", true), sand_fixture()),
+            ]);
+            assert_eq!(report.outputs.len(), 1, "{response}");
+            assert_eq!(report.outputs[0].account.as_ref().unwrap().id, "personal");
+            assert!(report.diagnostics.is_empty(), "{response}");
+        }
+
+        // Negative control: an allowance that promises a share but omits its
+        // percentage is a failure, and it stays visible as a diagnostic.
+        let report = grok_bot_account_report([(
+            bot_account("broken", false),
+            parse_sand_usage(&json!({"hasNonZeroIncludedLimit": true})),
+        )]);
+        assert!(report.outputs.is_empty());
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].account.as_ref().unwrap().id, "broken");
     }
 
     #[test]
@@ -1277,6 +1421,93 @@ mod tests {
         .unwrap();
         assert!(auth.email.is_none());
         assert_eq!(auth.credential_source, "stored");
+    }
+
+    /// The desktop email follows the JWT subject, never the source order.
+    #[test]
+    fn fallback_sources_borrow_desktop_email_only_for_the_same_subject() {
+        // An expired desktop JWT without a refresh token forces the fallback.
+        let desktop = auth_with_subject(Some(900), "auth0|account-a", None, None).access_token;
+        let same = future_jwt("auth0|account-a");
+        let other = future_jwt("auth0|account-b");
+        // (desktop access, fallback access, expected email)
+        let cases = [
+            (Some(desktop.as_str()), same.as_str(), Some("a@example.com")),
+            (Some(desktop.as_str()), other.as_str(), None),
+            (Some("opaque-desktop-token"), same.as_str(), None),
+            (None, same.as_str(), None),
+        ];
+        for (db_access, access, email) in cases {
+            let keychain = select_local_auth(
+                db_access,
+                None,
+                Some("a@example.com"),
+                || (Some(access.to_string()), None),
+                || panic!("a fresh Keychain token should not read stored credentials"),
+                1000,
+            )
+            .unwrap();
+            assert_eq!(keychain.credential_source, "keychain");
+            assert_eq!(keychain.email.as_deref(), email, "keychain {db_access:?}");
+
+            let stored = select_local_auth(
+                db_access,
+                None,
+                Some("a@example.com"),
+                || (None, None),
+                || {
+                    Some(
+                        serde_json::from_value(json!({
+                            "sessionToken": format!("user::{access}"),
+                            "createdAt": "2026-10-17T00:00:00Z"
+                        }))
+                        .unwrap(),
+                    )
+                },
+                1000,
+            )
+            .unwrap();
+            assert_eq!(stored.credential_source, "stored");
+            assert_eq!(stored.email.as_deref(), email, "stored {db_access:?}");
+        }
+    }
+
+    #[test]
+    fn stored_email_wins_over_a_matching_desktop_email() {
+        let stored = serde_json::from_value(json!({
+            "sessionToken": format!("user::{}", future_jwt("auth0|account-a")),
+            "createdAt": "2026-10-17T00:00:00Z",
+            "email": "saved@example.com"
+        }))
+        .unwrap();
+        let auth = select_local_auth(
+            Some(&auth_with_subject(Some(900), "auth0|account-a", None, None).access_token),
+            None,
+            Some("desktop@example.com"),
+            || (None, None),
+            || Some(stored),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(auth.email.as_deref(), Some("saved@example.com"));
+    }
+
+    /// `needs_refresh` treats a token within 60s of expiry as expired, so a
+    /// Keychain token without a refresh grant is usable only past that edge.
+    #[test]
+    fn keychain_expiry_boundary_without_refresh() {
+        for (exp, selected) in [(1060, false), (1061, true)] {
+            let access = auth_with_subject(Some(exp), "auth0|account-a", None, None).access_token;
+            let result = select_local_auth(
+                None,
+                None,
+                None,
+                || (Some(access.clone()), None),
+                || None,
+                1000,
+            );
+            assert_eq!(result.is_ok(), selected, "exp {exp}");
+        }
     }
 
     #[test]
@@ -1491,26 +1722,6 @@ mod tests {
             Some("2026-10-06T09:12:29.574Z")
         );
         assert_eq!(parsed.plan.as_deref(), Some("Grok Bot Plan"));
-    }
-
-    #[test]
-    fn parse_sand_usage_hides_pooled_and_zero_limit() {
-        // Grok Bot cards report each missing personal allowance explicitly.
-        assert!(sand_usage_or_error(&json!({
-            "usesPooledEnterpriseAllowance": true,
-            "usagePercent": 10.0,
-            "hasNonZeroIncludedLimit": true
-        }))
-        .is_err());
-        assert!(sand_usage_or_error(&json!({
-            "hasNonZeroIncludedLimit": false,
-            "usagePercent": 10.0
-        }))
-        .is_err());
-        assert!(sand_usage_or_error(&json!({
-            "hasNonZeroIncludedLimit": true
-        }))
-        .is_err());
     }
 
     #[test]

@@ -16,8 +16,6 @@ const BILLING_GRPC_URL: &str = "https://grok.com/grok_api_v2.GrokBuildBilling/Ge
 /// from Cursor-metered Grok Bot (`GetSandUsageStatus`). The response declares
 /// whether its one current period is weekly or monthly.
 const GROK_CREDITS_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
-/// Monthly included-allowance meter, read alongside a weekly credits period.
-const GROK_MONTHLY_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing";
 const GROK_USER_AGENT: &str = "Grok Build";
 const GROK_TOKEN_AUTH: &str = "xai-grok-cli";
 const WEEKLY_PERIOD_TYPE: &str = "USAGE_PERIOD_TYPE_WEEKLY";
@@ -493,22 +491,6 @@ fn fetch_network_usage(credentials: &Credentials) -> Result<UsageOutput> {
         plan = proxy.plan;
         metrics.extend(proxy.metrics);
         errors.extend(proxy.errors);
-
-        // A weekly credits period has a separate monthly included allowance.
-        if metrics.iter().any(|metric| metric.label == "Weekly") {
-            match fetch_proxy_billing(&client, credentials, GROK_MONTHLY_URL).await {
-                Ok(monthly) => {
-                    if let Some(metric) = parse_proxy_legacy_metric(&monthly) {
-                        metrics.push(metric);
-                    }
-                    if plan.is_none() {
-                        plan = proxy_subscription_tier(&monthly).map(normalize_subscription_tier);
-                    }
-                }
-                Err(error) => errors.push(format!("Grok monthly billing request failed: {error}")),
-            }
-        }
-
         if metrics.is_empty() {
             match fetch_billing_grpc(&client, &credentials.token).await {
                 Ok(body) => {

@@ -315,7 +315,7 @@ pub fn run(json: bool, since: Option<DateTime<Utc>>) -> Result<()> {
         since.is_none_or(|s| s <= now),
         "--since must not be in the future"
     );
-    let cards = cursor::fetch_grok_bot_report();
+    let cards = cursor::fetch_grok_bot_breakdown_report();
     let mut diagnostics = vec![];
     let cards = match cards {
         Ok(report) => {
