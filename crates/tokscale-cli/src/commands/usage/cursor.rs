@@ -160,23 +160,10 @@ pub fn fetch() -> Result<UsageOutput> {
 /// store decrypts; otherwise a single card from Cursor desktop auth. A pool
 /// the Cursor card already shows is omitted, so one pool renders one card.
 pub fn fetch_grok_bot_report() -> Result<UsageFetchReport> {
-    grok_bot_report(true)
-}
-
-/// Every account's own Grok Bot pool, including one the Cursor card shows,
-/// for the per-bot breakdown.
-pub fn fetch_grok_bot_breakdown_report() -> Result<UsageFetchReport> {
-    grok_bot_report(false)
-}
-
-fn grok_bot_report(omit_cursor_pool: bool) -> Result<UsageFetchReport> {
     match load_grok_bot_app_accounts() {
         Ok(accounts) if !accounts.is_empty() => {
             // The Cursor card renders the pool of the locally signed-in account.
-            let cursor_access = omit_cursor_pool
-                .then(|| resolve_local_auth().ok())
-                .flatten()
-                .map(|auth| auth.access_token);
+            let cursor_access = resolve_local_auth().ok().map(|auth| auth.access_token);
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
@@ -209,7 +196,7 @@ fn grok_bot_report(omit_cursor_pool: bool) -> Result<UsageFetchReport> {
                 Ok(grok_bot_account_report(results))
             })
         }
-        Ok(_) | Err(_) => fetch_grok_bot_desktop(omit_cursor_pool)
+        Ok(_) | Err(_) => fetch_grok_bot_desktop()
             .map(|output| UsageFetchReport::from_outputs(output.into_iter().collect())),
     }
 }
@@ -267,7 +254,7 @@ fn pool_on_cursor_card(
         && sand_replaces_cursor_tracks(plan, sand)
 }
 
-fn fetch_grok_bot_desktop(omit_cursor_pool: bool) -> Result<Option<UsageOutput>> {
+fn fetch_grok_bot_desktop() -> Result<Option<UsageOutput>> {
     let auth = resolve_local_auth()?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -276,13 +263,9 @@ fn fetch_grok_bot_desktop(omit_cursor_pool: bool) -> Result<Option<UsageOutput>>
         let now = Utc::now().timestamp();
         let mut access = bearer_for_request(&auth, now).await?;
         let client = plan_http_client()?;
-        let plan = if omit_cursor_pool {
-            connect_post_with_retry(&client, PLAN_URL, &auth, &mut access, "GetPlanInfo")
-                .await
-                .ok()
-        } else {
-            None
-        };
+        let plan = connect_post_with_retry(&client, PLAN_URL, &auth, &mut access, "GetPlanInfo")
+            .await
+            .ok();
         let sand = connect_post_with_retry(
             &client,
             SAND_USAGE_URL,
@@ -295,14 +278,12 @@ fn fetch_grok_bot_desktop(omit_cursor_pool: bool) -> Result<Option<UsageOutput>>
             return Ok(None);
         };
         // Desktop auth is the Cursor card's own account.
-        if omit_cursor_pool
-            && pool_on_cursor_card(
-                Some(&access),
-                &access,
-                &parse_plan_info(plan.as_ref()),
-                &parsed,
-            )
-        {
+        if pool_on_cursor_card(
+            Some(&access),
+            &access,
+            &parse_plan_info(plan.as_ref()),
+            &parsed,
+        ) {
             return Ok(None);
         }
         Ok(Some(UsageOutput {
@@ -729,10 +710,6 @@ fn jwt_from_session_token(session: &str) -> Option<String> {
     let decoded = session.replace("%3A%3A", "::");
     let jwt = decoded.split("::").nth(1)?.trim();
     access_token_usable(jwt).then(|| jwt.to_string())
-}
-
-pub(super) fn local_cursor_email() -> Option<String> {
-    resolve_local_auth().ok().and_then(|auth| auth.email)
 }
 
 fn resolve_local_auth() -> Result<LocalCursorAuth> {

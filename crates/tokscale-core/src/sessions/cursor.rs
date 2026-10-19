@@ -100,7 +100,7 @@ fn record_parse_cursor_file_call(path: &Path) {
     }
 }
 
-pub fn account_id_from_cursor_cache_path(path: &Path) -> String {
+fn account_id_from_cursor_cache_path(path: &Path) -> String {
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -164,24 +164,6 @@ struct CursorUsageEvent {
     charged_cents: Option<f64>,
     #[serde(rename = "tokenUsage", default)]
     token_usage: Option<CursorTokenUsage>,
-    #[serde(
-        rename = "automationId",
-        default,
-        deserialize_with = "de_automation_id"
-    )]
-    automation_id: Option<String>,
-}
-
-// Optional metadata must not discard otherwise valid usage events.
-fn de_automation_id<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<String>, D::Error> {
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(value
-        .as_str()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(str::to_owned))
 }
 
 impl CursorUsageEvent {
@@ -221,22 +203,30 @@ pub fn parse_cursor_usage_event_timestamp(value: &serde_json::Value) -> Option<i
 /// string doesn't fail the whole row.
 #[derive(Debug, Deserialize, Default)]
 struct CursorTokenUsage {
-    #[serde(rename = "inputTokens", default, deserialize_with = "de_token_count")]
-    input_tokens: CursorTokenCount,
-    #[serde(rename = "outputTokens", default, deserialize_with = "de_token_count")]
-    output_tokens: CursorTokenCount,
+    #[serde(
+        rename = "inputTokens",
+        default,
+        deserialize_with = "de_opt_i64_lenient"
+    )]
+    input_tokens: Option<i64>,
+    #[serde(
+        rename = "outputTokens",
+        default,
+        deserialize_with = "de_opt_i64_lenient"
+    )]
+    output_tokens: Option<i64>,
     #[serde(
         rename = "cacheReadTokens",
         default,
-        deserialize_with = "de_token_count"
+        deserialize_with = "de_opt_i64_lenient"
     )]
-    cache_read_tokens: CursorTokenCount,
+    cache_read_tokens: Option<i64>,
     #[serde(
         rename = "cacheWriteTokens",
         default,
-        deserialize_with = "de_token_count"
+        deserialize_with = "de_opt_i64_lenient"
     )]
-    cache_write_tokens: CursorTokenCount,
+    cache_write_tokens: Option<i64>,
     /// The metered cost of this event's tokens, in cents. Cursor's
     /// `aiserver.v1.TokenUsage` carries it next to the token counts and the
     /// discount fields, so it is populated even when the event was plan-included
@@ -252,10 +242,10 @@ struct CursorTokenUsage {
 impl CursorTokenUsage {
     fn token_breakdown(&self) -> TokenBreakdown {
         TokenBreakdown {
-            input: self.input_tokens.normalized.unwrap_or(0).max(0),
-            output: self.output_tokens.normalized.unwrap_or(0).max(0),
-            cache_read: self.cache_read_tokens.normalized.unwrap_or(0).max(0),
-            cache_write: self.cache_write_tokens.normalized.unwrap_or(0).max(0),
+            input: self.input_tokens.unwrap_or(0).max(0),
+            output: self.output_tokens.unwrap_or(0).max(0),
+            cache_read: self.cache_read_tokens.unwrap_or(0).max(0),
+            cache_write: self.cache_write_tokens.unwrap_or(0).max(0),
             cache_write_1h: 0,
             reasoning: 0,
         }
@@ -315,123 +305,12 @@ fn json_value_to_f64(value: &serde_json::Value) -> Option<f64> {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-struct CursorTokenCount {
-    // Preserve legacy normalized counts independently of raw coverage validity.
-    normalized: Option<i64>,
-    known: bool,
-    /// The field carried a non-null value, valid or not.
-    present: bool,
-}
-
-impl CursorTokenCount {
-    /// The count only when its raw value is a valid nonnegative integer, so a
-    /// rejected value such as `"inf"` or `1.5` never enters a known-data sum.
-    fn known_value(self) -> Option<i64> {
-        self.known.then_some(self.normalized).flatten()
-    }
-}
-
-fn is_known_token_count(value: &serde_json::Value) -> bool {
-    let float = match value {
-        serde_json::Value::Number(number) => {
-            if let Some(integer) = number.as_i64() {
-                return integer >= 0;
-            }
-            number.as_f64()
-        }
-        serde_json::Value::String(text) => return is_known_decimal_token_count(text.trim()),
-        _ => None,
-    };
-    float.is_some_and(|count| {
-        // i64::MAX rounds up to 2^63 as f64, so the upper bound is exclusive.
-        count.is_finite()
-            && (0.0..9_223_372_036_854_775_808.0).contains(&count)
-            && count.fract() == 0.0
-    })
-}
-
-// Validate decimal strings before any floating-point rounding or underflow.
-fn is_known_decimal_token_count(text: &str) -> bool {
-    let (negative, unsigned) = match text.as_bytes().first() {
-        Some(b'-') => (true, &text[1..]),
-        Some(b'+') => (false, &text[1..]),
-        _ => (false, text),
-    };
-    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
-        Some(index) => {
-            let raw = &unsigned[index + 1..];
-            let (negative, digits) = match raw.as_bytes().first() {
-                Some(b'-') => (true, &raw[1..]),
-                Some(b'+') => (false, &raw[1..]),
-                _ => (false, raw),
-            };
-            if digits.is_empty() || !digits.bytes().all(|digit| digit.is_ascii_digit()) {
-                return false;
-            }
-            // Saturation bounds the work even for arbitrarily long exponents.
-            let magnitude = digits.bytes().fold(0_i128, |value, digit| {
-                value
-                    .saturating_mul(10)
-                    .saturating_add(i128::from(digit - b'0'))
-            });
-            (
-                &unsigned[..index],
-                if negative { -magnitude } else { magnitude },
-            )
-        }
-        None => (unsigned, 0),
-    };
-    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    if (whole.is_empty() && fraction.is_empty())
-        || !whole
-            .bytes()
-            .chain(fraction.bytes())
-            .all(|digit| digit.is_ascii_digit())
-    {
-        return false;
-    }
-    let digits = whole.bytes().chain(fraction.bytes());
-    let first = digits.clone().position(|digit| digit != b'0');
-    let Some(first) = first else {
-        return true;
-    };
-    if negative {
-        return false;
-    }
-    let last = digits
-        .clone()
-        .enumerate()
-        .filter_map(|(index, digit)| (digit != b'0').then_some(index))
-        .last()
-        .unwrap();
-    let significant_len = last - first + 1;
-    let trailing_zeros = whole.len() + fraction.len() - last - 1;
-    let scale = exponent
-        .saturating_sub(fraction.len() as i128)
-        .saturating_add(trailing_zeros as i128);
-    if scale < 0 || scale.saturating_add(significant_len as i128) > 19 {
-        return false;
-    }
-    let significant = digits.skip(first).take(significant_len);
-    let value = significant
-        .chain(std::iter::repeat_n(b'0', scale as usize))
-        .try_fold(0_i64, |value, digit| {
-            value.checked_mul(10)?.checked_add(i64::from(digit - b'0'))
-        });
-    value.is_some()
-}
-
-fn de_token_count<'de, D>(deserializer: D) -> Result<CursorTokenCount, D::Error>
+fn de_opt_i64_lenient<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(CursorTokenCount {
-        normalized: value.as_ref().and_then(json_value_to_i64),
-        known: value.as_ref().is_some_and(is_known_token_count),
-        present: value.is_some(),
-    })
+    Ok(value.as_ref().and_then(json_value_to_i64))
 }
 
 fn de_opt_f64_lenient<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
@@ -555,15 +434,13 @@ fn is_conversation_uuid(id: &str) -> bool {
 /// Classify only explicit bot router conversations and sandbox subagent IDs.
 /// The full cache is examined before time/model filtering so switching models
 /// within an anchored conversation does not change ownership.
-fn classify_grok_bot_messages(records: &mut [CursorUsageRecord], account_id: &str) {
-    let anchored: HashSet<String> = records
+fn classify_grok_bot_messages(messages: &mut [UnifiedMessage], account_id: &str) {
+    let anchored: HashSet<String> = messages
         .iter()
-        .map(|record| &record.message)
         .filter(|m| is_conversation_uuid(&m.session_id) && m.model_id.starts_with("grok-bot-"))
         .map(|m| m.session_id.clone())
         .collect();
-    for record in records {
-        let message = &mut record.message;
+    for message in messages {
         if anchored.contains(&message.session_id)
             || message
                 .session_id
@@ -583,75 +460,8 @@ fn classify_grok_bot_messages(records: &mut [CursorUsageRecord], account_id: &st
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TokenUsageCoverage {
-    Missing,
-    Partial,
-    Complete,
-}
-
-impl CursorTokenUsage {
-    /// Input and output must be valid. Cursor omits the cache counts on many
-    /// events, so an absent cache count is not a gap, but a present invalid
-    /// one is.
-    fn coverage(&self) -> TokenUsageCoverage {
-        let counts = [
-            self.input_tokens,
-            self.output_tokens,
-            self.cache_read_tokens,
-            self.cache_write_tokens,
-        ];
-        if !counts.iter().any(|count| count.known) {
-            return TokenUsageCoverage::Missing;
-        }
-        let required = self.input_tokens.known && self.output_tokens.known;
-        let optional = [self.cache_read_tokens, self.cache_write_tokens]
-            .iter()
-            .all(|count| !count.present || count.known);
-        if required && optional {
-            TokenUsageCoverage::Complete
-        } else {
-            TokenUsageCoverage::Partial
-        }
-    }
-
-    /// Valid counts only; absent or rejected counts contribute nothing.
-    fn known_token_breakdown(&self) -> TokenBreakdown {
-        TokenBreakdown {
-            input: self.input_tokens.known_value().unwrap_or(0).max(0),
-            output: self.output_tokens.known_value().unwrap_or(0).max(0),
-            cache_read: self.cache_read_tokens.known_value().unwrap_or(0).max(0),
-            cache_write: self.cache_write_tokens.known_value().unwrap_or(0).max(0),
-            cache_write_1h: 0,
-            reasoning: 0,
-        }
-    }
-}
-
-/// Parsed Cursor metadata for local bot accounting. Kept separate from messages
-/// so optional display metadata does not alter cache or submission contracts.
-#[derive(Debug, Clone)]
-pub struct CursorUsageRecord {
-    pub message: UnifiedMessage,
-    pub token_usage_coverage: TokenUsageCoverage,
-    /// Only the counts whose raw values are valid. `message.tokens` keeps the
-    /// legacy normalized values that reports and sync identity depend on.
-    pub known_tokens: TokenBreakdown,
-    pub metered_cost_usd: Option<f64>,
-    pub charged_cost_usd: Option<f64>,
-    pub automation_id: Option<String>,
-}
-
 /// Parse cached events without filesystem access, retaining Cursor-reported costs.
 pub fn parse_cursor_events_json_content(content: &str, account_id: &str) -> Vec<UnifiedMessage> {
-    parse_cursor_usage_records(content, account_id)
-        .into_iter()
-        .map(|record| record.message)
-        .collect()
-}
-
-/// Retain optional accounting metadata and classify only valid parsed events.
-pub fn parse_cursor_usage_records(content: &str, account_id: &str) -> Vec<CursorUsageRecord> {
     let root: serde_json::Value = match serde_json::from_str(content) {
         Ok(root) => root,
         Err(_) => return vec![],
@@ -693,8 +503,6 @@ pub fn parse_cursor_usage_records(content: &str, account_id: &str) -> Vec<Cursor
 
         let default_usage = CursorTokenUsage::default();
         let token_usage = event.token_usage.as_ref().unwrap_or(&default_usage);
-        let token_usage_coverage = token_usage.coverage();
-        let known_tokens = token_usage.known_token_breakdown();
 
         // Cursor reports two different amounts. `tokenUsage.totalCents` is the
         // metered cost of the event's own tokens; `chargedCents` is what the
@@ -704,10 +512,9 @@ pub fn parse_cursor_usage_records(content: &str, account_id: &str) -> Vec<Cursor
         // rows keep Cursor's own number instead of falling through to local
         // pricing, which refuses the router labels `auto`/`agent_review` (#1062)
         // and would drop them into the unpriced bucket at $0.00.
-        let metered_cost_usd =
-            finite_non_negative_cents(token_usage.total_cents).map(|c| c / 100.0);
-        let charged_cost_usd = finite_non_negative_cents(event.charged_cents).map(|c| c / 100.0);
-        let cost = metered_cost_usd.or(charged_cost_usd);
+        let metered_cents = finite_non_negative_cents(token_usage.total_cents)
+            .or_else(|| finite_non_negative_cents(event.charged_cents));
+        let cost = metered_cents.map(|cents| cents / 100.0);
 
         let mut message = UnifiedMessage::new(
             "cursor",
@@ -725,14 +532,7 @@ pub fn parse_cursor_usage_records(content: &str, account_id: &str) -> Vec<Cursor
         if cost.is_some() {
             message.mark_provider_reported_cost();
         }
-        messages.push(CursorUsageRecord {
-            message,
-            token_usage_coverage,
-            known_tokens,
-            metered_cost_usd,
-            charged_cost_usd,
-            automation_id: event.automation_id,
-        });
+        messages.push(message);
     }
 
     classify_grok_bot_messages(&mut messages, account_id);
@@ -1632,211 +1432,34 @@ mod grok_bot_tests {
     }
 
     #[test]
-    fn token_coverage_distinguishes_absent_counts_from_explicit_zero() {
-        for (tokens, expected) in [
-            (json!(null), TokenUsageCoverage::Missing),
-            (json!({}), TokenUsageCoverage::Missing),
-            (json!({"totalCents": 25}), TokenUsageCoverage::Missing),
-            (json!({"inputTokens": -1}), TokenUsageCoverage::Missing),
-            (json!({"inputTokens": 0}), TokenUsageCoverage::Partial),
-            (
-                json!({"inputTokens": 10, "outputTokens": 2, "cacheReadTokens": 0}),
-                TokenUsageCoverage::Complete,
-            ),
-            (
-                json!({"inputTokens": 10, "outputTokens": 2}),
-                TokenUsageCoverage::Complete,
-            ),
-            (
-                json!({"inputTokens": 10, "outputTokens": 2, "cacheWriteTokens": "inf"}),
-                TokenUsageCoverage::Partial,
-            ),
-            (
-                json!({"inputTokens": 10, "cacheReadTokens": 0, "cacheWriteTokens": 0}),
-                TokenUsageCoverage::Partial,
-            ),
-            (
-                json!({"inputTokens": 0, "outputTokens": 0, "cacheReadTokens": 0, "cacheWriteTokens": 0}),
-                TokenUsageCoverage::Complete,
-            ),
-        ] {
-            let content = json!({"usageEventsDisplay": [{
-                "timestamp": 1791417600000_i64,
-                "model": "grok-bot-default",
-                "tokenUsage": tokens,
-            }]})
-            .to_string();
-            let records = parse_cursor_usage_records(&content, "work");
-            assert_eq!(records.len(), 1);
-            assert_eq!(records[0].token_usage_coverage, expected, "{content}");
-        }
-    }
-
-    #[test]
-    fn token_coverage_validates_raw_counts_without_changing_normalized_tokens() {
-        for (raw, known, normalized) in [
-            (json!(0), true, 0),
-            (json!(10.0), true, 10),
-            (json!("10.0"), true, 10),
-            (json!("1.00e1"), true, 10),
-            (json!("100e-1"), true, 10),
-            (json!("+00010.000"), true, 10),
-            (json!("9223372036854775807.0"), true, i64::MAX),
-            (json!("10.0000000000000001"), false, 10),
-            (json!("-1e-400"), false, 0),
-            (json!("1e-400"), false, 0),
-            (
-                json!("-0.000e-99999999999999999999999999999999999999999"),
-                true,
-                0,
-            ),
-            (
-                json!("1e99999999999999999999999999999999999999999"),
-                false,
-                i64::MAX,
-            ),
-            (
-                json!("1e-99999999999999999999999999999999999999999"),
-                false,
-                0,
-            ),
-            (json!("9223372036854775807.1"), false, i64::MAX),
-            (json!("1e"), false, 0),
-            (json!("1.2.3"), false, 0),
-            (json!(" 0 "), true, 0),
-            (json!(i64::MAX), true, i64::MAX),
-            (json!(i64::MAX.to_string()), true, i64::MAX),
-            (json!(null), false, 0),
-            (json!("invalid"), false, 0),
-            (json!("NaN"), false, 0),
-            (json!("inf"), false, i64::MAX),
-            (json!("-inf"), false, 0),
-            (json!(-0.5), false, 0),
-            (json!("-0.5"), false, 0),
-            (json!(1.5), false, 1),
-            (json!("1.5"), false, 1),
-            (json!(9_223_372_036_854_775_808_u64), false, i64::MAX),
-            (json!("9223372036854775808"), false, i64::MAX),
-            (json!("1e100"), false, i64::MAX),
-        ] {
-            for mixed in [false, true] {
-                let tokens = if mixed {
-                    json!({"inputTokens": raw, "outputTokens": 0,
-                        "cacheReadTokens": 0, "cacheWriteTokens": 0})
-                } else {
-                    json!({"inputTokens": raw, "outputTokens": raw,
-                        "cacheReadTokens": raw, "cacheWriteTokens": raw})
-                };
-                let content = json!({"usageEventsDisplay": [{
-                    "timestamp": 1791417600000_i64,
-                    "model": "grok-bot-default",
-                    "tokenUsage": tokens,
-                }]})
-                .to_string();
-                let records = parse_cursor_usage_records(&content, "work");
-                assert_eq!(records.len(), 1, "{content}");
-                let expected = if known {
-                    TokenUsageCoverage::Complete
-                } else if mixed {
-                    TokenUsageCoverage::Partial
-                } else {
-                    TokenUsageCoverage::Missing
-                };
-                assert_eq!(records[0].token_usage_coverage, expected, "{content}");
-                assert_eq!(records[0].message.tokens.input, normalized, "{content}");
-            }
-        }
-    }
-
-    #[test]
-    fn cursor_records_preserve_metered_and_charged_amounts() {
-        let content = json!({"usageEventsDisplay": [
-            {"timestamp": 1791417600000_i64, "model": "auto", "tokenUsage": {"totalCents": 25}, "chargedCents": 0},
-            {"timestamp": 1791417600000_i64, "model": "auto", "tokenUsage": {"totalCents": "20"}, "chargedCents": "21.5", "cursorTokenFee": "1.5"},
-            {"timestamp": 1791417600000_i64, "model": "auto", "chargedCents": 10, "cursorTokenFee": -1},
-        ]}).to_string();
-        let records = parse_cursor_usage_records(&content, "work");
-        assert_eq!(records[0].metered_cost_usd, Some(0.25));
-        assert_eq!(records[0].charged_cost_usd, Some(0.0));
-        assert_eq!(records[0].message.cost, 0.25);
-        assert_eq!(records[1].metered_cost_usd, Some(0.20));
-        assert_eq!(records[1].charged_cost_usd, Some(0.215));
-        assert_eq!(records[1].message.cost, 0.20);
-        assert_eq!(records[2].metered_cost_usd, None);
-        assert_eq!(records[2].charged_cost_usd, Some(0.1));
-        assert_eq!(records[2].message.cost, 0.1);
-    }
-
-    #[test]
-    fn cursor_records_keep_missing_zero_partial_and_invalid_metadata_distinct() {
-        let bot = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-        let rows: Vec<_> = [
-            json!({}),
-            json!(null),
-            json!({"inputTokens": 0}),
-            json!({"outputTokens": 12}),
-            json!({}),
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(i, tokens)| {
-            json!({
-                "timestamp": 1791417600000_i64, "conversationId": bot,
-                "model": "grok-bot-default", "tokenUsage": tokens,
-                "automationId": ([json!(42), json!(null), json!("  "), json!(" job "), json!({})][i])
-            })
-        })
-        .collect();
-        let records =
-            parse_cursor_usage_records(&json!({"usageEventsDisplay": rows}).to_string(), "work");
-        assert_eq!(records.len(), 5);
-        assert_eq!(
-            records
-                .iter()
-                .map(|r| r.token_usage_coverage)
-                .collect::<Vec<_>>(),
-            [
-                TokenUsageCoverage::Missing,
-                TokenUsageCoverage::Missing,
-                TokenUsageCoverage::Partial,
-                TokenUsageCoverage::Partial,
-                TokenUsageCoverage::Missing
-            ]
-        );
-        assert_eq!(records[0].message.tokens, TokenBreakdown::default());
-        assert_eq!(records[2].message.tokens, TokenBreakdown::default());
-        assert_eq!(records[3].message.tokens.output, 12);
-        assert_eq!(records[3].automation_id.as_deref(), Some("job"));
-        assert!(records
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != 3)
-            .all(|(_, r)| r.automation_id.is_none()));
-        assert!(records.iter().all(|r| r.message.agent.as_deref()
-            == Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee [work; conversation]")));
-    }
-
-    #[test]
     fn invalid_router_row_does_not_anchor_ordinary_grok_usage() {
         let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-        let records = parse_cursor_usage_records(&json!({"usageEventsDisplay": [
-            {"timestamp": 0, "conversationId": id, "model": "grok-bot-default"},
-            {"timestamp": 1791417600000_i64, "conversationId": id, "model": "grok-4", "automationId": "cursor-job"}
-        ]}).to_string(), "work");
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].message.client, "cursor");
-        assert!(records[0].message.agent.is_none());
+        let messages = parse_cursor_events_json_content(
+            &json!({"usageEventsDisplay": [
+                {"timestamp": 0, "conversationId": id, "model": "grok-bot-default"},
+                {"timestamp": 1791417600000_i64, "conversationId": id, "model": "grok-4"}
+            ]})
+            .to_string(),
+            "work",
+        );
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].client, "cursor");
+        assert!(messages[0].agent.is_none());
     }
 
     #[test]
-    fn bot_metadata_preserves_combined_aggregation_totals() {
-        let records = parse_cursor_usage_records(
-            include_str!("../../tests/fixtures/grok_bot_usage.json"),
-            "work",
-        );
-        let split: Vec<_> = records.into_iter().map(|r| r.message).collect();
-        assert_eq!(split.len(), 8);
-        assert_eq!(split.iter().filter(|m| m.client == "grok-bot").count(), 6);
+    fn bot_classification_preserves_combined_aggregation_totals() {
+        let bot = "12345678-1234-1234-1234-123456789abc";
+        let content = json!({"usageEventsDisplay": [
+            {"timestamp": 1791417600000_i64, "conversationId": bot, "model": "grok-bot-default",
+                "tokenUsage": {"inputTokens": 100, "outputTokens": 10, "cacheReadTokens": 5, "totalCents": 50}},
+            {"timestamp": 1791417600000_i64, "conversationId": bot, "model": "gpt-5",
+                "tokenUsage": {"inputTokens": 20, "outputTokens": 2, "cacheWriteTokens": 3, "totalCents": 25}},
+            {"timestamp": 1791417600000_i64, "conversationId": "other", "model": "grok-4",
+                "tokenUsage": {"inputTokens": 7, "outputTokens": 1, "totalCents": 5}}
+        ]}).to_string();
+        let split = parse_cursor_events_json_content(&content, "work");
+        assert_eq!(split.iter().filter(|m| m.client == "grok-bot").count(), 2);
         let mut before = split.clone();
         for message in &mut before {
             message.client = "cursor".into();
@@ -1845,12 +1468,12 @@ mod grok_bot_tests {
         let after = crate::aggregator::aggregate_by_date(split);
         assert_eq!(baseline[0].totals, after[0].totals);
         assert_eq!(baseline[0].token_breakdown, after[0].token_breakdown);
-        assert_eq!(after[0].totals.messages, 8);
-        assert_eq!(after[0].totals.cost, 6.75);
-        assert_eq!(after[0].token_breakdown.input, 920);
-        assert_eq!(after[0].token_breakdown.output, 92);
-        assert_eq!(after[0].token_breakdown.cache_read, 57);
-        assert_eq!(after[0].token_breakdown.cache_write, 18);
+        assert_eq!(after[0].totals.messages, 3);
+        assert_eq!(after[0].totals.cost, 0.8);
+        assert_eq!(after[0].token_breakdown.input, 127);
+        assert_eq!(after[0].token_breakdown.output, 13);
+        assert_eq!(after[0].token_breakdown.cache_read, 5);
+        assert_eq!(after[0].token_breakdown.cache_write, 3);
     }
 
     #[test]

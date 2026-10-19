@@ -119,12 +119,6 @@ fn old_cursor_credentials_path(home_dir: &Path) -> PathBuf {
     home_dir.join(".tokscale/cursor-credentials.json")
 }
 
-/// Live Cursor cache directory for the current home, for usage reports that
-/// read the per-account caches directly.
-pub fn get_cursor_cache_dir() -> Result<PathBuf> {
-    Ok(cursor_cache_dir(&home_dir()?))
-}
-
 fn cursor_cache_dir(home_dir: &Path) -> PathBuf {
     home_dir.join(".config/tokscale/cursor-cache")
 }
@@ -1054,7 +1048,7 @@ fn sanitize_account_id_for_filename(account_id: &str) -> String {
 
 /// Hash the exact ID, including case and whitespace. Sanitized names cannot
 /// distinguish accounts and are retained only for human-readable archive labels.
-pub(crate) fn cursor_account_cache_stem(account_id: &str) -> String {
+fn cursor_account_cache_stem(account_id: &str) -> String {
     format!("account-{:x}", Sha256::digest(account_id.as_bytes()))
 }
 
