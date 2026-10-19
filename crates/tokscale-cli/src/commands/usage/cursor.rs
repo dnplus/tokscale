@@ -790,8 +790,8 @@ fn record_matches_access(access_token: &str, record: &[Option<String>]) -> bool 
 /// falls through to the next source. Cursor can split one account's access and
 /// refresh JWTs between state.vscdb and Keychain, so a missing refresh token
 /// is transferred only when a JWT subject proves both records belong to the
-/// same account. Keychain is read only when the desktop record cannot stand
-/// alone.
+/// same account. The desktop email labels a fallback token under the same
+/// rule. Keychain is read only when the desktop record cannot stand alone.
 fn select_local_auth(
     db_access: Option<&str>,
     db_refresh: Option<&str>,
@@ -804,6 +804,14 @@ fn select_local_auth(
         .map(str::trim)
         .filter(|token| access_token_usable(token));
     let mut db_refresh = nonempty(db_refresh);
+    // The desktop email names another source's token only when a JWT subject
+    // proves both belong to the same account.
+    let desktop_email_for = |access: &str| {
+        db_access
+            .is_some_and(|desktop| same_cursor_principal(desktop, access))
+            .then(|| account_label(db_email))
+            .flatten()
+    };
     let desktop = |access: &str, refresh_token: Option<String>| LocalCursorAuth {
         access_token: access.to_string(),
         refresh_token,
@@ -838,8 +846,8 @@ fn select_local_auth(
         if !needs_refresh(access, now_unix) || keychain_refresh.is_some() {
             return Ok(LocalCursorAuth {
                 access_token: access.to_string(),
+                email: desktop_email_for(access),
                 refresh_token: keychain_refresh,
-                email: None,
                 credential_source: "keychain",
             });
         }
@@ -849,10 +857,12 @@ fn select_local_auth(
         if let Some(access) = jwt_from_session_token(&creds.session_token)
             .filter(|access| !needs_refresh(access, now_unix))
         {
+            let email =
+                account_label(creds.email.as_deref()).or_else(|| desktop_email_for(&access));
             return Ok(LocalCursorAuth {
                 access_token: access,
                 refresh_token: None,
-                email: account_label(creds.email.as_deref()),
+                email,
                 credential_source: "stored",
             });
         }
@@ -1411,6 +1421,93 @@ mod tests {
         .unwrap();
         assert!(auth.email.is_none());
         assert_eq!(auth.credential_source, "stored");
+    }
+
+    /// The desktop email follows the JWT subject, never the source order.
+    #[test]
+    fn fallback_sources_borrow_desktop_email_only_for_the_same_subject() {
+        // An expired desktop JWT without a refresh token forces the fallback.
+        let desktop = auth_with_subject(Some(900), "auth0|account-a", None, None).access_token;
+        let same = future_jwt("auth0|account-a");
+        let other = future_jwt("auth0|account-b");
+        // (desktop access, fallback access, expected email)
+        let cases = [
+            (Some(desktop.as_str()), same.as_str(), Some("a@example.com")),
+            (Some(desktop.as_str()), other.as_str(), None),
+            (Some("opaque-desktop-token"), same.as_str(), None),
+            (None, same.as_str(), None),
+        ];
+        for (db_access, access, email) in cases {
+            let keychain = select_local_auth(
+                db_access,
+                None,
+                Some("a@example.com"),
+                || (Some(access.to_string()), None),
+                || panic!("a fresh Keychain token should not read stored credentials"),
+                1000,
+            )
+            .unwrap();
+            assert_eq!(keychain.credential_source, "keychain");
+            assert_eq!(keychain.email.as_deref(), email, "keychain {db_access:?}");
+
+            let stored = select_local_auth(
+                db_access,
+                None,
+                Some("a@example.com"),
+                || (None, None),
+                || {
+                    Some(
+                        serde_json::from_value(json!({
+                            "sessionToken": format!("user::{access}"),
+                            "createdAt": "2026-10-17T00:00:00Z"
+                        }))
+                        .unwrap(),
+                    )
+                },
+                1000,
+            )
+            .unwrap();
+            assert_eq!(stored.credential_source, "stored");
+            assert_eq!(stored.email.as_deref(), email, "stored {db_access:?}");
+        }
+    }
+
+    #[test]
+    fn stored_email_wins_over_a_matching_desktop_email() {
+        let stored = serde_json::from_value(json!({
+            "sessionToken": format!("user::{}", future_jwt("auth0|account-a")),
+            "createdAt": "2026-10-17T00:00:00Z",
+            "email": "saved@example.com"
+        }))
+        .unwrap();
+        let auth = select_local_auth(
+            Some(&auth_with_subject(Some(900), "auth0|account-a", None, None).access_token),
+            None,
+            Some("desktop@example.com"),
+            || (None, None),
+            || Some(stored),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(auth.email.as_deref(), Some("saved@example.com"));
+    }
+
+    /// `needs_refresh` treats a token within 60s of expiry as expired, so a
+    /// Keychain token without a refresh grant is usable only past that edge.
+    #[test]
+    fn keychain_expiry_boundary_without_refresh() {
+        for (exp, selected) in [(1060, false), (1061, true)] {
+            let access = auth_with_subject(Some(exp), "auth0|account-a", None, None).access_token;
+            let result = select_local_auth(
+                None,
+                None,
+                None,
+                || (Some(access.clone()), None),
+                || None,
+                1000,
+            );
+            assert_eq!(result.is_ok(), selected, "exp {exp}");
+        }
     }
 
     #[test]
