@@ -138,6 +138,12 @@ fn prepare_for_capability(
         scope
             .full_history_clients
             .retain(|client| !is_family(client));
+        if let Some(floors) = &mut scope.retention_floors {
+            floors.retain(|client, _| !is_family(client));
+            if floors.is_empty() {
+                scope.retention_floors = None;
+            }
+        }
     }
     let mut removed_usage = false;
     for day in &mut filtered.contributions {
@@ -397,6 +403,37 @@ mod tests {
         assert_eq!(json["device"], before["device"]);
         assert_eq!(json["mcpServers"], before["mcpServers"]);
         assert_eq!(serde_json::to_value(&original).unwrap(), before);
+    }
+
+    #[test]
+    fn submit_compat_legacy_removes_family_retention_floors() {
+        let mut original = payload(&["cursor", "grok-bot", "claude"]);
+        original.scan_scope.as_mut().unwrap().retention_floors = Some(
+            [
+                ("cursor", "2026-10-07"),
+                ("grok-bot", "2026-10-07"),
+                ("claude", "2026-10-08"),
+            ]
+            .into_iter()
+            .map(|(client, date)| (client.to_string(), date.to_string()))
+            .collect(),
+        );
+        let filtered = prepare_for_capability(&original, false).unwrap();
+        let json = serde_json::to_value(&*filtered).unwrap();
+        assert_eq!(
+            json["scanScope"]["retentionFloors"],
+            serde_json::json!({"claude": "2026-10-08"})
+        );
+
+        let mut family_floors_only = payload(&["cursor", "claude"]);
+        family_floors_only
+            .scan_scope
+            .as_mut()
+            .unwrap()
+            .retention_floors = Some([("grok-bot".to_string(), "2026-10-07".to_string())].into());
+        let filtered = prepare_for_capability(&family_floors_only, false).unwrap();
+        let json = serde_json::to_value(&*filtered).unwrap();
+        assert!(json["scanScope"].get("retentionFloors").is_none());
     }
 
     #[test]
