@@ -174,14 +174,13 @@ pub fn fetch_grok_bot_report() -> Result<UsageFetchReport> {
                 Ok(grok_bot_account_report(results))
             })
         }
-        Ok(_) | Err(_) => {
-            fetch_grok_bot_desktop().map(|output| UsageFetchReport::from_outputs(vec![output]))
-        }
+        Ok(_) | Err(_) => fetch_grok_bot_desktop()
+            .map(|output| UsageFetchReport::from_outputs(output.into_iter().collect())),
     }
 }
 
 fn grok_bot_account_report(
-    results: impl IntoIterator<Item = (GrokBotAppAccount, Result<ParsedSandUsage>)>,
+    results: impl IntoIterator<Item = (GrokBotAppAccount, Result<Option<ParsedSandUsage>>)>,
 ) -> UsageFetchReport {
     let mut report = UsageFetchReport::default();
     for (account, result) in results {
@@ -191,7 +190,9 @@ fn grok_bot_account_report(
             is_active: account.is_active,
         };
         match result {
-            Ok(parsed) => report.outputs.push(UsageOutput {
+            // No personal allowance is a successful empty result, not a failure.
+            Ok(None) => {}
+            Ok(Some(parsed)) => report.outputs.push(UsageOutput {
                 provider: GROK_BOT_PROVIDER.to_string(),
                 account: Some(identity),
                 credential_source: Some("grok-bot-app".into()),
@@ -218,7 +219,7 @@ fn grok_bot_account_report(
     report
 }
 
-fn fetch_grok_bot_desktop() -> Result<UsageOutput> {
+fn fetch_grok_bot_desktop() -> Result<Option<UsageOutput>> {
     let auth = resolve_local_auth()?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -235,8 +236,10 @@ fn fetch_grok_bot_desktop() -> Result<UsageOutput> {
             "GetSandUsageStatus",
         )
         .await?;
-        let parsed = sand_usage_or_error(&sand)?;
-        Ok(UsageOutput {
+        let Some(parsed) = parse_sand_usage(&sand)? else {
+            return Ok(None);
+        };
+        Ok(Some(UsageOutput {
             provider: GROK_BOT_PROVIDER.to_string(),
             account: None,
             credential_source: Some(auth.credential_source.into()),
@@ -246,36 +249,16 @@ fn fetch_grok_bot_desktop() -> Result<UsageOutput> {
             reset_credits: None,
             credit_status: None,
             spend_control: None,
-        })
+        }))
     })
 }
 
-async fn fetch_sand_for_token(client: &reqwest::Client, access: &str) -> Result<ParsedSandUsage> {
+async fn fetch_sand_for_token(
+    client: &reqwest::Client,
+    access: &str,
+) -> Result<Option<ParsedSandUsage>> {
     let sand = connect_post(client, SAND_USAGE_URL, access, "GetSandUsageStatus").await?;
-    sand_usage_or_error(&sand)
-}
-
-/// A Grok Bot card reports a missing personal allowance as a diagnostic so
-/// each account's state stays visible, rather than silently omitting it.
-fn sand_usage_or_error(value: &Value) -> Result<ParsedSandUsage> {
-    parse_sand_usage(value)?.ok_or_else(|| {
-        if value
-            .get("usesPooledEnterpriseAllowance")
-            .and_then(Value::as_bool)
-            == Some(true)
-        {
-            anyhow::anyhow!("Grok Bot uses a pooled enterprise allowance with no personal share")
-        } else if value
-            .get("hasNonZeroIncludedLimit")
-            .and_then(Value::as_bool)
-            == Some(false)
-            || value.get("includedLimitZero").and_then(Value::as_bool) == Some(true)
-        {
-            anyhow::anyhow!("Grok Bot has no included weekly allowance on this Cursor account")
-        } else {
-            anyhow::anyhow!("Grok Bot GetSandUsageStatus had no usagePercent")
-        }
-    })
+    parse_sand_usage(&sand)
 }
 
 #[derive(Debug, Clone)]
@@ -1196,8 +1179,36 @@ mod tests {
         }
     }
 
-    fn sand_fixture() -> Result<ParsedSandUsage> {
-        sand_usage_or_error(&json!({"hasNonZeroIncludedLimit": true, "usagePercent": 25}))
+    fn sand_fixture() -> Result<Option<ParsedSandUsage>> {
+        parse_sand_usage(&json!({"hasNonZeroIncludedLimit": true, "usagePercent": 25}))
+    }
+
+    #[test]
+    fn grok_bot_account_without_personal_quota_is_hidden_not_reported() {
+        let no_personal = [
+            json!({"usesPooledEnterpriseAllowance": true, "usagePercent": 10.0}),
+            json!({"hasNonZeroIncludedLimit": false, "usagePercent": 10.0}),
+            json!({"includedLimitZero": true, "usagePercent": 0.0}),
+        ];
+        for response in no_personal {
+            let report = grok_bot_account_report([
+                (bot_account("pooled", false), parse_sand_usage(&response)),
+                (bot_account("personal", true), sand_fixture()),
+            ]);
+            assert_eq!(report.outputs.len(), 1, "{response}");
+            assert_eq!(report.outputs[0].account.as_ref().unwrap().id, "personal");
+            assert!(report.diagnostics.is_empty(), "{response}");
+        }
+
+        // Negative control: an allowance that promises a share but omits its
+        // percentage is a failure, and it stays visible as a diagnostic.
+        let report = grok_bot_account_report([(
+            bot_account("broken", false),
+            parse_sand_usage(&json!({"hasNonZeroIncludedLimit": true})),
+        )]);
+        assert!(report.outputs.is_empty());
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].account.as_ref().unwrap().id, "broken");
     }
 
     #[test]
@@ -1491,26 +1502,6 @@ mod tests {
             Some("2026-10-06T09:12:29.574Z")
         );
         assert_eq!(parsed.plan.as_deref(), Some("Grok Bot Plan"));
-    }
-
-    #[test]
-    fn parse_sand_usage_hides_pooled_and_zero_limit() {
-        // Grok Bot cards report each missing personal allowance explicitly.
-        assert!(sand_usage_or_error(&json!({
-            "usesPooledEnterpriseAllowance": true,
-            "usagePercent": 10.0,
-            "hasNonZeroIncludedLimit": true
-        }))
-        .is_err());
-        assert!(sand_usage_or_error(&json!({
-            "hasNonZeroIncludedLimit": false,
-            "usagePercent": 10.0
-        }))
-        .is_err());
-        assert!(sand_usage_or_error(&json!({
-            "hasNonZeroIncludedLimit": true
-        }))
-        .is_err());
     }
 
     #[test]
