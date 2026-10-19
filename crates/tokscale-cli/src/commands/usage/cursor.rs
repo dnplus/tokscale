@@ -157,10 +157,26 @@ pub fn fetch() -> Result<UsageOutput> {
 }
 
 /// One Grok Bot card per signed-in Cursor account in Grok Bot.app when that
-/// store decrypts; otherwise a single card from Cursor desktop auth.
+/// store decrypts; otherwise a single card from Cursor desktop auth. A pool
+/// the Cursor card already shows is omitted, so one pool renders one card.
 pub fn fetch_grok_bot_report() -> Result<UsageFetchReport> {
+    grok_bot_report(true)
+}
+
+/// Every account's own Grok Bot pool, including one the Cursor card shows,
+/// for the per-bot breakdown.
+pub fn fetch_grok_bot_breakdown_report() -> Result<UsageFetchReport> {
+    grok_bot_report(false)
+}
+
+fn grok_bot_report(omit_cursor_pool: bool) -> Result<UsageFetchReport> {
     match load_grok_bot_app_accounts() {
         Ok(accounts) if !accounts.is_empty() => {
+            // The Cursor card renders the pool of the locally signed-in account.
+            let cursor_access = omit_cursor_pool
+                .then(|| resolve_local_auth().ok())
+                .flatten()
+                .map(|auth| auth.access_token);
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
@@ -168,13 +184,32 @@ pub fn fetch_grok_bot_report() -> Result<UsageFetchReport> {
                 let client = plan_http_client()?;
                 let mut results = Vec::new();
                 for account in accounts {
-                    let result = fetch_sand_for_token(&client, &account.access_token).await;
+                    let mut result = fetch_sand_for_token(&client, &account.access_token).await;
+                    if let (Ok(Some(parsed)), Some(cursor)) = (&result, cursor_access.as_deref()) {
+                        let plan = if parsed.is_unified
+                            || !same_cursor_principal(cursor, &account.access_token)
+                        {
+                            None
+                        } else {
+                            connect_post(&client, PLAN_URL, &account.access_token, "GetPlanInfo")
+                                .await
+                                .ok()
+                        };
+                        if pool_on_cursor_card(
+                            Some(cursor),
+                            &account.access_token,
+                            &parse_plan_info(plan.as_ref()),
+                            parsed,
+                        ) {
+                            result = Ok(None);
+                        }
+                    }
                     results.push((account, result));
                 }
                 Ok(grok_bot_account_report(results))
             })
         }
-        Ok(_) | Err(_) => fetch_grok_bot_desktop()
+        Ok(_) | Err(_) => fetch_grok_bot_desktop(omit_cursor_pool)
             .map(|output| UsageFetchReport::from_outputs(output.into_iter().collect())),
     }
 }
@@ -219,7 +254,20 @@ fn grok_bot_account_report(
     report
 }
 
-fn fetch_grok_bot_desktop() -> Result<Option<UsageOutput>> {
+/// True when the Cursor card already renders this account's Grok Bot pool:
+/// the account is the Cursor card's own (proved by token or JWT subject) and
+/// the pool replaces its Auto/API tracks. An unprovable account keeps its card.
+fn pool_on_cursor_card(
+    cursor_access: Option<&str>,
+    account_access: &str,
+    plan: &ParsedPlanInfo,
+    sand: &ParsedSandUsage,
+) -> bool {
+    cursor_access.is_some_and(|cursor| same_cursor_principal(cursor, account_access))
+        && sand_replaces_cursor_tracks(plan, sand)
+}
+
+fn fetch_grok_bot_desktop(omit_cursor_pool: bool) -> Result<Option<UsageOutput>> {
     let auth = resolve_local_auth()?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -228,6 +276,13 @@ fn fetch_grok_bot_desktop() -> Result<Option<UsageOutput>> {
         let now = Utc::now().timestamp();
         let mut access = bearer_for_request(&auth, now).await?;
         let client = plan_http_client()?;
+        let plan = if omit_cursor_pool {
+            connect_post_with_retry(&client, PLAN_URL, &auth, &mut access, "GetPlanInfo")
+                .await
+                .ok()
+        } else {
+            None
+        };
         let sand = connect_post_with_retry(
             &client,
             SAND_USAGE_URL,
@@ -239,6 +294,17 @@ fn fetch_grok_bot_desktop() -> Result<Option<UsageOutput>> {
         let Some(parsed) = parse_sand_usage(&sand)? else {
             return Ok(None);
         };
+        // Desktop auth is the Cursor card's own account.
+        if omit_cursor_pool
+            && pool_on_cursor_card(
+                Some(&access),
+                &access,
+                &parse_plan_info(plan.as_ref()),
+                &parsed,
+            )
+        {
+            return Ok(None);
+        }
         Ok(Some(UsageOutput {
             provider: GROK_BOT_PROVIDER.to_string(),
             account: None,
@@ -1181,6 +1247,63 @@ mod tests {
 
     fn sand_fixture() -> Result<Option<ParsedSandUsage>> {
         parse_sand_usage(&json!({"hasNonZeroIncludedLimit": true, "usagePercent": 25}))
+    }
+
+    #[test]
+    fn grok_bot_pool_is_omitted_only_when_the_cursor_card_shows_it() {
+        let account = future_jwt("auth0|account-a");
+        let same_subject = future_jwt("auth0|account-a").replace("signature", "other-signature");
+        let other_subject = future_jwt("auth0|account-b");
+        let sand = |unified: bool| {
+            parse_sand_usage(&json!({
+                "hasNonZeroIncludedLimit": true,
+                "usagePercent": 25,
+                "isUnified": unified
+            }))
+            .unwrap()
+            .unwrap()
+        };
+        let plan = |period: Option<&str>| {
+            parse_plan_info(
+                period
+                    .map(|period| json!({"planInfo": {"includedUsagePeriod": period}}))
+                    .as_ref(),
+            )
+        };
+        // (Cursor card token, unified, plan period, omitted)
+        let cases = [
+            (Some(account.as_str()), true, None, true),
+            (Some(same_subject.as_str()), true, None, true),
+            (
+                Some(same_subject.as_str()),
+                false,
+                Some("INCLUDED_USAGE_PERIOD_WEEKLY"),
+                true,
+            ),
+            (
+                Some(same_subject.as_str()),
+                false,
+                Some("INCLUDED_USAGE_PERIOD_MONTHLY"),
+                false,
+            ),
+            (Some(same_subject.as_str()), false, None, false),
+            (Some(other_subject.as_str()), true, None, false),
+            (
+                Some(other_subject.as_str()),
+                false,
+                Some("INCLUDED_USAGE_PERIOD_WEEKLY"),
+                false,
+            ),
+            (Some("opaque-cursor-token"), true, None, false),
+            (None, true, Some("INCLUDED_USAGE_PERIOD_WEEKLY"), false),
+        ];
+        for (cursor, unified, period, omitted) in cases {
+            assert_eq!(
+                pool_on_cursor_card(cursor, &account, &plan(period), &sand(unified)),
+                omitted,
+                "cursor={cursor:?} unified={unified} period={period:?}"
+            );
+        }
     }
 
     #[test]
