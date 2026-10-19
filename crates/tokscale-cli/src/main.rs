@@ -385,16 +385,12 @@ enum Commands {
         json: bool,
         #[arg(long, help = "Light terminal output (no TUI)")]
         light: bool,
-        #[arg(long, conflicts_with_all = ["json", "bots"], help = "Output usage and per-account fetch diagnostics as JSON")]
-        json_report: bool,
-        #[arg(long, help = "Break down local Grok Bot usage by bot")]
-        bots: bool,
         #[arg(
             long,
-            requires = "bots",
-            help = "Fallback window start (RFC3339), when weekly quota is unavailable"
+            conflicts_with = "json",
+            help = "Output usage and per-account fetch diagnostics as JSON"
         )]
-        since: Option<chrono::DateTime<chrono::FixedOffset>>,
+        json_report: bool,
     },
     #[command(about = "Codex account integration commands")]
     Codex {
@@ -1041,15 +1037,9 @@ fn main() -> Result<()> {
             json,
             json_report,
             light,
-            bots,
-            since,
         }) => {
             reject_unsupported_home_override(&cli.home, "usage")?;
-            if bots {
-                commands::usage::bots::run(json, since.map(|date| date.with_timezone(&chrono::Utc)))
-            } else {
-                commands::usage::run(json, json_report, light, cli.debug)
-            }
+            commands::usage::run(json, json_report, light, cli.debug)
         }
         Some(Commands::Codex { subcommand }) => {
             reject_unsupported_home_override(&cli.home, "codex")?;
@@ -8062,65 +8052,14 @@ mod tests {
                 ..
             })
         ));
-        for flag in ["--json", "--bots"] {
-            assert!(super::Cli::try_parse_from([
-                "tokscale",
-                "--no-spinner",
-                "usage",
-                "--json-report",
-                flag
-            ])
-            .is_err());
-        }
-    }
-
-    #[test]
-    fn usage_bot_flags_are_opt_in() {
-        use clap::Parser;
-        for args in [
-            vec!["tokscale", "usage"],
-            vec!["tokscale", "usage", "--light"],
-            vec!["tokscale", "usage", "--json"],
-        ] {
-            let cli = super::Cli::try_parse_from(args).unwrap();
-            assert!(matches!(
-                cli.command,
-                Some(super::Commands::Usage {
-                    bots: false,
-                    since: None,
-                    ..
-                })
-            ));
-        }
         assert!(super::Cli::try_parse_from([
             "tokscale",
+            "--no-spinner",
             "usage",
-            "--since",
-            "2026-10-01T00:00:00Z"
+            "--json-report",
+            "--json"
         ])
         .is_err());
-        assert!(
-            super::Cli::try_parse_from(["tokscale", "usage", "--bots", "--since", "invalid"])
-                .is_err()
-        );
-        let cli = super::Cli::try_parse_from([
-            "tokscale",
-            "usage",
-            "--bots",
-            "--json",
-            "--since",
-            "2026-10-01T00:00:00Z",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(super::Commands::Usage {
-                bots: true,
-                json: true,
-                since: Some(_),
-                ..
-            })
-        ));
     }
 
     use super::*;
