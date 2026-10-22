@@ -7909,58 +7909,6 @@ fn test_submit_sends_sessions_only_to_receivers_that_advertise_them() {
     }
 }
 
-/// `--print-payload` writes the would-be upload and its legacy-receiver view
-/// without contacting the receiver or minting a device id.
-#[test]
-fn test_submit_dry_run_prints_full_and_legacy_payloads_offline() {
-    let tmp = create_temp_fixture_dir();
-    prime_pricing_cache_with_a_priced_model(tmp.path());
-    let server = UploadFixture::accepting("fixture");
-    let full = tmp.path().join("out/payload-full.json");
-
-    let output = upload_cmd(tmp.path(), &server.url)
-        .args([
-            "submit",
-            "--client",
-            "opencode",
-            "--dry-run",
-            "--print-payload",
-        ])
-        .arg(&full)
-        .output()
-        .unwrap();
-    let requests = server.finish();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "{stdout}\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        requests.is_empty(),
-        "a dry run never calls the receiver: {requests:?}"
-    );
-    assert!(!sandbox_config_dir(tmp.path()).join("device.json").exists());
-    assert!(
-        stdout.contains("Dry run - not submitting data."),
-        "{stdout}"
-    );
-    assert!(stdout.contains("opencode: "), "{stdout}");
-
-    let read = |path: &Path| -> serde_json::Value {
-        serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
-    };
-    let full_payload = read(&full);
-    assert!(full_payload["sessions"]
-        .as_array()
-        .is_some_and(|s| !s.is_empty()));
-    assert!(full_payload.get("device").is_none());
-    let legacy = read(&tmp.path().join("out/payload-legacy.json"));
-    assert!(legacy.get("sessions").is_none());
-    assert_eq!(legacy["contributions"], full_payload["contributions"]);
-}
-
 /// Both entry points upload the same submission, and the quota reading, to the
 /// logged-in server and to every enabled extra target, each with its own token.
 #[test]

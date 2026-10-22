@@ -365,7 +365,6 @@ mod tests {
                         reasoning: 1,
                     },
                     messages: 1,
-                    cwd: Some("/work/repo".into()),
                     git_branch: Some("main".into()),
                     repo_url: None,
                 })

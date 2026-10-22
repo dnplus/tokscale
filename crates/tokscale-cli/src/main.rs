@@ -327,13 +327,6 @@ enum Commands {
         dry_run: bool,
         #[arg(
             long,
-            value_name = "PATH",
-            requires = "dry_run",
-            help = "With --dry-run, write the payload JSON to PATH and the legacy-receiver view beside it"
-        )]
-        print_payload: Option<PathBuf>,
-        #[arg(
-            long,
             help = "Disable automatic quota upload after a successful submit"
         )]
         no_quota: bool,
@@ -972,7 +965,6 @@ fn main() -> Result<()> {
             clients,
             date,
             dry_run,
-            print_payload,
             no_quota,
             extra_targets,
         }) => {
@@ -991,7 +983,6 @@ fn main() -> Result<()> {
                 until,
                 year,
                 dry_run,
-                print_payload.as_deref(),
                 no_quota,
                 &extra_targets,
                 SubmitMode::Interactive,
@@ -5310,7 +5301,8 @@ struct TsTokenContributionData {
 
 /// One agent session's usage and where it ran. This is the whole set of
 /// fields the receiver gets for a session: nothing from the conversation
-/// itself (titles, prompts, message text) is ever sent.
+/// itself (titles, prompts, message text) and no local path (the working
+/// directory) is ever sent.
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsSessionContribution {
@@ -5323,8 +5315,6 @@ struct TsSessionContribution {
     last_seen: i64,
     tokens: TsTokenBreakdown,
     messages: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     git_branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5339,12 +5329,66 @@ struct TsSessionModel {
     provider_id: Option<String>,
 }
 
+/// The receiver keeps this many sessions per principal; sending more is waste.
+const MAX_SUBMIT_SESSIONS: usize = 2_000;
+/// Upper bound on the serialized `sessions` array, so it cannot blow up a
+/// submission whose daily totals are small.
+const MAX_SUBMIT_SESSIONS_BYTES: usize = 2 * 1024 * 1024;
+
 fn to_ts_session_contributions(
     sessions: &[tokscale_core::SessionContributionV2],
 ) -> Option<Vec<TsSessionContribution>> {
-    let sessions: Vec<TsSessionContribution> = sessions
+    bound_ts_sessions(
+        collect_ts_sessions(sessions),
+        MAX_SUBMIT_SESSIONS,
+        MAX_SUBMIT_SESSIONS_BYTES,
+    )
+}
+
+/// Keep the most recent `max_count` sessions, then drop the oldest until the
+/// serialized array fits `max_bytes`. `None` when nothing fits, so the daily
+/// totals still submit without `sessions`.
+fn bound_ts_sessions(
+    mut sessions: Vec<TsSessionContribution>,
+    max_count: usize,
+    max_bytes: usize,
+) -> Option<Vec<TsSessionContribution>> {
+    sessions.sort_by(|a, b| {
+        b.last_seen
+            .cmp(&a.last_seen)
+            .then_with(|| a.client.cmp(&b.client))
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    sessions.truncate(max_count);
+
+    // Brackets plus one comma between elements.
+    let mut bytes = 2usize;
+    let mut keep = 0;
+    for session in &sessions {
+        let size = serde_json::to_vec(session).ok()?.len();
+        let next = bytes + size + usize::from(keep > 0);
+        if next > max_bytes {
+            break;
+        }
+        bytes = next;
+        keep += 1;
+    }
+    sessions.truncate(keep);
+    (!sessions.is_empty()).then_some(sessions)
+}
+
+fn collect_ts_sessions(
+    sessions: &[tokscale_core::SessionContributionV2],
+) -> Vec<TsSessionContribution> {
+    sessions
         .iter()
-        .filter(|session| !session.session_id.is_empty() && session.totals.tokens > 0)
+        .filter(|session| {
+            !session.session_id.is_empty()
+                && session.totals.tokens > 0
+                // No usable timestamp: the receiver cannot place the session.
+                && session.first_seen > 0
+                && session.last_seen > 0
+        })
         .map(|session| TsSessionContribution {
             session_id: session.session_id.clone(),
             client: session.client.clone(),
@@ -5368,12 +5412,10 @@ fn to_ts_session_contributions(
                 reasoning: session.token_breakdown.reasoning,
             },
             messages: session.totals.messages,
-            cwd: session.cwd.clone(),
             git_branch: session.git_branch.clone(),
             repo_url: session.repo_url.clone(),
         })
-        .collect();
-    (!sessions.is_empty()).then_some(sessions)
+        .collect()
 }
 
 fn to_ts_token_contribution_data(
@@ -6950,7 +6992,6 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
                 until,
                 year,
                 false,
-                None,
                 no_quota || settings.no_quota,
                 &extra_targets,
                 SubmitMode::Autosubmit,
@@ -6978,7 +7019,6 @@ fn run_submit_command(
     until: Option<String>,
     year: Option<String>,
     dry_run: bool,
-    print_payload: Option<&Path>,
     no_quota: bool,
     extra_target_flags: &extra_targets::ExtraTargetFlags,
     mode: SubmitMode,
@@ -7264,12 +7304,6 @@ fn run_submit_command(
     }
 
     if dry_run {
-        if let Some(path) = print_payload {
-            // Read-only device lookup: a dry run must not create device.json.
-            let device = device::existing_submit_device()?;
-            let payload = to_ts_token_contribution_data(&graph_result, device.as_ref(), scan_scope);
-            write_payload_preview(path, &payload)?;
-        }
         extra_plan.print_dry_run();
         println!("{}", "  Dry run - not submitting data.\n".yellow());
         return Ok(());
@@ -7312,72 +7346,6 @@ fn run_submit_command(
     }
 
     Ok(())
-}
-
-/// Write the payload `submit` would POST, plus what a receiver without any
-/// optional capability would get. Purely local: the receiver is never asked.
-fn write_payload_preview(path: &Path, payload: &TsTokenContributionData) -> Result<()> {
-    fn write_json(path: &Path, value: &TsTokenContributionData) -> Result<()> {
-        use anyhow::Context;
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        std::fs::write(path, serde_json::to_vec_pretty(value)?)
-            .with_context(|| format!("failed to write {}", path.display()))
-    }
-
-    write_json(path, payload)?;
-    println!("  Full payload written to {}", path.display());
-    let legacy_path = legacy_payload_path(path);
-    match submit_compat::prepare_for_capability(
-        payload,
-        submit_compat::ReceiverCapabilities::default(),
-    ) {
-        Some(legacy) => {
-            write_json(&legacy_path, &legacy)?;
-            println!(
-                "  Legacy-receiver payload written to {}",
-                legacy_path.display()
-            );
-        }
-        None => println!(
-            "  A legacy receiver would get no payload: only Cursor/Grok Bot usage was found. {} was not written.",
-            legacy_path.display()
-        ),
-    }
-
-    let mut sessions_per_client = std::collections::BTreeMap::<&str, usize>::new();
-    for session in payload.sessions.iter().flatten() {
-        *sessions_per_client.entry(&session.client).or_default() += 1;
-    }
-    if sessions_per_client.is_empty() {
-        println!("  Sessions: none");
-    } else {
-        println!("  Sessions per client:");
-        for (client, count) in sessions_per_client {
-            println!("    {client}: {count}");
-        }
-    }
-    Ok(())
-}
-
-/// `payload-full.json` becomes `payload-legacy.json`; any other name gets
-/// `-legacy` before its extension.
-fn legacy_payload_path(path: &Path) -> PathBuf {
-    let stem = path
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let stem = stem.strip_suffix("-full").unwrap_or(&stem);
-    let file_name = match path.extension() {
-        Some(extension) => format!("{stem}-legacy.{}", extension.to_string_lossy()),
-        None => format!("{stem}-legacy"),
-    };
-    path.with_file_name(file_name)
 }
 
 /// POST a prepared payload to `/api/submit` and report the outcome. Shared by
@@ -10222,7 +10190,6 @@ mod tests {
                     "reasoning": 15
                 },
                 "messages": 3,
-                "cwd": "/Users/dev/work/app",
                 "gitBranch": "feature/sessions",
                 "repoUrl": "https://github.com/acme/app.git"
             }])
@@ -10234,6 +10201,115 @@ mod tests {
             .unwrap()
             .get("sessions")
             .is_none());
+    }
+
+    #[test]
+    fn submit_payload_never_carries_a_working_directory_or_path() {
+        let graph = graph_with_sessions(vec![session_message(
+            "s1",
+            "claude-sonnet-4-5",
+            "anthropic",
+            1_780_000_000_000,
+            10,
+        )]);
+        // The fixture records a cwd; the aggregate holds it, the wire must not.
+        assert_eq!(
+            graph.sessions[0].cwd.as_deref(),
+            Some("/Users/dev/work/app")
+        );
+        let wire =
+            serde_json::to_string(&to_ts_token_contribution_data(&graph, None, None)).unwrap();
+        assert!(!wire.contains("cwd"), "{wire}");
+        assert!(!wire.contains("/Users/dev"), "{wire}");
+        assert!(!wire.contains("work/app\""), "{wire}");
+        let json: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        for session in json["sessions"].as_array().unwrap() {
+            for (key, value) in session.as_object().unwrap() {
+                if let Some(text) = value.as_str().filter(|_| key != "repoUrl") {
+                    assert!(
+                        !text.starts_with('/') && !text.contains(":\\"),
+                        "{key}: {text}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn bound_fixture(index: i64, pad: usize) -> TsSessionContribution {
+        TsSessionContribution {
+            session_id: format!("s{index}{}", "x".repeat(pad)),
+            client: "claude".to_string(),
+            models: Vec::new(),
+            first_seen: index * 1000,
+            last_seen: index * 1000,
+            tokens: TsTokenBreakdown {
+                input: 1,
+                output: 1,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            messages: 1,
+            git_branch: None,
+            repo_url: None,
+        }
+    }
+
+    #[test]
+    fn submitted_sessions_keep_only_the_newest_by_last_seen() {
+        let sessions: Vec<_> = (1..=(MAX_SUBMIT_SESSIONS as i64 + 50))
+            .map(|i| bound_fixture(i, 0))
+            .collect();
+        let kept = bound_ts_sessions(sessions, MAX_SUBMIT_SESSIONS, usize::MAX).unwrap();
+        assert_eq!(kept.len(), MAX_SUBMIT_SESSIONS);
+        assert_eq!(kept[0].last_seen, (MAX_SUBMIT_SESSIONS as i64 + 50) * 1000);
+        assert_eq!(kept.last().unwrap().last_seen, 51 * 1000);
+    }
+
+    #[test]
+    fn submitted_sessions_drop_the_oldest_until_they_fit_the_byte_budget() {
+        let sessions: Vec<_> = (1..=10).map(|i| bound_fixture(i, 100)).collect();
+        let one = serde_json::to_vec(&sessions[0]).unwrap().len();
+        // Room for three sessions plus brackets and commas, not four.
+        let budget = 2 + 3 * one + 2 + 5;
+        let kept = bound_ts_sessions(sessions.clone(), 2_000, budget).unwrap();
+        assert_eq!(kept.len(), 3);
+        assert_eq!(kept[0].last_seen, 10_000);
+        assert!(serde_json::to_vec(&kept).unwrap().len() <= budget);
+
+        // Nothing fits: sessions are omitted, not truncated mid-session.
+        assert!(bound_ts_sessions(sessions, 2_000, one).is_none());
+    }
+
+    #[test]
+    fn oversized_sessions_are_omitted_so_daily_totals_still_submit() {
+        // One session alone exceeds the budget through a huge model list.
+        let mut huge = bound_fixture(1, 0);
+        huge.models = (0..MAX_SUBMIT_SESSIONS_BYTES / 10)
+            .map(|i| TsSessionModel {
+                model_id: format!("model-{i:08}"),
+                provider_id: None,
+            })
+            .collect();
+        assert!(bound_ts_sessions(vec![huge], 2_000, MAX_SUBMIT_SESSIONS_BYTES).is_none());
+    }
+
+    #[test]
+    fn sessions_without_a_timestamp_are_not_submitted() {
+        let graph = graph_with_sessions(vec![
+            session_message("zero", "claude-sonnet-4-5", "anthropic", 0, 10),
+            session_message(
+                "real",
+                "claude-sonnet-4-5",
+                "anthropic",
+                1_780_000_000_000,
+                10,
+            ),
+        ]);
+        let json = serde_json::to_value(to_ts_token_contribution_data(&graph, None, None)).unwrap();
+        let sessions = json["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["sessionId"], "real");
     }
 
     #[test]
@@ -10297,59 +10373,12 @@ mod tests {
                 "lastSeen",
                 "tokens",
                 "messages",
-                "cwd",
                 "gitBranch",
                 "repoUrl",
             ]
             .into_iter()
             .collect()
         );
-    }
-
-    #[test]
-    fn legacy_payload_path_replaces_full_suffix_or_appends_legacy() {
-        for (input, expected) in [
-            ("out/payload-full.json", "out/payload-legacy.json"),
-            ("out/payload.json", "out/payload-legacy.json"),
-            ("payload-full", "payload-legacy"),
-            ("payload", "payload-legacy"),
-            ("dir.d/full.json", "dir.d/full-legacy.json"),
-        ] {
-            assert_eq!(
-                legacy_payload_path(Path::new(input)),
-                PathBuf::from(expected),
-                "{input}"
-            );
-        }
-    }
-
-    #[test]
-    fn print_payload_requires_dry_run() {
-        assert!(Cli::try_parse_from([
-            "tokscale",
-            "--no-spinner",
-            "submit",
-            "--print-payload",
-            "payload-full.json"
-        ])
-        .is_err());
-        let cli = Cli::try_parse_from([
-            "tokscale",
-            "--no-spinner",
-            "submit",
-            "--dry-run",
-            "--print-payload",
-            "payload-full.json",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Submit {
-                dry_run: true,
-                print_payload: Some(path),
-                ..
-            }) if path == Path::new("payload-full.json")
-        ));
     }
 
     #[test]
