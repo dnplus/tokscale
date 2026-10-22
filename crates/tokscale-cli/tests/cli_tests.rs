@@ -1693,6 +1693,7 @@ fn test_cursor_cache_follows_tokscale_config_dir() {
 
     cmd_with_home(tmp.path())
         .env("TOKSCALE_CONFIG_DIR", &config_dir)
+        .env("APPDATA", tmp.path().join("AppData/Roaming"))
         .args(["models", "--json", "--client", "cursor", "--no-spinner"])
         .assert()
         .success()

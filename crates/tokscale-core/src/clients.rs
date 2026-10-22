@@ -2132,18 +2132,14 @@ mod tests {
     #[test]
     #[serial]
     fn test_cursor_cache_root_follows_override_but_keeps_home_default() {
-        let previous_override = std::env::var("TOKSCALE_CONFIG_DIR").ok();
+        let mut env = EnvGuard::capture(&["TOKSCALE_CONFIG_DIR"]);
         let home = std::path::Path::new("/tmp/home");
         let home_default = native_join(home, ".config/tokscale/cursor-cache");
         for client in [ClientId::Cursor, ClientId::GrokBot] {
-            unsafe {
-                std::env::remove_var("TOKSCALE_CONFIG_DIR");
-            }
+            env.remove("TOKSCALE_CONFIG_DIR");
             assert_eq!(client.data().resolve_path("/tmp/home"), home_default);
 
-            unsafe {
-                std::env::set_var("TOKSCALE_CONFIG_DIR", "/tmp/custom-config-root");
-            }
+            env.set("TOKSCALE_CONFIG_DIR", "/tmp/custom-config-root");
             assert_eq!(
                 client.data().resolve_path("/tmp/home"),
                 native_join(
@@ -2158,7 +2154,6 @@ mod tests {
                 home_default
             );
         }
-        restore_env("TOKSCALE_CONFIG_DIR", previous_override);
     }
 
     #[test]
