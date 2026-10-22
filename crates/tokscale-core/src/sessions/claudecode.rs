@@ -48,6 +48,16 @@ pub struct ClaudeEntry {
     /// Optional billing or routing provider emitted by wrappers around Claude Code.
     #[serde(rename = "providerId", alias = "provider_id", alias = "provider")]
     pub provider_id: Option<String>,
+    /// Working directory Claude Code recorded on this line.
+    #[serde(default, deserialize_with = "super::deserialize_lenient_string")]
+    pub cwd: Option<String>,
+    /// Branch checked out when this line was written; it can change mid-session.
+    #[serde(
+        rename = "gitBranch",
+        default,
+        deserialize_with = "super::deserialize_lenient_string"
+    )]
+    pub git_branch: Option<String>,
 }
 
 /// Meta sidecar written next to nested-layout sidechain transcripts.
@@ -915,7 +925,12 @@ fn parse_claude_lines(
                     pending_turn_start = true;
                 }
 
-                if let Some(tool_message) = tool_result_message {
+                if let Some(mut tool_message) = tool_result_message {
+                    tool_message.session_context = super::SessionContext::recorded(
+                        entry.cwd.as_deref(),
+                        entry.git_branch.as_deref(),
+                        None,
+                    );
                     if let Some(ref dedup_key) = tool_message.dedup_key {
                         if let Some(&existing_idx) = processed_hashes.get(dedup_key) {
                             let mut billing_conflicted = billing_conflicts.contains(&existing_idx);
@@ -1114,6 +1129,11 @@ fn parse_claude_lines(
                     unified.duration_ms = duration_ms;
                     unified.agent = sidechain_agent.clone();
                     unified.set_workspace(workspace_key.clone(), workspace_label.clone());
+                    unified.session_context = super::SessionContext::recorded(
+                        entry.cwd.as_deref(),
+                        entry.git_branch.as_deref(),
+                        None,
+                    );
                     // Mark the first assistant response after a user message as a turn start
                     if pending_turn_start {
                         unified.is_turn_start = true;
@@ -1346,6 +1366,7 @@ pub(crate) fn claude_advisor_messages(
             advisor.message_count = 0;
             advisor.agent.clone_from(&parent.agent);
             advisor.set_workspace(parent.workspace_key.clone(), parent.workspace_label.clone());
+            advisor.session_context.clone_from(&parent.session_context);
             Some((advisor, usage))
         })
         .collect()
@@ -1587,6 +1608,9 @@ pub(crate) fn merge_message_completeness(
     if existing.session_title.is_none() {
         existing.session_title.clone_from(&candidate.session_title);
     }
+    existing
+        .session_context
+        .fill_missing_from(&candidate.session_context);
     if existing.agent.is_none() {
         existing.agent.clone_from(&candidate.agent);
     }
@@ -2438,6 +2462,64 @@ mod tests {
     use tempfile::{NamedTempFile, TempDir};
 
     #[test]
+    fn messages_carry_their_own_line_context_and_the_session_takes_the_last_branch() {
+        let content = concat!(
+            r#"{"type":"user","timestamp":"2026-05-28T10:00:00.000Z","cwd":"/Users/dev/work/app","gitBranch":"main","message":{"role":"user","content":"start"}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-05-28T10:00:01.000Z","requestId":"req_1","cwd":"/Users/dev/work/app","gitBranch":"main","message":{"id":"msg_1","model":"claude-sonnet-4-5","usage":{"input_tokens":10,"output_tokens":1}}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-05-28T10:05:00.000Z","requestId":"req_2","cwd":"/Users/dev/work/app","gitBranch":"feature/sessions","message":{"id":"msg_2","model":"claude-sonnet-4-5","usage":{"input_tokens":20,"output_tokens":2}}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-05-28T10:06:00.000Z","requestId":"req_3","cwd":"/Users/dev/work/app","gitBranch":"","message":{"id":"msg_3","model":"claude-sonnet-4-5","usage":{"input_tokens":30,"output_tokens":3}}}"#,
+            "\n",
+        );
+        let (_dir, path) = create_project_file(content, "-Users-dev-work-app", "s1.jsonl");
+
+        let messages = parse_claude_file(&path);
+        let contexts: Vec<_> = messages
+            .iter()
+            .map(|message| {
+                (
+                    message.session_context.cwd.as_deref(),
+                    message.session_context.git_branch.as_deref(),
+                    message.session_context.repo_url.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            contexts,
+            [
+                (Some("/Users/dev/work/app"), Some("main"), None),
+                (Some("/Users/dev/work/app"), Some("feature/sessions"), None),
+                (Some("/Users/dev/work/app"), None, None),
+            ]
+        );
+
+        let sessions = crate::aggregate_by_session_v2(messages);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].cwd.as_deref(), Some("/Users/dev/work/app"));
+        assert_eq!(sessions[0].git_branch.as_deref(), Some("feature/sessions"));
+        assert_eq!(sessions[0].repo_url, None);
+    }
+
+    #[test]
+    fn wrongly_typed_context_fields_do_not_drop_usage() {
+        let content = concat!(
+            r#"{"type":"assistant","timestamp":"2026-05-28T10:00:01.000Z","requestId":"req_1","cwd":42,"gitBranch":{"name":"main"},"message":{"id":"msg_1","model":"claude-sonnet-4-5","usage":{"input_tokens":10,"output_tokens":1}}}"#,
+            "\n",
+        );
+        let (_dir, path) = create_project_file(content, "proj", "s1.jsonl");
+
+        let messages = parse_claude_file(&path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 10);
+        assert_eq!(
+            messages[0].session_context,
+            crate::sessions::SessionContext::default()
+        );
+    }
+
+    #[test]
     fn is_human_turn_counts_html_user_prompt() {
         let line = r#"{"type":"user","message":{"content":"<div>hello</div>"}}"#;
         assert!(is_human_turn(line));
@@ -3210,6 +3292,8 @@ mod tests {
                 agent_id: None,
                 session_id: None,
                 provider_id: None,
+                cwd: None,
+                git_branch: None,
             },
             last_model: Some("<synthetic>"),
             last_provider_hint: None,
@@ -4915,6 +4999,39 @@ mod resume_tests {
                 "checkpoint after line {cut}"
             );
         }
+    }
+
+    #[test]
+    fn test_resumed_lines_carry_their_own_session_context() {
+        let line = |request: &str, branch: &str| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"2026-10-01T10:0{request}:00.000Z","requestId":"req_{request}","cwd":"/work/app","gitBranch":"{branch}","message":{{"id":"msg_{request}","model":"claude-sonnet-4-5","usage":{{"input_tokens":3,"output_tokens":1}}}}}}"#
+            )
+            .into_bytes()
+            .into_iter()
+            .chain(*b"\n")
+            .collect::<Vec<u8>>()
+        };
+        let dir = TempDir::new().unwrap();
+        let path = transcript_path(&dir);
+        append(&path, &[line("1", "main")]);
+        let first = parse_claude_file_with_checkpoint(&path, None);
+        let checkpoint = first.checkpoint.expect("a complete line checkpoints");
+
+        append(&path, &[line("2", "feature/x")]);
+        let resumed = resume_claude_file(&path, None, &checkpoint, &first.messages)
+            .expect("a grown transcript resumes");
+
+        let branches: Vec<_> = resumed
+            .messages
+            .iter()
+            .map(|message| message.session_context.git_branch.as_deref())
+            .collect();
+        assert_eq!(branches, [Some("main"), Some("feature/x")]);
+        assert_eq!(
+            resumed.messages,
+            parse_claude_file_with_checkpoint(&path, None).messages
+        );
     }
 
     #[test]

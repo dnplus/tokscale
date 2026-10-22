@@ -5253,6 +5253,9 @@ const AMP_SUBMISSION_PARSER_VERSION: u32 = 2;
 // selected surfaces declare this generation and cover the credited history.
 // This is a submission contract, independent of the on-disk parser cache version.
 const MICODE_SUBMISSION_PARSER_VERSION: u32 = 2;
+// Per-session metadata shape; sent only to receivers that advertise this exact
+// version, since older receivers may reject an unknown top-level key.
+const SESSIONS_SUBMISSION_VERSION: u32 = 1;
 
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -5292,6 +5295,127 @@ struct TsTokenContributionData {
     mcp_servers: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<TsSubmissionProvenance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sessions: Option<Vec<TsSessionContribution>>,
+}
+
+/// One agent session's usage and where it ran. This is the whole set of
+/// fields the receiver gets for a session: nothing from the conversation
+/// itself (titles, prompts, message text) and no local path (the working
+/// directory) is ever sent.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TsSessionContribution {
+    session_id: String,
+    client: String,
+    models: Vec<TsSessionModel>,
+    /// Unix milliseconds.
+    first_seen: i64,
+    /// Unix milliseconds.
+    last_seen: i64,
+    tokens: TsTokenBreakdown,
+    messages: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_url: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TsSessionModel {
+    model_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_id: Option<String>,
+}
+
+/// The receiver keeps this many sessions per principal; sending more is waste.
+const MAX_SUBMIT_SESSIONS: usize = 2_000;
+/// Upper bound on the serialized `sessions` array, so it cannot blow up a
+/// submission whose daily totals are small.
+const MAX_SUBMIT_SESSIONS_BYTES: usize = 2 * 1024 * 1024;
+
+fn to_ts_session_contributions(
+    sessions: &[tokscale_core::SessionContributionV2],
+) -> Option<Vec<TsSessionContribution>> {
+    bound_ts_sessions(
+        collect_ts_sessions(sessions),
+        MAX_SUBMIT_SESSIONS,
+        MAX_SUBMIT_SESSIONS_BYTES,
+    )
+}
+
+/// Keep the most recent `max_count` sessions, then drop the oldest until the
+/// serialized array fits `max_bytes`. `None` when nothing fits, so the daily
+/// totals still submit without `sessions`.
+fn bound_ts_sessions(
+    mut sessions: Vec<TsSessionContribution>,
+    max_count: usize,
+    max_bytes: usize,
+) -> Option<Vec<TsSessionContribution>> {
+    sessions.sort_by(|a, b| {
+        b.last_seen
+            .cmp(&a.last_seen)
+            .then_with(|| a.client.cmp(&b.client))
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    sessions.truncate(max_count);
+
+    // Brackets plus one comma between elements.
+    let mut bytes = 2usize;
+    let mut keep = 0;
+    for session in &sessions {
+        let size = serde_json::to_vec(session).ok()?.len();
+        let next = bytes + size + usize::from(keep > 0);
+        if next > max_bytes {
+            break;
+        }
+        bytes = next;
+        keep += 1;
+    }
+    sessions.truncate(keep);
+    (!sessions.is_empty()).then_some(sessions)
+}
+
+fn collect_ts_sessions(
+    sessions: &[tokscale_core::SessionContributionV2],
+) -> Vec<TsSessionContribution> {
+    sessions
+        .iter()
+        .filter(|session| {
+            !session.session_id.is_empty()
+                && session.totals.tokens > 0
+                // No usable timestamp: the receiver cannot place the session.
+                && session.first_seen > 0
+                && session.last_seen > 0
+        })
+        .map(|session| TsSessionContribution {
+            session_id: session.session_id.clone(),
+            client: session.client.clone(),
+            models: session
+                .clients
+                .iter()
+                .map(|cell| TsSessionModel {
+                    model_id: cell.model_id.clone(),
+                    provider_id: (!cell.provider_id.is_empty()).then(|| cell.provider_id.clone()),
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            first_seen: session.first_seen.saturating_mul(1000),
+            last_seen: session.last_seen.saturating_mul(1000),
+            tokens: TsTokenBreakdown {
+                input: session.token_breakdown.input,
+                output: session.token_breakdown.output,
+                cache_read: session.token_breakdown.cache_read,
+                cache_write: session.token_breakdown.cache_write,
+                reasoning: session.token_breakdown.reasoning,
+            },
+            messages: session.totals.messages,
+            git_branch: session.git_branch.clone(),
+            repo_url: session.repo_url.clone(),
+        })
+        .collect()
 }
 
 fn to_ts_token_contribution_data(
@@ -5428,6 +5552,7 @@ fn to_ts_token_contribution_data(
             }
         },
         provenance: None,
+        sessions: to_ts_session_contributions(&graph.sessions),
     }
 }
 
@@ -8401,6 +8526,7 @@ mod tests {
             time_metrics: None,
             unpriced_submission_usage: Vec::new(),
             incomplete_cost_dates: std::collections::BTreeSet::new(),
+            sessions: Vec::new(),
         }
     }
 
@@ -9969,6 +10095,289 @@ mod tests {
         assert_eq!(
             payload.device.as_ref().unwrap().name.as_deref(),
             Some("Test device")
+        );
+    }
+
+    fn session_message(
+        session_id: &str,
+        model: &str,
+        provider: &str,
+        timestamp_ms: i64,
+        input: i64,
+    ) -> tokscale_core::UnifiedMessage {
+        let mut message = tokscale_core::UnifiedMessage::new(
+            "claude",
+            model,
+            provider,
+            session_id,
+            timestamp_ms,
+            TokenBreakdown {
+                input,
+                output: 2,
+                cache_read: 3,
+                cache_write: 4,
+                cache_write_1h: 0,
+                reasoning: 5,
+            },
+            0.1,
+        );
+        message.session_title = Some("Refactor the payment token flow".to_string());
+        message.session_context = tokscale_core::sessions::SessionContext::recorded(
+            Some("/Users/dev/work/app"),
+            Some("feature/sessions"),
+            Some("https://github.com/acme/app.git"),
+        );
+        message
+    }
+
+    fn graph_with_sessions(messages: Vec<tokscale_core::UnifiedMessage>) -> GraphResultV2 {
+        let mut graph = graph_result_with_contributions(vec![daily_contribution(
+            "2026-05-28",
+            100,
+            1.0,
+            "claude",
+            "claude-sonnet-4-5",
+        )]);
+        graph.sessions = tokscale_core::aggregate_by_session_v2(messages);
+        graph
+    }
+
+    #[test]
+    fn submit_payload_serializes_sessions_with_camel_case_keys_and_ms_timestamps() {
+        let graph = graph_with_sessions(vec![
+            session_message(
+                "s1",
+                "claude-sonnet-4-5",
+                "anthropic",
+                1_780_000_000_000,
+                10,
+            ),
+            session_message(
+                "s1",
+                "claude-sonnet-4-5",
+                "anthropic",
+                1_780_000_030_000,
+                20,
+            ),
+            session_message("s1", "claude-haiku-4-5", "", 1_780_000_090_000, 30),
+            // Neither of these is a reportable session.
+            session_message("", "claude-sonnet-4-5", "anthropic", 1_780_000_000_000, 10),
+            {
+                let mut empty = session_message("s2", "claude-sonnet-4-5", "anthropic", 1, 0);
+                empty.tokens = TokenBreakdown::default();
+                empty
+            },
+        ]);
+
+        let json = serde_json::to_value(to_ts_token_contribution_data(&graph, None, None)).unwrap();
+
+        assert_eq!(
+            json["sessions"],
+            serde_json::json!([{
+                "sessionId": "s1",
+                "client": "claude",
+                "models": [
+                    {"modelId": "claude-haiku-4-5"},
+                    {"modelId": "claude-sonnet-4-5", "providerId": "anthropic"}
+                ],
+                "firstSeen": 1_780_000_000_000_i64,
+                "lastSeen": 1_780_000_090_000_i64,
+                "tokens": {
+                    "input": 60,
+                    "output": 6,
+                    "cacheRead": 9,
+                    "cacheWrite": 12,
+                    "reasoning": 15
+                },
+                "messages": 3,
+                "gitBranch": "feature/sessions",
+                "repoUrl": "https://github.com/acme/app.git"
+            }])
+        );
+
+        let without = to_ts_token_contribution_data(&graph_with_sessions(Vec::new()), None, None);
+        assert!(without.sessions.is_none());
+        assert!(serde_json::to_value(without)
+            .unwrap()
+            .get("sessions")
+            .is_none());
+    }
+
+    #[test]
+    fn submit_payload_never_carries_a_working_directory_or_path() {
+        let graph = graph_with_sessions(vec![session_message(
+            "s1",
+            "claude-sonnet-4-5",
+            "anthropic",
+            1_780_000_000_000,
+            10,
+        )]);
+        // The fixture records a cwd; the aggregate holds it, the wire must not.
+        assert_eq!(
+            graph.sessions[0].cwd.as_deref(),
+            Some("/Users/dev/work/app")
+        );
+        let wire =
+            serde_json::to_string(&to_ts_token_contribution_data(&graph, None, None)).unwrap();
+        assert!(!wire.contains("cwd"), "{wire}");
+        assert!(!wire.contains("/Users/dev"), "{wire}");
+        assert!(!wire.contains("work/app\""), "{wire}");
+        let json: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        for session in json["sessions"].as_array().unwrap() {
+            for (key, value) in session.as_object().unwrap() {
+                if let Some(text) = value.as_str().filter(|_| key != "repoUrl") {
+                    assert!(
+                        !text.starts_with('/') && !text.contains(":\\"),
+                        "{key}: {text}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn bound_fixture(index: i64, pad: usize) -> TsSessionContribution {
+        TsSessionContribution {
+            session_id: format!("s{index}{}", "x".repeat(pad)),
+            client: "claude".to_string(),
+            models: Vec::new(),
+            first_seen: index * 1000,
+            last_seen: index * 1000,
+            tokens: TsTokenBreakdown {
+                input: 1,
+                output: 1,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            messages: 1,
+            git_branch: None,
+            repo_url: None,
+        }
+    }
+
+    #[test]
+    fn submitted_sessions_keep_only_the_newest_by_last_seen() {
+        let sessions: Vec<_> = (1..=(MAX_SUBMIT_SESSIONS as i64 + 50))
+            .map(|i| bound_fixture(i, 0))
+            .collect();
+        let kept = bound_ts_sessions(sessions, MAX_SUBMIT_SESSIONS, usize::MAX).unwrap();
+        assert_eq!(kept.len(), MAX_SUBMIT_SESSIONS);
+        assert_eq!(kept[0].last_seen, (MAX_SUBMIT_SESSIONS as i64 + 50) * 1000);
+        assert_eq!(kept.last().unwrap().last_seen, 51 * 1000);
+    }
+
+    #[test]
+    fn submitted_sessions_drop_the_oldest_until_they_fit_the_byte_budget() {
+        let sessions: Vec<_> = (1..=10).map(|i| bound_fixture(i, 100)).collect();
+        let one = serde_json::to_vec(&sessions[0]).unwrap().len();
+        // Room for three sessions plus brackets and commas, not four.
+        let budget = 2 + 3 * one + 2 + 5;
+        let kept = bound_ts_sessions(sessions.clone(), 2_000, budget).unwrap();
+        assert_eq!(kept.len(), 3);
+        assert_eq!(kept[0].last_seen, 10_000);
+        assert!(serde_json::to_vec(&kept).unwrap().len() <= budget);
+
+        // Nothing fits: sessions are omitted, not truncated mid-session.
+        assert!(bound_ts_sessions(sessions, 2_000, one).is_none());
+    }
+
+    #[test]
+    fn oversized_sessions_are_omitted_so_daily_totals_still_submit() {
+        // One session alone exceeds the budget through a huge model list.
+        let mut huge = bound_fixture(1, 0);
+        huge.models = (0..MAX_SUBMIT_SESSIONS_BYTES / 10)
+            .map(|i| TsSessionModel {
+                model_id: format!("model-{i:08}"),
+                provider_id: None,
+            })
+            .collect();
+        assert!(bound_ts_sessions(vec![huge], 2_000, MAX_SUBMIT_SESSIONS_BYTES).is_none());
+    }
+
+    #[test]
+    fn sessions_without_a_timestamp_are_not_submitted() {
+        let graph = graph_with_sessions(vec![
+            session_message("zero", "claude-sonnet-4-5", "anthropic", 0, 10),
+            session_message(
+                "real",
+                "claude-sonnet-4-5",
+                "anthropic",
+                1_780_000_000_000,
+                10,
+            ),
+        ]);
+        let json = serde_json::to_value(to_ts_token_contribution_data(&graph, None, None)).unwrap();
+        let sessions = json["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["sessionId"], "real");
+    }
+
+    #[test]
+    fn submit_payload_sessions_carry_no_conversation_content() {
+        fn keys<'a>(value: &'a serde_json::Value, found: &mut Vec<&'a str>) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    for (key, child) in object {
+                        found.push(key);
+                        keys(child, found);
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter().for_each(|item| keys(item, found)),
+                _ => {}
+            }
+        }
+
+        let graph = graph_with_sessions(vec![session_message(
+            "s1",
+            "claude-sonnet-4-5",
+            "anthropic",
+            1_780_000_000_000,
+            10,
+        )]);
+        let json = serde_json::to_value(to_ts_token_contribution_data(&graph, None, None)).unwrap();
+        let wire = json.to_string();
+        assert!(
+            !wire.contains("payment token flow"),
+            "the title must not be sent"
+        );
+
+        let mut found = Vec::new();
+        keys(&json, &mut found);
+        for forbidden in [
+            "title",
+            "sessionTitle",
+            "description",
+            "aiTitle",
+            "lastPrompt",
+            "prompt",
+            "content",
+            "token",
+            "apiKey",
+        ] {
+            assert!(
+                !found.contains(&forbidden),
+                "payload has a `{forbidden}` key"
+            );
+        }
+
+        let session = json["sessions"][0].as_object().unwrap();
+        let session_keys: std::collections::BTreeSet<&str> =
+            session.keys().map(String::as_str).collect();
+        assert_eq!(
+            session_keys,
+            [
+                "sessionId",
+                "client",
+                "models",
+                "firstSeen",
+                "lastSeen",
+                "tokens",
+                "messages",
+                "gitBranch",
+                "repoUrl",
+            ]
+            .into_iter()
+            .collect()
         );
     }
 

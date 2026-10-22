@@ -608,6 +608,14 @@ pub struct SessionContributionV2 {
     pub first_seen: i64,
     /// Latest message timestamp (unix seconds) in the session.
     pub last_seen: i64,
+    /// Each context field is the one recorded by the latest message that
+    /// recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_url: Option<String>,
 }
 
 /// Year totals with cost provenance; opt in from [`YearSummary`].
@@ -686,6 +694,9 @@ pub struct GraphResultV2 {
     /// not part of local report aggregation or exported historical reports.
     #[serde(skip)]
     pub incomplete_cost_dates: BTreeSet<String>,
+    /// Per-session aggregates, filled only for submission graphs.
+    #[serde(skip)]
+    pub sessions: Vec<SessionContributionV2>,
 }
 
 /// Token-bearing usage submitted at zero cost because it cannot be priced
@@ -5499,6 +5510,8 @@ struct GraphSink<'a> {
     requirement: GraphPricingRequirement,
     buffer: Vec<(UnifiedMessage, Option<EstimateSource>)>,
     daily: aggregator::DailyFoldV2,
+    /// Only submission builds the per-session aggregate; other reports skip its cost.
+    sessions: Option<aggregator::SessionFoldV2>,
     interner: sessionize::SpanInterner,
     spans: Vec<sessionize::SessionSpan>,
     /// Merged across batches by (provider, model); counts and tokens add.
@@ -5521,6 +5534,8 @@ impl<'a> GraphSink<'a> {
             requirement,
             buffer: Vec::new(),
             daily: aggregator::DailyFoldV2::default(),
+            sessions: matches!(requirement, GraphPricingRequirement::Submission)
+                .then(aggregator::SessionFoldV2::default),
             interner: sessionize::SpanInterner::default(),
             spans: Vec::new(),
             unpriced_usage: HashMap::new(),
@@ -5587,6 +5602,9 @@ impl<'a> GraphSink<'a> {
         for (message, estimate_source) in &batch {
             self.daily
                 .add_with_estimate_source(message, *estimate_source);
+            if let Some(sessions) = self.sessions.as_mut() {
+                sessions.add(message);
+            }
             if message.timestamp > 0 {
                 self.spans.push(sessionize::SessionSpan::from_message(
                     message,
@@ -5648,6 +5666,10 @@ impl<'a> GraphSink<'a> {
         result.time_metrics = Some(time_metrics);
         result.unpriced_submission_usage = unpriced_submission_usage;
         result.incomplete_cost_dates = self.incomplete_cost_dates;
+        result.sessions = self
+            .sessions
+            .map(aggregator::SessionFoldV2::finish)
+            .unwrap_or_default();
 
         for contribution in &mut result.contributions {
             if let Some(&ms) = daily_active_time.get(&contribution.date) {
@@ -8089,6 +8111,7 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
         pricing_model_id: msg.pricing_model_id.clone(),
         estimate_status: msg.estimate_status,
         copilot_context: None,
+        session_context: Default::default(),
     }
 }
 

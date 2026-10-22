@@ -135,6 +135,10 @@ fn parse_antigravity_db_file(path: &Path, client: &'static str) -> Vec<UnifiedMe
             if meta.workspace_key.is_some() {
                 message.set_workspace(meta.workspace_key.clone(), meta.workspace_label.clone());
             }
+            // The workspace key is the decoded folder URI with only separators
+            // normalized, so it is the path Antigravity recorded.
+            message.session_context =
+                super::SessionContext::recorded(meta.workspace_key.as_deref(), None, None);
             messages.push(message);
         }
     }
@@ -1260,6 +1264,14 @@ mod tests {
             Some("C:/Users/Frank/obsidian-vault")
         );
         assert_eq!(message.workspace_label.as_deref(), Some("obsidian-vault"));
+        assert_eq!(
+            message.session_context,
+            crate::sessions::SessionContext {
+                cwd: Some("C:/Users/Frank/obsidian-vault".into()),
+                git_branch: None,
+                repo_url: None,
+            }
+        );
     }
 
     #[test]

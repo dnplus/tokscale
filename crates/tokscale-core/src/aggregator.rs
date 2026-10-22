@@ -179,7 +179,8 @@ impl DailyFoldV2 {
     }
 }
 
-/// Aggregate messages into per-session contributions, keyed on `session_id`.
+/// Aggregate messages into per-session contributions, keyed on
+/// `(client, session_id)`: two clients may reuse one session id.
 ///
 /// Each returned [`SessionContributionV2`] sums all token buckets and cost for a
 /// single session and exposes the same client/model breakdown shape as
@@ -190,12 +191,12 @@ pub fn aggregate_by_session_v2(messages: Vec<UnifiedMessage>) -> Vec<SessionCont
         return Vec::new();
     }
 
-    let session_map: HashMap<String, SessionAccumulator> = messages
+    let session_map: HashMap<SessionKey, SessionAccumulator> = messages
         .into_par_iter()
         .fold(
             HashMap::new,
-            |mut acc: HashMap<String, SessionAccumulator>, msg| {
-                let entry = acc.entry(msg.session_id.clone()).or_default();
+            |mut acc: HashMap<SessionKey, SessionAccumulator>, msg| {
+                let entry = acc.entry(session_key(&msg)).or_default();
                 entry.add_message(&msg);
                 acc
             },
@@ -207,19 +208,51 @@ pub fn aggregate_by_session_v2(messages: Vec<UnifiedMessage>) -> Vec<SessionCont
             a
         });
 
-    let mut contributions: Vec<SessionContributionV2> = session_map
-        .into_iter()
-        .map(|(session_id, acc)| acc.into_contribution(session_id))
-        .collect();
+    SessionFoldV2 {
+        sessions: session_map,
+    }
+    .finish()
+}
 
-    // Most recently active first; stable sort by session_id when ties.
-    contributions.sort_by(|a, b| {
-        b.last_seen
-            .cmp(&a.last_seen)
-            .then_with(|| a.session_id.cmp(&b.session_id))
-    });
+/// Incremental form of [`aggregate_by_session_v2`] for callers that stream
+/// messages and drop each one after folding it, as [`DailyFoldV2`] does for days.
+#[derive(Default)]
+pub(crate) struct SessionFoldV2 {
+    sessions: HashMap<SessionKey, SessionAccumulator>,
+}
 
-    contributions
+/// A session is identified by its client and id together.
+type SessionKey = (String, String);
+
+fn session_key(message: &UnifiedMessage) -> SessionKey {
+    (message.client.clone(), message.session_id.clone())
+}
+
+impl SessionFoldV2 {
+    pub(crate) fn add(&mut self, message: &UnifiedMessage) {
+        self.sessions
+            .entry(session_key(message))
+            .or_default()
+            .add_message(message);
+    }
+
+    pub(crate) fn finish(self) -> Vec<SessionContributionV2> {
+        let mut contributions: Vec<SessionContributionV2> = self
+            .sessions
+            .into_iter()
+            .map(|((_, session_id), acc)| acc.into_contribution(session_id))
+            .collect();
+
+        // Most recently active first; stable sort by session_id when ties.
+        contributions.sort_by(|a, b| {
+            b.last_seen
+                .cmp(&a.last_seen)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+                .then_with(|| a.client.cmp(&b.client))
+        });
+
+        contributions
+    }
 }
 
 /// Calculate summary statistics
@@ -361,6 +394,7 @@ pub fn generate_graph_result_v2(
         time_metrics: None,
         unpriced_submission_usage: Vec::new(),
         incomplete_cost_dates: std::collections::BTreeSet::new(),
+        sessions: Vec::new(),
     }
 }
 
@@ -706,6 +740,48 @@ struct SessionAccumulator {
     top_cost: f64,
     first_seen: i64,
     last_seen: i64,
+    cwd: LatestValue,
+    git_branch: LatestValue,
+    repo_url: LatestValue,
+}
+
+/// The value recorded by the latest message that recorded one. Ties on the
+/// timestamp go to the greater value, so rayon's fold order cannot pick.
+#[derive(Default)]
+struct LatestValue(Option<(i64, String)>);
+
+impl LatestValue {
+    fn supersedes(&self, timestamp: i64, value: &str) -> bool {
+        self.0
+            .as_ref()
+            .is_none_or(|(held_at, held)| (timestamp, value) > (*held_at, held.as_str()))
+    }
+
+    fn offer(&mut self, timestamp: i64, value: Option<&str>) {
+        let Some(value) = value.filter(|value| self.supersedes(timestamp, value)) else {
+            return;
+        };
+        match &mut self.0 {
+            // A session's rows mostly repeat one value; reuse its buffer.
+            Some((held_at, held)) => {
+                *held_at = timestamp;
+                value.clone_into(held);
+            }
+            None => self.0 = Some((timestamp, value.to_owned())),
+        }
+    }
+
+    fn merge(&mut self, other: LatestValue) {
+        if let Some((timestamp, value)) = other.0 {
+            if self.supersedes(timestamp, &value) {
+                self.0 = Some((timestamp, value));
+            }
+        }
+    }
+
+    fn into_value(self) -> Option<String> {
+        self.0.map(|(_, value)| value)
+    }
 }
 
 impl Default for SessionAccumulator {
@@ -722,6 +798,9 @@ impl Default for SessionAccumulator {
             top_cost: f64::NEG_INFINITY,
             first_seen: i64::MAX,
             last_seen: i64::MIN,
+            cwd: LatestValue::default(),
+            git_branch: LatestValue::default(),
+            repo_url: LatestValue::default(),
         }
     }
 }
@@ -781,12 +860,22 @@ impl SessionAccumulator {
         } else {
             msg.timestamp
         };
-        if secs < self.first_seen {
-            self.first_seen = secs;
+        // A zero timestamp means "unknown", not 1970.
+        if secs > 0 {
+            if secs < self.first_seen {
+                self.first_seen = secs;
+            }
+            if secs > self.last_seen {
+                self.last_seen = secs;
+            }
         }
-        if secs > self.last_seen {
-            self.last_seen = secs;
-        }
+
+        let context = &msg.session_context;
+        self.cwd.offer(msg.timestamp, context.cwd.as_deref());
+        self.git_branch
+            .offer(msg.timestamp, context.git_branch.as_deref());
+        self.repo_url
+            .offer(msg.timestamp, context.repo_url.as_deref());
     }
 
     fn merge(&mut self, other: SessionAccumulator) {
@@ -832,6 +921,10 @@ impl SessionAccumulator {
         if other.last_seen > self.last_seen {
             self.last_seen = other.last_seen;
         }
+
+        self.cwd.merge(other.cwd);
+        self.git_branch.merge(other.git_branch);
+        self.repo_url.merge(other.repo_url);
     }
 
     fn into_contribution(self, session_id: String) -> SessionContributionV2 {
@@ -899,6 +992,9 @@ impl SessionAccumulator {
             clients,
             first_seen,
             last_seen,
+            cwd: self.cwd.into_value(),
+            git_branch: self.git_branch.into_value(),
+            repo_url: self.repo_url.into_value(),
         }
     }
 }
@@ -944,6 +1040,123 @@ pub fn calculate_intensities_v2(contributions: &mut [DailyContributionV2]) {
 mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
+
+    #[test]
+    fn session_context_takes_each_fields_latest_value_in_any_order() {
+        let message =
+            |timestamp: i64, cwd: Option<&str>, branch: Option<&str>, repo: Option<&str>| {
+                let mut message = mock_unified_message("2026-05-28", 10, 0.1, "model", "claude");
+                message.timestamp = timestamp;
+                message.session_context =
+                    crate::sessions::SessionContext::recorded(cwd, branch, repo);
+                message
+            };
+        let messages = [
+            message(1_000, Some("/a"), Some("main"), None),
+            message(2_000, None, Some("dev"), Some("https://h/r.git")),
+            message(3_000, Some("/b"), None, None),
+            // Same instant as the previous row: the greater value wins.
+            message(3_000, Some("/c"), None, None),
+        ];
+        let expected = (
+            Some("/c".to_string()),
+            Some("dev".to_string()),
+            Some("https://h/r.git".to_string()),
+        );
+        let context_of = |session: &SessionContributionV2| {
+            (
+                session.cwd.clone(),
+                session.git_branch.clone(),
+                session.repo_url.clone(),
+            )
+        };
+
+        let mut orders = vec![vec![]];
+        for message in &messages {
+            orders = orders
+                .into_iter()
+                .flat_map(|order: Vec<&UnifiedMessage>| {
+                    (0..=order.len()).map(move |at| {
+                        let mut next = order.clone();
+                        next.insert(at, message);
+                        next
+                    })
+                })
+                .collect();
+        }
+        assert_eq!(orders.len(), 24);
+        for order in orders {
+            let mut fold = SessionFoldV2::default();
+            order.iter().for_each(|message| fold.add(message));
+            assert_eq!(context_of(&fold.finish()[0]), expected);
+
+            // Rayon splits the corpus anywhere and merges either way round.
+            for split in 0..=order.len() {
+                let fold_part = |part: &[&UnifiedMessage]| {
+                    let mut acc = SessionAccumulator::default();
+                    part.iter().for_each(|message| acc.add_message(message));
+                    acc
+                };
+                for left_first in [true, false] {
+                    let (head, tail) = order.split_at(split);
+                    let (mut into, from) = if left_first {
+                        (fold_part(head), fold_part(tail))
+                    } else {
+                        (fold_part(tail), fold_part(head))
+                    };
+                    into.merge(from);
+                    let session = into.into_contribution("s".to_string());
+                    assert_eq!(context_of(&session), expected);
+                }
+            }
+        }
+
+        let parallel = aggregate_by_session_v2(messages.to_vec());
+        assert_eq!(context_of(&parallel[0]), expected);
+    }
+
+    #[test]
+    fn sessions_with_one_id_in_two_clients_stay_separate() {
+        let message = |client: &str, tokens: i64| {
+            let mut m = mock_unified_message("2026-05-28", tokens, 0.1, "model", client);
+            m.session_id = "shared".to_string();
+            m.timestamp = 1_780_000_000_000;
+            m
+        };
+        let sessions = aggregate_by_session_v2(vec![
+            message("claude", 10),
+            message("codex", 20),
+            message("claude", 5),
+        ]);
+        assert_eq!(sessions.len(), 2);
+        let messages_of = |client: &str| {
+            sessions
+                .iter()
+                .find(|s| s.client == client)
+                .unwrap()
+                .totals
+                .messages
+        };
+        assert_eq!(messages_of("claude"), 2);
+        assert_eq!(messages_of("codex"), 1);
+    }
+
+    #[test]
+    fn zero_timestamps_do_not_set_first_or_last_seen() {
+        let message = |timestamp: i64| {
+            let mut m = mock_unified_message("2026-05-28", 10, 0.1, "model", "claude");
+            m.session_id = "s".to_string();
+            m.timestamp = timestamp;
+            m
+        };
+        let mixed = aggregate_by_session_v2(vec![message(0), message(1_780_000_000_000)]);
+        assert_eq!(mixed[0].first_seen, 1_780_000_000);
+        assert_eq!(mixed[0].last_seen, 1_780_000_000);
+        assert_eq!(mixed[0].totals.tokens, 20);
+
+        let only_zero = aggregate_by_session_v2(vec![message(0)]);
+        assert_eq!((only_zero[0].first_seen, only_zero[0].last_seen), (0, 0));
+    }
 
     // Helper function to create mock UnifiedMessage
     fn mock_unified_message(
@@ -991,6 +1204,7 @@ mod tests {
             pricing_model_id: None,
             estimate_status: crate::sessions::EstimateStatus::Unpriced,
             copilot_context: None,
+            session_context: Default::default(),
         }
     }
 
@@ -1665,6 +1879,7 @@ mod tests {
             pricing_model_id: None,
             estimate_status: crate::sessions::EstimateStatus::Unpriced,
             copilot_context: None,
+            session_context: Default::default(),
             duration_ms: None,
         }
     }
@@ -1819,9 +2034,8 @@ mod tests {
     }
 
     #[test]
-    fn test_aggregate_by_session_picks_top_client_by_cost() {
-        // Same session_id but two different clients — top-level fields should
-        // reflect the client with the larger cost share.
+    fn test_aggregate_by_session_keeps_clients_sharing_an_id_apart() {
+        // Same session_id but two different clients are two sessions.
         let small = TokenBreakdown {
             input: 10,
             output: 10,
@@ -1862,14 +2076,15 @@ mod tests {
         ];
 
         let result = aggregate_by_session_v2(messages);
-        assert_eq!(result.len(), 1);
+        assert_eq!(result.len(), 2);
+        // Most recently active first.
         assert_eq!(result[0].client, "codex");
         assert_eq!(result[0].provider, "openai");
         assert_eq!(result[0].model, "gpt-5");
-        // Per-client breakdown should preserve both clients.
-        assert_eq!(result[0].clients.len(), 2);
-        assert_eq!(result[0].clients[0].client, "codex");
-        assert!((result[0].totals.cost - 0.501).abs() < 1e-9);
+        assert_eq!(result[0].clients.len(), 1);
+        assert!((result[0].totals.cost - 0.50).abs() < 1e-9);
+        assert_eq!(result[1].client, "amp");
+        assert!((result[1].totals.cost - 0.001).abs() < 1e-9);
     }
 
     #[test]
@@ -1911,6 +2126,9 @@ mod tests {
             }],
             first_seen: 1_715_551_577,
             last_seen: 1_715_551_612,
+            cwd: None,
+            git_branch: None,
+            repo_url: None,
         };
 
         let json = serde_json::to_string(&contrib).expect("serialize");

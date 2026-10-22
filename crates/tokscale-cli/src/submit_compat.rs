@@ -1,4 +1,5 @@
-//! Receiver-first rollout for the atomic Cursor/Grok Bot accounting family.
+//! Receiver-first rollout for payload features older receivers reject: the
+//! atomic Cursor/Grok Bot accounting family and per-session metadata.
 //! Never fold Bot back into Cursor: a migrated ledger may already contain both.
 use std::borrow::Cow;
 use std::time::Duration;
@@ -9,6 +10,7 @@ use reqwest::StatusCode;
 use crate::{
     DateRange, TsDataSummary, TsSourceContribution, TsTokenContributionData, TsYearSummary,
     CURSOR_SUBMISSION_PARSER_VERSION, GROK_BOT_SUBMISSION_PARSER_VERSION,
+    SESSIONS_SUBMISSION_VERSION,
 };
 
 /// Rebuild cost provenance from the retained rows, using the same participation
@@ -50,14 +52,21 @@ fn touches_family(payload: &TsTokenContributionData) -> bool {
             .is_some_and(|scope| scope.parser_versions.keys().any(|client| is_family(client)))
 }
 
+/// What the receiver accepts beyond the legacy payload, from `GET /api/submit`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ReceiverCapabilities {
+    pub(crate) cursor_grok_bot: bool,
+    pub(crate) sessions: bool,
+}
+
 /// Only definitive protocol responses permit a legacy fallback. Connection,
 /// auth and server errors never turn into silent loss of the submitted family.
-fn supports_family(status: StatusCode, body: &[u8]) -> Result<bool> {
+fn parse_capabilities(status: StatusCode, body: &[u8]) -> Result<ReceiverCapabilities> {
     if matches!(
         status,
         StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
     ) {
-        return Ok(false);
+        return Ok(ReceiverCapabilities::default());
     }
     anyhow::ensure!(
         status.is_success(),
@@ -65,16 +74,20 @@ fn supports_family(status: StatusCode, body: &[u8]) -> Result<bool> {
     );
     let body: serde_json::Value = serde_json::from_slice(body)
         .context("Invalid submission capability response; no usage was uploaded")?;
-    let versions = &body["capabilities"]["cursorGrokBot"]["parserVersions"];
-    Ok(
-        versions["cursor"].as_u64() == Some(CURSOR_SUBMISSION_PARSER_VERSION as u64)
+    let capabilities = &body["capabilities"];
+    let versions = &capabilities["cursorGrokBot"]["parserVersions"];
+    Ok(ReceiverCapabilities {
+        cursor_grok_bot: versions["cursor"].as_u64()
+            == Some(CURSOR_SUBMISSION_PARSER_VERSION as u64)
             && versions["grok-bot"].as_u64() == Some(GROK_BOT_SUBMISSION_PARSER_VERSION as u64),
-    )
+        sessions: capabilities["sessions"]["version"].as_u64()
+            == Some(SESSIONS_SUBMISSION_VERSION as u64),
+    })
 }
 
 const MAX_CAPABILITY_BYTES: usize = 64 * 1024;
 
-async fn receiver_supports_family(api_url: &str) -> Result<bool> {
+async fn receiver_capabilities(api_url: &str) -> Result<ReceiverCapabilities> {
     let mut response = tokscale_core::http::client()
         .get(format!("{}/api/submit", api_url.trim_end_matches('/')))
         .timeout(Duration::from_secs(10))
@@ -84,7 +97,7 @@ async fn receiver_supports_family(api_url: &str) -> Result<bool> {
     let status = response.status();
     // Older Next receivers return a body-less 405. Other errors need no body.
     if !status.is_success() {
-        return supports_family(status, &[]);
+        return parse_capabilities(status, &[]);
     }
     anyhow::ensure!(
         response
@@ -104,32 +117,69 @@ async fn receiver_supports_family(api_url: &str) -> Result<bool> {
         );
         body.extend_from_slice(&chunk);
     }
-    supports_family(status, &body)
+    parse_capabilities(status, &body)
 }
 
 pub(crate) async fn prepare_submission<'a>(
     api_url: &str,
     payload: &'a TsTokenContributionData,
 ) -> Result<Cow<'a, TsTokenContributionData>> {
-    if !touches_family(payload) {
+    let family = touches_family(payload);
+    if !family && payload.sessions.is_none() {
         return Ok(Cow::Borrowed(payload));
     }
-    let supported = receiver_supports_family(api_url).await?;
-    if !supported {
+    let capabilities = match receiver_capabilities(api_url).await {
+        Ok(capabilities) => capabilities,
+        // Sessions are optional metadata, so without a definitive answer they
+        // are not sent. The family keeps failing closed.
+        Err(_) if !family => {
+            eprintln!("  Could not check whether this receiver accepts session metadata, so sessions were omitted from this upload. Usage totals are unaffected.");
+            ReceiverCapabilities::default()
+        }
+        Err(error) => return Err(error),
+    };
+    if family && !capabilities.cursor_grok_bot {
         eprintln!("  This receiver does not support atomic Cursor/Grok Bot accounting. Both clients are excluded from this upload; their previously credited history is unchanged. Local statistics are unaffected. Upgrade the receiver to submit this family.");
     }
-    prepare_for_capability(payload, supported).context(
+    prepare_for_capability(payload, capabilities).context(
         "The receiver does not support Cursor/Grok Bot and no compatible usage remains; no usage was uploaded. Upgrade the receiver before retrying."
     )
 }
 
-fn prepare_for_capability(
+/// The payload a receiver with `capabilities` accepts, or `None` when only
+/// Cursor/Grok Bot usage was present and the receiver cannot take it.
+pub(crate) fn prepare_for_capability(
     payload: &TsTokenContributionData,
-    supported: bool,
+    capabilities: ReceiverCapabilities,
 ) -> Option<Cow<'_, TsTokenContributionData>> {
-    if supported || !touches_family(payload) {
+    let strip_family = !capabilities.cursor_grok_bot && touches_family(payload);
+    let strip_sessions = payload.sessions.as_ref().is_some_and(|sessions| {
+        !capabilities.sessions
+            || (!capabilities.cursor_grok_bot
+                && sessions.iter().any(|session| is_family(&session.client)))
+    });
+    if !strip_family && !strip_sessions {
         return Some(Cow::Borrowed(payload));
     }
+    let mut filtered = if strip_family {
+        without_family(payload)?
+    } else {
+        payload.clone()
+    };
+    if !capabilities.sessions {
+        filtered.sessions = None;
+    } else if !capabilities.cursor_grok_bot {
+        if let Some(sessions) = &mut filtered.sessions {
+            sessions.retain(|session| !is_family(&session.client));
+        }
+        filtered.sessions.take_if(|sessions| sessions.is_empty());
+    }
+    Some(Cow::Owned(filtered))
+}
+
+/// The payload with every Cursor/Grok Bot row removed and its totals rebuilt
+/// from what remains, or `None` when nothing remains.
+fn without_family(payload: &TsTokenContributionData) -> Option<TsTokenContributionData> {
     let mut filtered = payload.clone();
     if let Some(scope) = &mut filtered.scan_scope {
         scope.parser_versions.retain(|client, _| !is_family(client));
@@ -270,15 +320,67 @@ fn prepare_for_capability(
         start: days.iter().map(|day| &day.date).min().unwrap().clone(),
         end: days.iter().map(|day| &day.date).max().unwrap().clone(),
     };
-    Some(Cow::Owned(filtered))
+    Some(filtered)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        TsDailyContribution, TsDailyTotals, TsExportMeta, TsSourceContribution, TsTokenBreakdown,
+        TsDailyContribution, TsDailyTotals, TsExportMeta, TsSessionContribution, TsSessionModel,
+        TsSourceContribution, TsTokenBreakdown,
     };
+
+    const LEGACY: ReceiverCapabilities = ReceiverCapabilities {
+        cursor_grok_bot: false,
+        sessions: false,
+    };
+    const FAMILY: ReceiverCapabilities = ReceiverCapabilities {
+        cursor_grok_bot: true,
+        sessions: false,
+    };
+
+    fn with_sessions(
+        mut graph: TsTokenContributionData,
+        clients: &[&str],
+    ) -> TsTokenContributionData {
+        graph.sessions = Some(
+            clients
+                .iter()
+                .enumerate()
+                .map(|(index, client)| TsSessionContribution {
+                    session_id: format!("session-{index}"),
+                    client: client.to_string(),
+                    models: vec![TsSessionModel {
+                        model_id: format!("{client}-model"),
+                        provider_id: None,
+                    }],
+                    first_seen: 1_780_000_000_000,
+                    last_seen: 1_780_000_060_000,
+                    tokens: TsTokenBreakdown {
+                        input: 70,
+                        output: 20,
+                        cache_read: 5,
+                        cache_write: 4,
+                        reasoning: 1,
+                    },
+                    messages: 1,
+                    git_branch: Some("main".into()),
+                    repo_url: None,
+                })
+                .collect(),
+        );
+        graph
+    }
+
+    fn session_clients(json: &serde_json::Value) -> Vec<&str> {
+        json["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|session| session["client"].as_str().unwrap())
+            .collect()
+    }
 
     fn payload(clients: &[&str]) -> TsTokenContributionData {
         let mut graph = TsTokenContributionData {
@@ -320,6 +422,7 @@ mod tests {
             }),
             mcp_servers: Some(vec!["kept".into()]),
             provenance: None,
+            sessions: None,
         };
         for (index, client) in clients.iter().enumerate() {
             graph.contributions.push(TsDailyContribution {
@@ -369,7 +472,7 @@ mod tests {
     fn submit_compat_legacy_removes_family_everywhere_and_rebuilds_totals() {
         let original = payload(&["cursor", "grok-bot", "claude"]);
         let before = serde_json::to_value(&original).unwrap();
-        let filtered = prepare_for_capability(&original, false).unwrap();
+        let filtered = prepare_for_capability(&original, LEGACY).unwrap();
         let json = serde_json::to_value(&*filtered).unwrap();
         let wire = serde_json::to_string(&*filtered).unwrap();
         assert!(!wire.contains("grok-bot"));
@@ -418,7 +521,7 @@ mod tests {
             .map(|(client, date)| (client.to_string(), date.to_string()))
             .collect(),
         );
-        let filtered = prepare_for_capability(&original, false).unwrap();
+        let filtered = prepare_for_capability(&original, LEGACY).unwrap();
         let json = serde_json::to_value(&*filtered).unwrap();
         assert_eq!(
             json["scanScope"]["retentionFloors"],
@@ -431,7 +534,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .retention_floors = Some([("grok-bot".to_string(), "2026-10-07".to_string())].into());
-        let filtered = prepare_for_capability(&family_floors_only, false).unwrap();
+        let filtered = prepare_for_capability(&family_floors_only, LEGACY).unwrap();
         let json = serde_json::to_value(&*filtered).unwrap();
         assert!(json["scanScope"].get("retentionFloors").is_none());
     }
@@ -443,7 +546,7 @@ mod tests {
         let bot = original.contributions.pop().unwrap();
         retained.clients.extend(bot.clients);
         original.contributions.push(retained);
-        let filtered = prepare_for_capability(&original, false).unwrap();
+        let filtered = prepare_for_capability(&original, LEGACY).unwrap();
         assert_eq!(filtered.contributions.len(), 1);
         assert_eq!(filtered.contributions[0].totals.tokens, 100);
         assert_eq!(filtered.contributions[0].token_breakdown.reasoning, 1);
@@ -454,17 +557,24 @@ mod tests {
 
     #[test]
     fn submit_compat_legacy_family_only_has_no_post_payload() {
-        assert!(prepare_for_capability(&payload(&["cursor", "grok-bot"]), false).is_none());
-        assert!(prepare_for_capability(&payload(&["grok-bot"]), false).is_none());
+        assert!(prepare_for_capability(&payload(&["cursor", "grok-bot"]), LEGACY).is_none());
+        assert!(prepare_for_capability(&payload(&["grok-bot"]), LEGACY).is_none());
     }
 
     #[test]
     fn submit_compat_capable_and_unrelated_payloads_are_unchanged() {
-        for (input, supported) in [
-            (payload(&["cursor", "grok-bot", "claude"]), true),
-            (payload(&["claude"]), false),
+        for (input, capabilities) in [
+            (payload(&["cursor", "grok-bot", "claude"]), FAMILY),
+            (payload(&["claude"]), LEGACY),
+            (
+                with_sessions(payload(&["cursor", "claude"]), &["cursor", "claude"]),
+                ReceiverCapabilities {
+                    cursor_grok_bot: true,
+                    sessions: true,
+                },
+            ),
         ] {
-            let output = prepare_for_capability(&input, supported).unwrap();
+            let output = prepare_for_capability(&input, capabilities).unwrap();
             assert!(matches!(output, Cow::Borrowed(_)));
             assert_eq!(
                 serde_json::to_value(&*output).unwrap(),
@@ -479,7 +589,7 @@ mod tests {
         let scope = input.scan_scope.as_mut().unwrap();
         scope.parser_versions.insert("cursor".into(), 4);
         scope.parser_versions.insert("grok-bot".into(), 1);
-        let filtered = prepare_for_capability(&input, false).unwrap();
+        let filtered = prepare_for_capability(&input, LEGACY).unwrap();
         let json = serde_json::to_value(&*filtered).unwrap();
         assert_eq!(
             json["scanScope"]["parserVersions"],
@@ -491,26 +601,130 @@ mod tests {
 
     #[test]
     fn submit_compat_capability_requires_exact_atomic_pair() {
+        let capabilities = |body: serde_json::Value| {
+            parse_capabilities(StatusCode::OK, &serde_json::to_vec(&body).unwrap()).unwrap()
+        };
         let supported = serde_json::json!({"capabilities":{"cursorGrokBot":{"parserVersions":{"cursor":4,"grok-bot":1}}}});
-        assert!(supports_family(StatusCode::OK, &serde_json::to_vec(&supported).unwrap()).unwrap());
+        assert_eq!(capabilities(supported), FAMILY);
         for body in [
             serde_json::json!({}),
             serde_json::json!({"capabilities":{"cursorGrokBot":{"parserVersions":{"cursor":4}}}}),
             serde_json::json!({"capabilities":{"cursorGrokBot":{"parserVersions":{"cursor":5,"grok-bot":1}}}}),
         ] {
-            assert!(!supports_family(StatusCode::OK, &serde_json::to_vec(&body).unwrap()).unwrap());
+            assert!(!capabilities(body).cursor_grok_bot);
         }
-        assert!(!supports_family(StatusCode::NOT_FOUND, b"").unwrap());
-        assert!(!supports_family(StatusCode::METHOD_NOT_ALLOWED, b"").unwrap());
+        assert_eq!(
+            parse_capabilities(StatusCode::NOT_FOUND, b"").unwrap(),
+            LEGACY
+        );
+        assert_eq!(
+            parse_capabilities(StatusCode::METHOD_NOT_ALLOWED, b"").unwrap(),
+            LEGACY
+        );
         for status in [
             StatusCode::UNAUTHORIZED,
             StatusCode::FORBIDDEN,
             StatusCode::TOO_MANY_REQUESTS,
             StatusCode::INTERNAL_SERVER_ERROR,
         ] {
-            assert!(supports_family(status, b"{}").is_err());
+            assert!(parse_capabilities(status, b"{}").is_err());
         }
-        assert!(supports_family(StatusCode::OK, b"not-json").is_err());
+        assert!(parse_capabilities(StatusCode::OK, b"not-json").is_err());
+    }
+
+    #[test]
+    fn submit_compat_sessions_capability_requires_the_exact_version() {
+        let capabilities = |body: serde_json::Value| {
+            parse_capabilities(StatusCode::OK, &serde_json::to_vec(&body).unwrap()).unwrap()
+        };
+        assert_eq!(
+            capabilities(serde_json::json!({"capabilities":{"sessions":{"version":1}}})),
+            ReceiverCapabilities {
+                cursor_grok_bot: false,
+                sessions: true,
+            }
+        );
+        assert_eq!(
+            capabilities(serde_json::json!({"capabilities":{
+                "cursorGrokBot":{"parserVersions":{"cursor":4,"grok-bot":1}},
+                "sessions":{"version":1}
+            }})),
+            ReceiverCapabilities {
+                cursor_grok_bot: true,
+                sessions: true,
+            }
+        );
+        for body in [
+            serde_json::json!({"capabilities":{"sessions":{"version":2}}}),
+            serde_json::json!({"capabilities":{"sessions":{"version":"1"}}}),
+            serde_json::json!({"capabilities":{"sessions":true}}),
+        ] {
+            assert!(!capabilities(body).sessions);
+        }
+    }
+
+    #[test]
+    fn submit_compat_sessions_are_stripped_unless_supported() {
+        let input = with_sessions(payload(&["claude", "codex"]), &["claude", "codex"]);
+        for capabilities in [LEGACY, FAMILY] {
+            let output = prepare_for_capability(&input, capabilities).unwrap();
+            let json = serde_json::to_value(&*output).unwrap();
+            assert!(json.get("sessions").is_none(), "{capabilities:?}");
+            let mut expected = serde_json::to_value(&input).unwrap();
+            expected.as_object_mut().unwrap().remove("sessions");
+            assert_eq!(json, expected, "only sessions are removed");
+        }
+
+        let supported = ReceiverCapabilities {
+            cursor_grok_bot: false,
+            sessions: true,
+        };
+        let output = prepare_for_capability(&input, supported).unwrap();
+        assert!(matches!(output, Cow::Borrowed(_)));
+        assert_eq!(
+            session_clients(&serde_json::to_value(&*output).unwrap()),
+            ["claude", "codex"]
+        );
+    }
+
+    #[test]
+    fn submit_compat_unsupported_family_drops_family_sessions() {
+        let sessions_only = ReceiverCapabilities {
+            cursor_grok_bot: false,
+            sessions: true,
+        };
+        let input = with_sessions(
+            payload(&["cursor", "grok-bot", "claude"]),
+            &["cursor", "grok-bot", "claude"],
+        );
+        let output = prepare_for_capability(&input, sessions_only).unwrap();
+        let json = serde_json::to_value(&*output).unwrap();
+        assert_eq!(session_clients(&json), ["claude"]);
+        assert_eq!(json["summary"]["clients"], serde_json::json!(["claude"]));
+
+        // Sessions can name the family even when no daily row does.
+        let input = with_sessions(payload(&["claude"]), &["cursor", "grok-bot"]);
+        let output = prepare_for_capability(&input, sessions_only).unwrap();
+        let json = serde_json::to_value(&*output).unwrap();
+        assert!(json.get("sessions").is_none());
+        assert_eq!(
+            json["summary"],
+            serde_json::to_value(&input).unwrap()["summary"]
+        );
+    }
+
+    #[test]
+    fn submit_compat_unknown_session_capability_omits_sessions_and_still_uploads() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let input = with_sessions(payload(&["claude"]), &["claude"]);
+        let output = runtime
+            .block_on(prepare_submission(&format!("http://{address}"), &input))
+            .unwrap();
+        assert!(output.sessions.is_none());
+        assert_eq!(output.contributions.len(), input.contributions.len());
     }
 
     #[test]
@@ -558,7 +772,7 @@ mod tests {
             });
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let error = runtime
-                .block_on(receiver_supports_family(&format!("http://{address}")))
+                .block_on(receiver_capabilities(&format!("http://{address}")))
                 .unwrap_err();
             assert!(error.to_string().contains("exceeds 64 KiB"), "{error:#}");
             server.join().unwrap();

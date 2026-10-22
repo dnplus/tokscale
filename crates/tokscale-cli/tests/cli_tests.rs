@@ -7562,6 +7562,7 @@ fn test_codex_compressed_session_reports_usage() {
 /// One request seen by an [`UploadFixture`].
 #[derive(Debug, Clone)]
 struct FixtureRequest {
+    method: String,
     path: String,
     authorization: Option<String>,
 }
@@ -7613,14 +7614,9 @@ impl UploadFixture {
                     }
                 };
                 let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
-                let path = headers
-                    .lines()
-                    .next()
-                    .unwrap()
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap()
-                    .to_owned();
+                let mut request_line = headers.lines().next().unwrap().split_whitespace();
+                let method = request_line.next().unwrap().to_owned();
+                let path = request_line.next().unwrap().to_owned();
                 let header = |wanted: &str| {
                     headers.lines().find_map(|line| {
                         let (name, value) = line.split_once(':')?;
@@ -7637,6 +7633,7 @@ impl UploadFixture {
                     request.extend_from_slice(&buffer[..count]);
                 }
                 received.lock().unwrap().push(FixtureRequest {
+                    method,
                     path: path.clone(),
                     authorization: header("authorization"),
                 });
@@ -7680,10 +7677,11 @@ fn default_upload_response(path: &str, body: &[u8], username: &str) -> (u16, Str
     }
 }
 
-fn count_path(requests: &[FixtureRequest], path: &str) -> usize {
+/// Uploads to `path`. The capability probe a submit sends first is a GET.
+fn count_posts(requests: &[FixtureRequest], path: &str) -> usize {
     requests
         .iter()
-        .filter(|request| request.path == path)
+        .filter(|request| request.method == "POST" && request.path == path)
         .count()
 }
 
@@ -7780,8 +7778,8 @@ fn test_submit_and_autosubmit_share_default_quota_upload() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("Successfully submitted!"));
-        assert_eq!(count_path(&requests, "/api/submit"), 1);
-        assert_eq!(count_path(&requests, "/api/quota"), usize::from(!no_quota));
+        assert_eq!(count_posts(&requests, "/api/submit"), 1);
+        assert_eq!(count_posts(&requests, "/api/quota"), usize::from(!no_quota));
         assert_eq!(
             String::from_utf8_lossy(&output.stderr).contains("Warning: quota upload failed"),
             quota_status == 502
@@ -7859,6 +7857,58 @@ fn test_target_add_rejects_a_token_the_server_refuses() {
     assert!(!tmp.path().join(".config/tokscale/targets.json").exists());
 }
 
+/// Session metadata reaches only a receiver that advertises the sessions
+/// capability; an older receiver gets the same upload without it.
+#[test]
+fn test_submit_sends_sessions_only_to_receivers_that_advertise_them() {
+    for advertised in [true, false] {
+        let tmp = create_temp_fixture_dir();
+        prime_pricing_cache_with_a_priced_model(tmp.path());
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let seen = std::sync::Arc::clone(&uploads);
+        let server = UploadFixture::start(move |path, body| {
+            if path == "/api/submit" && body.is_empty() {
+                let capabilities = if advertised {
+                    r#"{"capabilities":{"sessions":{"version":1}}}"#
+                } else {
+                    r#"{"capabilities":{}}"#
+                };
+                return (200, capabilities.to_string());
+            }
+            if path == "/api/submit" {
+                seen.lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(body).unwrap());
+            }
+            default_upload_response(path, body, "fixture")
+        });
+
+        let output = upload_cmd(tmp.path(), &server.url)
+            .args(["submit", "--client", "opencode", "--no-quota"])
+            .output()
+            .unwrap();
+        let requests = server.finish();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(count_posts(&requests, "/api/submit"), 1);
+        let uploads = uploads.lock().unwrap();
+        let sessions = uploads[0].get("sessions");
+        if advertised {
+            let sessions = sessions.and_then(|value| value.as_array()).unwrap();
+            assert!(!sessions.is_empty());
+            assert!(sessions
+                .iter()
+                .all(|session| session["client"] == "opencode" && session["firstSeen"].is_i64()));
+        } else {
+            assert!(sessions.is_none(), "{:?}", uploads[0]);
+        }
+    }
+}
+
 /// Both entry points upload the same submission, and the quota reading, to the
 /// logged-in server and to every enabled extra target, each with its own token.
 #[test]
@@ -7894,12 +7944,16 @@ fn test_submit_and_autosubmit_upload_to_extra_targets() {
         assert!(output.status.success(), "{stdout}\n{stderr}");
         assert!(stdout.contains("Submitted to extra target pa."), "{stdout}");
         for (requests, token) in [(&primary, "fixture-token"), (&extra, "tt_pa_secret")] {
-            assert_eq!(count_path(requests, "/api/submit"), 1);
-            assert_eq!(count_path(requests, "/api/quota"), 1);
+            assert_eq!(count_posts(requests, "/api/submit"), 1);
+            assert_eq!(count_posts(requests, "/api/quota"), 1);
             let expected = format!("Bearer {token}");
+            // The capability probe carries no token; every upload carries this target's.
             assert!(requests
                 .iter()
-                .all(|request| request.authorization.as_deref() == Some(expected.as_str())));
+                .all(|request| match request.method.as_str() {
+                    "POST" => request.authorization.as_deref() == Some(expected.as_str()),
+                    _ => request.authorization.is_none(),
+                }));
         }
         assert!(disabled.is_empty(), "a disabled target must be skipped");
         let state = extra_target_state(tmp.path(), "pa");
@@ -7941,14 +7995,14 @@ fn test_extra_target_failure_does_not_fail_the_primary_upload() {
             "{stderr}"
         );
         assert!(!stderr.contains("tt_pa_secret"), "{stderr}");
-        assert_eq!(count_path(&primary, "/api/submit"), 1);
-        assert_eq!(count_path(&primary, "/api/quota"), 1);
+        assert_eq!(count_posts(&primary, "/api/submit"), 1);
+        assert_eq!(count_posts(&primary, "/api/quota"), 1);
         if refused {
             assert!(failing.is_empty());
         } else {
             assert!(stderr.contains("receiver unavailable"), "{stderr}");
-            assert_eq!(count_path(&failing, "/api/submit"), 1);
-            assert_eq!(count_path(&failing, "/api/quota"), 0);
+            assert_eq!(count_posts(&failing, "/api/submit"), 1);
+            assert_eq!(count_posts(&failing, "/api/quota"), 0);
         }
         let state = extra_target_state(tmp.path(), "pa");
         assert!(state["lastError"].is_string(), "{state}");
@@ -7976,9 +8030,9 @@ fn test_primary_failure_still_uploads_to_extra_targets() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(stderr.contains("primary down"), "{stderr}");
-    assert_eq!(count_path(&primary, "/api/submit"), 1);
-    assert_eq!(count_path(&extra, "/api/submit"), 1);
-    assert_eq!(count_path(&extra, "/api/quota"), 1);
+    assert_eq!(count_posts(&primary, "/api/submit"), 1);
+    assert_eq!(count_posts(&extra, "/api/submit"), 1);
+    assert_eq!(count_posts(&extra, "/api/quota"), 1);
     assert!(extra_target_state(tmp.path(), "pa")["lastSuccessAtMs"].is_number());
 }
 
@@ -8001,7 +8055,7 @@ fn test_extra_target_flags_select_targets_per_run() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(count_path(&primary, "/api/submit"), 1);
+    assert_eq!(count_posts(&primary, "/api/submit"), 1);
     assert!(extra.is_empty());
 
     // --extra-target names a disabled target for this run only.
@@ -8021,7 +8075,7 @@ fn test_extra_target_flags_select_targets_per_run() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(count_path(&extra, "/api/submit"), 1);
+    assert_eq!(count_posts(&extra, "/api/submit"), 1);
 
     // An unknown name fails before anything is uploaded.
     let tmp = create_temp_fixture_dir();
@@ -8067,7 +8121,7 @@ fn test_unreadable_targets_file_keeps_the_primary_upload() {
     );
     assert!(!stderr.contains("tt_leak"), "{stderr}");
     assert!(!named.status.success());
-    assert_eq!(count_path(&primary, "/api/submit"), 1);
+    assert_eq!(count_posts(&primary, "/api/submit"), 1);
 
     let status = upload_cmd(tmp.path(), "http://127.0.0.1:9")
         .args(["autosubmit", "status", "--json"])
@@ -8105,7 +8159,7 @@ fn test_extra_target_with_an_unsafe_url_is_skipped() {
         !stdout.contains("Submitting to extra target pa"),
         "{stdout}"
     );
-    assert_eq!(count_path(&primary, "/api/submit"), 1);
+    assert_eq!(count_posts(&primary, "/api/submit"), 1);
     assert!(!tmp
         .path()
         .join(".config/tokscale/targets-state.json")

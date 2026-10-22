@@ -182,6 +182,105 @@ pub struct UnifiedMessage {
     /// cache envelope so adding this does not change other clients' wire layout.
     #[serde(skip)]
     pub copilot_context: Option<copilot::CopilotContextProvenance>,
+    /// Where the session was working when this message was recorded. Kept out
+    /// of the positional cache layout; fork-owned envelopes store it beside
+    /// each entry instead.
+    #[serde(skip)]
+    pub session_context: SessionContext,
+}
+
+/// Working directory and repository a source recorded for a message. Parsers
+/// fill it through [`SessionContext::recorded`] and [`SessionContext::update`],
+/// which treat blank values as absent and strip credentials from `repo_url`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionContext {
+    pub cwd: Option<String>,
+    pub git_branch: Option<String>,
+    pub repo_url: Option<String>,
+}
+
+impl SessionContext {
+    pub fn recorded(cwd: Option<&str>, git_branch: Option<&str>, repo_url: Option<&str>) -> Self {
+        let mut context = Self::default();
+        context.update(cwd, git_branch, repo_url);
+        context
+    }
+
+    /// Overwrite each field the source recorded again, keeping the others.
+    pub fn update(&mut self, cwd: Option<&str>, git_branch: Option<&str>, repo_url: Option<&str>) {
+        if let Some(cwd) = non_blank(cwd) {
+            self.cwd = Some(cwd);
+        }
+        if let Some(git_branch) = non_blank(git_branch) {
+            self.git_branch = Some(git_branch);
+        }
+        if let Some(repo_url) = repo_url.and_then(sanitize_repo_url) {
+            self.repo_url = Some(repo_url);
+        }
+    }
+
+    /// Take the fields this copy of a message lacks from another copy of it.
+    pub(crate) fn fill_missing_from(&mut self, other: &Self) {
+        for (mine, theirs) in [
+            (&mut self.cwd, &other.cwd),
+            (&mut self.git_branch, &other.git_branch),
+            (&mut self.repo_url, &other.repo_url),
+        ] {
+            if mine.is_none() {
+                mine.clone_from(theirs);
+            }
+        }
+    }
+}
+
+/// Context fields are optional metadata on lines that also carry usage, so a
+/// wrongly typed value must read as absent rather than reject the whole line.
+pub(crate) fn deserialize_lenient_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Ok(
+        match Option::<serde_json::Value>::deserialize(deserializer)? {
+            Some(serde_json::Value::String(value)) => Some(value),
+            _ => None,
+        },
+    )
+}
+
+fn non_blank(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// A repository remote without userinfo, query or fragment. A scheme URL that
+/// does not parse is dropped rather than passed through, because it may still
+/// hold credentials. scp-like `git@host:org/repo.git` is not a URL and is kept.
+pub(crate) fn sanitize_repo_url(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if !raw.contains("://") {
+        // scp-like syntax names a user at most; a `:` before `@` is a password.
+        let password_like = raw
+            .split_once('@')
+            .is_some_and(|(userinfo, _)| userinfo.contains(':'));
+        return (!password_like).then(|| raw.to_owned());
+    }
+    let mut url = reqwest::Url::parse(raw)
+        .ok()
+        .filter(reqwest::Url::has_host)?;
+    // These fail only for schemes that cannot carry userinfo at all.
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.into())
 }
 
 const fn default_message_count() -> i32 {
@@ -463,6 +562,7 @@ impl UnifiedMessage {
             is_turn_start: false,
             model_attribution_conflicted: false,
             copilot_context: None,
+            session_context: SessionContext::default(),
             billing_identity: BillingIdentity::Unknown,
             pricing_model_id: None,
             estimate_status: EstimateStatus::Unpriced,
@@ -1201,6 +1301,53 @@ where
 mod tests {
     use super::*;
     use chrono::FixedOffset;
+
+    #[test]
+    fn repo_url_loses_credentials_query_and_fragment() {
+        for (raw, expected) in [
+            (
+                "https://user:tok@host/org/repo.git?x=1",
+                Some("https://host/org/repo.git"),
+            ),
+            (
+                "https://ghp_secret@github.com/org/repo.git#frag",
+                Some("https://github.com/org/repo.git"),
+            ),
+            (
+                "ssh://git@host:22/org/repo.git",
+                Some("ssh://host:22/org/repo.git"),
+            ),
+            (
+                "git@github.com:org/repo.git",
+                Some("git@github.com:org/repo.git"),
+            ),
+            ("  https://host/org/repo  ", Some("https://host/org/repo")),
+            // Not a URL we can clean, so it is not passed through.
+            ("https://user:tok@host:99999/repo", None),
+            ("user:secret@host:org/repo.git", None),
+            ("", None),
+            ("   ", None),
+        ] {
+            assert_eq!(sanitize_repo_url(raw).as_deref(), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn session_context_treats_blank_values_as_absent_and_updates_per_field() {
+        let mut context =
+            SessionContext::recorded(Some("/work/app"), Some(""), Some("https://u:p@h/r.git"));
+        assert_eq!(
+            context,
+            SessionContext {
+                cwd: Some("/work/app".into()),
+                git_branch: None,
+                repo_url: Some("https://h/r.git".into()),
+            }
+        );
+        context.update(Some("/work/app/sub"), None, Some("  "));
+        assert_eq!(context.cwd.as_deref(), Some("/work/app/sub"));
+        assert_eq!(context.repo_url.as_deref(), Some("https://h/r.git"));
+    }
 
     #[test]
     fn workspace_repo_root_strips_worktree_suffixes() {
