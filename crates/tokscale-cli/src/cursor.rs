@@ -119,8 +119,20 @@ fn old_cursor_credentials_path(home_dir: &Path) -> PathBuf {
     home_dir.join(".tokscale/cursor-credentials.json")
 }
 
+/// `TOKSCALE_CONFIG_DIR` relocates the cache only for the user's own home. An
+/// explicit `--home` or a test's scratch home stays hermetic, matching the
+/// scanner, which ignores env roots for an explicit home.
+fn cursor_cache_config_override(home_dir: &Path) -> Option<PathBuf> {
+    (crate::paths::is_config_dir_overridden()
+        && crate::paths::home_dir().as_deref() == Some(home_dir))
+    .then(crate::paths::get_config_dir)
+}
+
 fn cursor_cache_dir(home_dir: &Path) -> PathBuf {
-    home_dir.join(".config/tokscale/cursor-cache")
+    match cursor_cache_config_override(home_dir) {
+        Some(config_dir) => config_dir.join("cursor-cache"),
+        None => home_dir.join(".config/tokscale/cursor-cache"),
+    }
 }
 
 fn cursor_desktop_auto_import_disabled_path(home_dir: &Path) -> PathBuf {
@@ -305,6 +317,10 @@ pub struct SyncCursorResult {
 }
 
 fn migrate_cache_dir_from_old_path_in_home(home_dir: &Path) {
+    // The migration deletes the legacy dir; never pull it into an isolated root.
+    if cursor_cache_config_override(home_dir).is_some() {
+        return;
+    }
     let old_dir = old_cursor_cache_dir(home_dir);
     let new_dir = cursor_cache_dir(home_dir);
     if !new_dir.exists()
@@ -3500,6 +3516,29 @@ mod tests {
                 "an unusable XDG_CONFIG_HOME must fall back to home"
             );
         }
+    }
+
+    #[test]
+    #[serial]
+    fn test_cursor_cache_dir_follows_tokscale_config_dir_for_own_home() {
+        let config = TempDir::new().unwrap();
+        let scratch_home = TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set("TOKSCALE_CONFIG_DIR", config.path().to_str().unwrap());
+        let cache_dir = config.path().join("cursor-cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(cache_dir.join("usage.json"), "{}").unwrap();
+
+        let own_home = home_dir().unwrap();
+        assert_eq!(cursor_cache_dir(&own_home), cache_dir);
+        assert!(
+            has_cursor_usage_cache(),
+            "sync and reports must see the override cache"
+        );
+        assert_eq!(
+            cursor_cache_dir(scratch_home.path()),
+            scratch_home.path().join(".config/tokscale/cursor-cache"),
+            "an explicit home stays hermetic"
+        );
     }
 
     #[test]
