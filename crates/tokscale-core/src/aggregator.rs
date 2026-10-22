@@ -179,7 +179,8 @@ impl DailyFoldV2 {
     }
 }
 
-/// Aggregate messages into per-session contributions, keyed on `session_id`.
+/// Aggregate messages into per-session contributions, keyed on
+/// `(client, session_id)`: two clients may reuse one session id.
 ///
 /// Each returned [`SessionContributionV2`] sums all token buckets and cost for a
 /// single session and exposes the same client/model breakdown shape as
@@ -190,12 +191,12 @@ pub fn aggregate_by_session_v2(messages: Vec<UnifiedMessage>) -> Vec<SessionCont
         return Vec::new();
     }
 
-    let session_map: HashMap<String, SessionAccumulator> = messages
+    let session_map: HashMap<SessionKey, SessionAccumulator> = messages
         .into_par_iter()
         .fold(
             HashMap::new,
-            |mut acc: HashMap<String, SessionAccumulator>, msg| {
-                let entry = acc.entry(msg.session_id.clone()).or_default();
+            |mut acc: HashMap<SessionKey, SessionAccumulator>, msg| {
+                let entry = acc.entry(session_key(&msg)).or_default();
                 entry.add_message(&msg);
                 acc
             },
@@ -217,26 +218,29 @@ pub fn aggregate_by_session_v2(messages: Vec<UnifiedMessage>) -> Vec<SessionCont
 /// messages and drop each one after folding it, as [`DailyFoldV2`] does for days.
 #[derive(Default)]
 pub(crate) struct SessionFoldV2 {
-    sessions: HashMap<String, SessionAccumulator>,
+    sessions: HashMap<SessionKey, SessionAccumulator>,
+}
+
+/// A session is identified by its client and id together.
+type SessionKey = (String, String);
+
+fn session_key(message: &UnifiedMessage) -> SessionKey {
+    (message.client.clone(), message.session_id.clone())
 }
 
 impl SessionFoldV2 {
     pub(crate) fn add(&mut self, message: &UnifiedMessage) {
-        match self.sessions.get_mut(&message.session_id) {
-            Some(session) => session.add_message(message),
-            None => self
-                .sessions
-                .entry(message.session_id.clone())
-                .or_default()
-                .add_message(message),
-        }
+        self.sessions
+            .entry(session_key(message))
+            .or_default()
+            .add_message(message);
     }
 
     pub(crate) fn finish(self) -> Vec<SessionContributionV2> {
         let mut contributions: Vec<SessionContributionV2> = self
             .sessions
             .into_iter()
-            .map(|(session_id, acc)| acc.into_contribution(session_id))
+            .map(|((_, session_id), acc)| acc.into_contribution(session_id))
             .collect();
 
         // Most recently active first; stable sort by session_id when ties.
@@ -244,6 +248,7 @@ impl SessionFoldV2 {
             b.last_seen
                 .cmp(&a.last_seen)
                 .then_with(|| a.session_id.cmp(&b.session_id))
+                .then_with(|| a.client.cmp(&b.client))
         });
 
         contributions
@@ -855,11 +860,14 @@ impl SessionAccumulator {
         } else {
             msg.timestamp
         };
-        if secs < self.first_seen {
-            self.first_seen = secs;
-        }
-        if secs > self.last_seen {
-            self.last_seen = secs;
+        // A zero timestamp means "unknown", not 1970.
+        if secs > 0 {
+            if secs < self.first_seen {
+                self.first_seen = secs;
+            }
+            if secs > self.last_seen {
+                self.last_seen = secs;
+            }
         }
 
         let context = &msg.session_context;
@@ -1105,6 +1113,49 @@ mod tests {
 
         let parallel = aggregate_by_session_v2(messages.to_vec());
         assert_eq!(context_of(&parallel[0]), expected);
+    }
+
+    #[test]
+    fn sessions_with_one_id_in_two_clients_stay_separate() {
+        let message = |client: &str, tokens: i64| {
+            let mut m = mock_unified_message("2026-05-28", tokens, 0.1, "model", client);
+            m.session_id = "shared".to_string();
+            m.timestamp = 1_780_000_000_000;
+            m
+        };
+        let sessions = aggregate_by_session_v2(vec![
+            message("claude", 10),
+            message("codex", 20),
+            message("claude", 5),
+        ]);
+        assert_eq!(sessions.len(), 2);
+        let messages_of = |client: &str| {
+            sessions
+                .iter()
+                .find(|s| s.client == client)
+                .unwrap()
+                .totals
+                .messages
+        };
+        assert_eq!(messages_of("claude"), 2);
+        assert_eq!(messages_of("codex"), 1);
+    }
+
+    #[test]
+    fn zero_timestamps_do_not_set_first_or_last_seen() {
+        let message = |timestamp: i64| {
+            let mut m = mock_unified_message("2026-05-28", 10, 0.1, "model", "claude");
+            m.session_id = "s".to_string();
+            m.timestamp = timestamp;
+            m
+        };
+        let mixed = aggregate_by_session_v2(vec![message(0), message(1_780_000_000_000)]);
+        assert_eq!(mixed[0].first_seen, 1_780_000_000);
+        assert_eq!(mixed[0].last_seen, 1_780_000_000);
+        assert_eq!(mixed[0].totals.tokens, 20);
+
+        let only_zero = aggregate_by_session_v2(vec![message(0)]);
+        assert_eq!((only_zero[0].first_seen, only_zero[0].last_seen), (0, 0));
     }
 
     // Helper function to create mock UnifiedMessage
@@ -1983,9 +2034,8 @@ mod tests {
     }
 
     #[test]
-    fn test_aggregate_by_session_picks_top_client_by_cost() {
-        // Same session_id but two different clients — top-level fields should
-        // reflect the client with the larger cost share.
+    fn test_aggregate_by_session_keeps_clients_sharing_an_id_apart() {
+        // Same session_id but two different clients are two sessions.
         let small = TokenBreakdown {
             input: 10,
             output: 10,
@@ -2026,14 +2076,15 @@ mod tests {
         ];
 
         let result = aggregate_by_session_v2(messages);
-        assert_eq!(result.len(), 1);
+        assert_eq!(result.len(), 2);
+        // Most recently active first.
         assert_eq!(result[0].client, "codex");
         assert_eq!(result[0].provider, "openai");
         assert_eq!(result[0].model, "gpt-5");
-        // Per-client breakdown should preserve both clients.
-        assert_eq!(result[0].clients.len(), 2);
-        assert_eq!(result[0].clients[0].client, "codex");
-        assert!((result[0].totals.cost - 0.501).abs() < 1e-9);
+        assert_eq!(result[0].clients.len(), 1);
+        assert!((result[0].totals.cost - 0.50).abs() < 1e-9);
+        assert_eq!(result[1].client, "amp");
+        assert!((result[1].totals.cost - 0.001).abs() < 1e-9);
     }
 
     #[test]
