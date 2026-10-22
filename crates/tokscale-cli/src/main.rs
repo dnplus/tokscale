@@ -327,6 +327,13 @@ enum Commands {
         dry_run: bool,
         #[arg(
             long,
+            value_name = "PATH",
+            requires = "dry_run",
+            help = "With --dry-run, write the payload JSON to PATH and the legacy-receiver view beside it"
+        )]
+        print_payload: Option<PathBuf>,
+        #[arg(
+            long,
             help = "Disable automatic quota upload after a successful submit"
         )]
         no_quota: bool,
@@ -965,6 +972,7 @@ fn main() -> Result<()> {
             clients,
             date,
             dry_run,
+            print_payload,
             no_quota,
             extra_targets,
         }) => {
@@ -983,6 +991,7 @@ fn main() -> Result<()> {
                 until,
                 year,
                 dry_run,
+                print_payload.as_deref(),
                 no_quota,
                 &extra_targets,
                 SubmitMode::Interactive,
@@ -5253,6 +5262,9 @@ const AMP_SUBMISSION_PARSER_VERSION: u32 = 2;
 // selected surfaces declare this generation and cover the credited history.
 // This is a submission contract, independent of the on-disk parser cache version.
 const MICODE_SUBMISSION_PARSER_VERSION: u32 = 2;
+// Per-session metadata shape; sent only to receivers that advertise this exact
+// version, since older receivers may reject an unknown top-level key.
+const SESSIONS_SUBMISSION_VERSION: u32 = 1;
 
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -5292,6 +5304,76 @@ struct TsTokenContributionData {
     mcp_servers: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<TsSubmissionProvenance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sessions: Option<Vec<TsSessionContribution>>,
+}
+
+/// One agent session's usage and where it ran. This is the whole set of
+/// fields the receiver gets for a session: nothing from the conversation
+/// itself (titles, prompts, message text) is ever sent.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TsSessionContribution {
+    session_id: String,
+    client: String,
+    models: Vec<TsSessionModel>,
+    /// Unix milliseconds.
+    first_seen: i64,
+    /// Unix milliseconds.
+    last_seen: i64,
+    tokens: TsTokenBreakdown,
+    messages: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_url: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TsSessionModel {
+    model_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_id: Option<String>,
+}
+
+fn to_ts_session_contributions(
+    sessions: &[tokscale_core::SessionContributionV2],
+) -> Option<Vec<TsSessionContribution>> {
+    let sessions: Vec<TsSessionContribution> = sessions
+        .iter()
+        .filter(|session| !session.session_id.is_empty() && session.totals.tokens > 0)
+        .map(|session| TsSessionContribution {
+            session_id: session.session_id.clone(),
+            client: session.client.clone(),
+            models: session
+                .clients
+                .iter()
+                .map(|cell| TsSessionModel {
+                    model_id: cell.model_id.clone(),
+                    provider_id: (!cell.provider_id.is_empty()).then(|| cell.provider_id.clone()),
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            first_seen: session.first_seen.saturating_mul(1000),
+            last_seen: session.last_seen.saturating_mul(1000),
+            tokens: TsTokenBreakdown {
+                input: session.token_breakdown.input,
+                output: session.token_breakdown.output,
+                cache_read: session.token_breakdown.cache_read,
+                cache_write: session.token_breakdown.cache_write,
+                reasoning: session.token_breakdown.reasoning,
+            },
+            messages: session.totals.messages,
+            cwd: session.cwd.clone(),
+            git_branch: session.git_branch.clone(),
+            repo_url: session.repo_url.clone(),
+        })
+        .collect();
+    (!sessions.is_empty()).then_some(sessions)
 }
 
 fn to_ts_token_contribution_data(
@@ -5428,6 +5510,7 @@ fn to_ts_token_contribution_data(
             }
         },
         provenance: None,
+        sessions: to_ts_session_contributions(&graph.sessions),
     }
 }
 
@@ -6867,6 +6950,7 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
                 until,
                 year,
                 false,
+                None,
                 no_quota || settings.no_quota,
                 &extra_targets,
                 SubmitMode::Autosubmit,
@@ -6894,6 +6978,7 @@ fn run_submit_command(
     until: Option<String>,
     year: Option<String>,
     dry_run: bool,
+    print_payload: Option<&Path>,
     no_quota: bool,
     extra_target_flags: &extra_targets::ExtraTargetFlags,
     mode: SubmitMode,
@@ -7179,6 +7264,12 @@ fn run_submit_command(
     }
 
     if dry_run {
+        if let Some(path) = print_payload {
+            // Read-only device lookup: a dry run must not create device.json.
+            let device = device::existing_submit_device()?;
+            let payload = to_ts_token_contribution_data(&graph_result, device.as_ref(), scan_scope);
+            write_payload_preview(path, &payload)?;
+        }
         extra_plan.print_dry_run();
         println!("{}", "  Dry run - not submitting data.\n".yellow());
         return Ok(());
@@ -7221,6 +7312,72 @@ fn run_submit_command(
     }
 
     Ok(())
+}
+
+/// Write the payload `submit` would POST, plus what a receiver without any
+/// optional capability would get. Purely local: the receiver is never asked.
+fn write_payload_preview(path: &Path, payload: &TsTokenContributionData) -> Result<()> {
+    fn write_json(path: &Path, value: &TsTokenContributionData) -> Result<()> {
+        use anyhow::Context;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        std::fs::write(path, serde_json::to_vec_pretty(value)?)
+            .with_context(|| format!("failed to write {}", path.display()))
+    }
+
+    write_json(path, payload)?;
+    println!("  Full payload written to {}", path.display());
+    let legacy_path = legacy_payload_path(path);
+    match submit_compat::prepare_for_capability(
+        payload,
+        submit_compat::ReceiverCapabilities::default(),
+    ) {
+        Some(legacy) => {
+            write_json(&legacy_path, &legacy)?;
+            println!(
+                "  Legacy-receiver payload written to {}",
+                legacy_path.display()
+            );
+        }
+        None => println!(
+            "  A legacy receiver would get no payload: only Cursor/Grok Bot usage was found. {} was not written.",
+            legacy_path.display()
+        ),
+    }
+
+    let mut sessions_per_client = std::collections::BTreeMap::<&str, usize>::new();
+    for session in payload.sessions.iter().flatten() {
+        *sessions_per_client.entry(&session.client).or_default() += 1;
+    }
+    if sessions_per_client.is_empty() {
+        println!("  Sessions: none");
+    } else {
+        println!("  Sessions per client:");
+        for (client, count) in sessions_per_client {
+            println!("    {client}: {count}");
+        }
+    }
+    Ok(())
+}
+
+/// `payload-full.json` becomes `payload-legacy.json`; any other name gets
+/// `-legacy` before its extension.
+fn legacy_payload_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stem = stem.strip_suffix("-full").unwrap_or(&stem);
+    let file_name = match path.extension() {
+        Some(extension) => format!("{stem}-legacy.{}", extension.to_string_lossy()),
+        None => format!("{stem}-legacy"),
+    };
+    path.with_file_name(file_name)
 }
 
 /// POST a prepared payload to `/api/submit` and report the outcome. Shared by
@@ -8401,6 +8558,7 @@ mod tests {
             time_metrics: None,
             unpriced_submission_usage: Vec::new(),
             incomplete_cost_dates: std::collections::BTreeSet::new(),
+            sessions: Vec::new(),
         }
     }
 
@@ -9970,6 +10128,228 @@ mod tests {
             payload.device.as_ref().unwrap().name.as_deref(),
             Some("Test device")
         );
+    }
+
+    fn session_message(
+        session_id: &str,
+        model: &str,
+        provider: &str,
+        timestamp_ms: i64,
+        input: i64,
+    ) -> tokscale_core::UnifiedMessage {
+        let mut message = tokscale_core::UnifiedMessage::new(
+            "claude",
+            model,
+            provider,
+            session_id,
+            timestamp_ms,
+            TokenBreakdown {
+                input,
+                output: 2,
+                cache_read: 3,
+                cache_write: 4,
+                cache_write_1h: 0,
+                reasoning: 5,
+            },
+            0.1,
+        );
+        message.session_title = Some("Refactor the payment token flow".to_string());
+        message.session_context = tokscale_core::sessions::SessionContext::recorded(
+            Some("/Users/dev/work/app"),
+            Some("feature/sessions"),
+            Some("https://github.com/acme/app.git"),
+        );
+        message
+    }
+
+    fn graph_with_sessions(messages: Vec<tokscale_core::UnifiedMessage>) -> GraphResultV2 {
+        let mut graph = graph_result_with_contributions(vec![daily_contribution(
+            "2026-05-28",
+            100,
+            1.0,
+            "claude",
+            "claude-sonnet-4-5",
+        )]);
+        graph.sessions = tokscale_core::aggregate_by_session_v2(messages);
+        graph
+    }
+
+    #[test]
+    fn submit_payload_serializes_sessions_with_camel_case_keys_and_ms_timestamps() {
+        let graph = graph_with_sessions(vec![
+            session_message(
+                "s1",
+                "claude-sonnet-4-5",
+                "anthropic",
+                1_780_000_000_000,
+                10,
+            ),
+            session_message(
+                "s1",
+                "claude-sonnet-4-5",
+                "anthropic",
+                1_780_000_030_000,
+                20,
+            ),
+            session_message("s1", "claude-haiku-4-5", "", 1_780_000_090_000, 30),
+            // Neither of these is a reportable session.
+            session_message("", "claude-sonnet-4-5", "anthropic", 1_780_000_000_000, 10),
+            {
+                let mut empty = session_message("s2", "claude-sonnet-4-5", "anthropic", 1, 0);
+                empty.tokens = TokenBreakdown::default();
+                empty
+            },
+        ]);
+
+        let json = serde_json::to_value(to_ts_token_contribution_data(&graph, None, None)).unwrap();
+
+        assert_eq!(
+            json["sessions"],
+            serde_json::json!([{
+                "sessionId": "s1",
+                "client": "claude",
+                "models": [
+                    {"modelId": "claude-haiku-4-5"},
+                    {"modelId": "claude-sonnet-4-5", "providerId": "anthropic"}
+                ],
+                "firstSeen": 1_780_000_000_000_i64,
+                "lastSeen": 1_780_000_090_000_i64,
+                "tokens": {
+                    "input": 60,
+                    "output": 6,
+                    "cacheRead": 9,
+                    "cacheWrite": 12,
+                    "reasoning": 15
+                },
+                "messages": 3,
+                "cwd": "/Users/dev/work/app",
+                "gitBranch": "feature/sessions",
+                "repoUrl": "https://github.com/acme/app.git"
+            }])
+        );
+
+        let without = to_ts_token_contribution_data(&graph_with_sessions(Vec::new()), None, None);
+        assert!(without.sessions.is_none());
+        assert!(serde_json::to_value(without)
+            .unwrap()
+            .get("sessions")
+            .is_none());
+    }
+
+    #[test]
+    fn submit_payload_sessions_carry_no_conversation_content() {
+        fn keys<'a>(value: &'a serde_json::Value, found: &mut Vec<&'a str>) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    for (key, child) in object {
+                        found.push(key);
+                        keys(child, found);
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter().for_each(|item| keys(item, found)),
+                _ => {}
+            }
+        }
+
+        let graph = graph_with_sessions(vec![session_message(
+            "s1",
+            "claude-sonnet-4-5",
+            "anthropic",
+            1_780_000_000_000,
+            10,
+        )]);
+        let json = serde_json::to_value(to_ts_token_contribution_data(&graph, None, None)).unwrap();
+        let wire = json.to_string();
+        assert!(
+            !wire.contains("payment token flow"),
+            "the title must not be sent"
+        );
+
+        let mut found = Vec::new();
+        keys(&json, &mut found);
+        for forbidden in [
+            "title",
+            "sessionTitle",
+            "description",
+            "aiTitle",
+            "lastPrompt",
+            "prompt",
+            "content",
+            "token",
+            "apiKey",
+        ] {
+            assert!(
+                !found.contains(&forbidden),
+                "payload has a `{forbidden}` key"
+            );
+        }
+
+        let session = json["sessions"][0].as_object().unwrap();
+        let session_keys: std::collections::BTreeSet<&str> =
+            session.keys().map(String::as_str).collect();
+        assert_eq!(
+            session_keys,
+            [
+                "sessionId",
+                "client",
+                "models",
+                "firstSeen",
+                "lastSeen",
+                "tokens",
+                "messages",
+                "cwd",
+                "gitBranch",
+                "repoUrl",
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    #[test]
+    fn legacy_payload_path_replaces_full_suffix_or_appends_legacy() {
+        for (input, expected) in [
+            ("out/payload-full.json", "out/payload-legacy.json"),
+            ("out/payload.json", "out/payload-legacy.json"),
+            ("payload-full", "payload-legacy"),
+            ("payload", "payload-legacy"),
+            ("dir.d/full.json", "dir.d/full-legacy.json"),
+        ] {
+            assert_eq!(
+                legacy_payload_path(Path::new(input)),
+                PathBuf::from(expected),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn print_payload_requires_dry_run() {
+        assert!(Cli::try_parse_from([
+            "tokscale",
+            "--no-spinner",
+            "submit",
+            "--print-payload",
+            "payload-full.json"
+        ])
+        .is_err());
+        let cli = Cli::try_parse_from([
+            "tokscale",
+            "--no-spinner",
+            "submit",
+            "--dry-run",
+            "--print-payload",
+            "payload-full.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Submit {
+                dry_run: true,
+                print_payload: Some(path),
+                ..
+            }) if path == Path::new("payload-full.json")
+        ));
     }
 
     #[test]

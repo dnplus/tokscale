@@ -2125,6 +2125,7 @@ mod tests {
             pricing_model_id: None,
             estimate_status: tokscale_core::sessions::EstimateStatus::Unpriced,
             copilot_context: None,
+            session_context: Default::default(),
         };
 
         accumulate_session_entry(&mut entry, &msg, 0.0, "test-model", "test-model", true);

@@ -1,5 +1,6 @@
 use crate::clients::ClientId;
 use crate::sessions::codex::CodexParseState;
+use crate::sessions::SessionContext;
 use crate::UnifiedMessage;
 use bincode::Options;
 use rayon::prelude::*;
@@ -71,6 +72,17 @@ const _: () = assert!(COPILOT_CACHE_FORMAT_VERSION > CACHE_FORMAT_VERSION);
 const _: () = assert!(MICODE_CACHE_FORMAT_VERSION > CACHE_FORMAT_VERSION);
 const _: () = assert!(CLAUDE_CACHE_FORMAT_VERSION > CACHE_FORMAT_VERSION);
 const _: () = assert!(MICODE_CACHE_FORMAT_VERSION != CLAUDE_CACHE_FORMAT_VERSION);
+// Fork-owned envelopes wrap the upstream entry layout with per-message
+// `SessionContext`. The offset keeps their numbers clear of any upstream format;
+// an upstream layout bump moves them too and must add a decoder for the old
+// fork number, or Claude's retained history is discarded as stale.
+const FORK_SESSION_CONTEXT_FORMAT_OFFSET: u32 = 1000;
+const SESSION_CONTEXT_CACHE_FORMAT_VERSION: u32 =
+    CACHE_FORMAT_VERSION + FORK_SESSION_CONTEXT_FORMAT_OFFSET;
+const CLAUDE_SESSION_CONTEXT_CACHE_FORMAT_VERSION: u32 =
+    CLAUDE_CACHE_FORMAT_VERSION + FORK_SESSION_CONTEXT_FORMAT_OFFSET;
+const _: () =
+    assert!(SESSION_CONTEXT_CACHE_FORMAT_VERSION != CLAUDE_SESSION_CONTEXT_CACHE_FORMAT_VERSION);
 const LEGACY_CACHE_FORMAT_VERSION_V4: u32 = 4;
 const LEGACY_CACHE_FORMAT_VERSION_V5: u32 = 5;
 const LEGACY_CACHE_FORMAT_VERSION_V6: u32 = 6;
@@ -1039,6 +1051,7 @@ impl From<LegacyCodexStateV14> for CodexParseState {
             session_agent: state.session_agent,
             session_workspace_key: state.session_workspace_key,
             session_workspace_label: state.session_workspace_label,
+            session_context: Default::default(),
             forked_child_waiting_for_turn_context: state.forked_child_waiting_for_turn_context,
             forked_child_inherited_baseline: state.forked_child_inherited_baseline,
             forked_child_inherited_reported_total: state.forked_child_inherited_reported_total,
@@ -1180,6 +1193,7 @@ impl From<LegacyCodexStateV15> for CodexParseState {
             session_agent: state.session_agent,
             session_workspace_key: state.session_workspace_key,
             session_workspace_label: state.session_workspace_label,
+            session_context: Default::default(),
             forked_child_waiting_for_turn_context: state.forked_child_waiting_for_turn_context,
             forked_child_inherited_baseline: state.forked_child_inherited_baseline,
             forked_child_inherited_reported_total: state.forked_child_inherited_reported_total,
@@ -2124,9 +2138,17 @@ struct CacheShardKey {
 /// No generation marker is a real message index; the serialized layout is unchanged.
 // Generation 4 preserves record-over-session billing evidence when streamed
 // tool-result duplicates arrive in either order.
-const CLAUDE_RETAINED_PARSE_GENERATION: u32 = 4;
+// Generation 5 gives live rows the per-message session context (cwd, git
+// branch) that earlier entries never recorded.
+const CLAUDE_RETAINED_PARSE_GENERATION: u32 = 5;
 const CLAUDE_RETENTION_PROVENANCE_MARKER: usize =
-    usize::MAX - (CLAUDE_RETAINED_PARSE_GENERATION as usize - 1);
+    retention_marker(CLAUDE_RETAINED_PARSE_GENERATION);
+/// The first generation whose tool-result billing labels are order-independent.
+const CLAUDE_TOOL_RESULT_BILLING_GENERATION: u32 = 4;
+
+const fn retention_marker(generation: u32) -> usize {
+    usize::MAX - (generation as usize - 1)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CachedSourceEntry {
@@ -2299,6 +2321,7 @@ impl From<LegacyUnifiedMessageV7> for UnifiedMessage {
             session_title: message.session_title,
             parent_session_id: None,
             copilot_context: None,
+            session_context: Default::default(),
             is_turn_start: message.is_turn_start,
             model_attribution_conflicted: message.model_attribution_conflicted,
             billing_identity: crate::sessions::BillingIdentity::Unknown,
@@ -2388,6 +2411,7 @@ impl From<LegacyUnifiedMessageV8> for UnifiedMessage {
             session_title: message.session_title,
             parent_session_id: None,
             copilot_context: None,
+            session_context: Default::default(),
             is_turn_start: message.is_turn_start,
             model_attribution_conflicted: message.model_attribution_conflicted,
             billing_identity: crate::sessions::BillingIdentity::Unknown,
@@ -2475,6 +2499,7 @@ impl From<LegacyUnifiedMessageV9> for UnifiedMessage {
             session_title: message.session_title,
             parent_session_id: None,
             copilot_context: None,
+            session_context: Default::default(),
             is_turn_start: message.is_turn_start,
             model_attribution_conflicted: message.model_attribution_conflicted,
             billing_identity: crate::sessions::BillingIdentity::Unknown,
@@ -2635,6 +2660,7 @@ impl From<LegacyUnifiedMessageV10> for UnifiedMessage {
             is_turn_start: message.is_turn_start,
             model_attribution_conflicted: message.model_attribution_conflicted,
             copilot_context: None,
+            session_context: Default::default(),
             billing_identity: crate::sessions::BillingIdentity::Unknown,
             pricing_model_id: None,
             estimate_status: crate::sessions::EstimateStatus::Unpriced,
@@ -3124,7 +3150,11 @@ impl CachedSourceEntry {
     /// cache is the only history left, so preserve every row but clear only the
     /// affected scoped identity before repricing it.
     fn remove_legacy_claude_tool_result_billing(&mut self) -> bool {
-        if !self.needs_retention_provenance_migration() {
+        // Older generations have larger markers; no marker predates them all.
+        let predates_fix = self
+            .retention_provenance_marker()
+            .is_none_or(|marker| marker > retention_marker(CLAUDE_TOOL_RESULT_BILLING_GENERATION));
+        if !self.is_claude_namespace() || !predates_fix {
             return false;
         }
         let mut changed = false;
@@ -4085,6 +4115,39 @@ fn read_shard_with_limit_unchecked(
         };
     }
 
+    if envelope.format_version == CLAUDE_SESSION_CONTEXT_CACHE_FORMAT_VERSION {
+        if identity.namespace != ClientId::Claude.as_str() {
+            return ShardReadStatus::Stale;
+        }
+        type ClaudeWireEntry = (
+            CachedSourceEntry,
+            Option<crate::sessions::claudecode::ClaudeCheckpoint>,
+            Vec<SessionContext>,
+        );
+        return match bincode::options()
+            .with_limit(max_shard_bytes)
+            .deserialize::<Vec<ClaudeWireEntry>>(&envelope.payload)
+        {
+            Ok(entries) => {
+                let mut restored = Vec::with_capacity(entries.len());
+                for (mut entry, checkpoint, contexts) in entries {
+                    if !restore_session_contexts(&mut entry, contexts) {
+                        return ShardReadStatus::Invalid(
+                            "Claude session context length mismatch".into(),
+                        );
+                    }
+                    let checkpoint =
+                        checkpoint.filter(|checkpoint| checkpoint.has_valid_integrity());
+                    restored.push(entry.with_claude_checkpoint(checkpoint));
+                }
+                ShardReadStatus::Loaded(restored)
+            }
+            Err(error) => ShardReadStatus::Invalid(error.to_string()),
+        };
+    }
+
+    // The same entry layout without session context. These load with empty
+    // context; the retained-parse generation then rebuilds them from live bytes.
     if envelope.format_version == CLAUDE_CACHE_FORMAT_VERSION {
         if identity.namespace != ClientId::Claude.as_str() {
             return ShardReadStatus::Stale;
@@ -4318,6 +4381,30 @@ fn read_shard_with_limit_unchecked(
                 read_legacy_v10::<LegacyCodexIncrementalV15>(&envelope.payload, max_shard_bytes)
             }
         }
+        SESSION_CONTEXT_CACHE_FORMAT_VERSION => match bincode::options()
+            .with_limit(max_shard_bytes)
+            .deserialize::<Vec<SessionContextWireEntry>>(&envelope.payload)
+        {
+            Ok(entries) => {
+                let mut restored = Vec::with_capacity(entries.len());
+                for (mut entry, contexts, parse_context) in entries {
+                    if !restore_session_contexts(&mut entry, contexts) {
+                        return ShardReadStatus::Invalid("session context length mismatch".into());
+                    }
+                    if let (Some(incremental), Some(context)) =
+                        (entry.codex_incremental.as_mut(), parse_context)
+                    {
+                        incremental.state.session_context = context;
+                    }
+                    restored.push(entry);
+                }
+                ShardReadStatus::Loaded(restored)
+            }
+            Err(error) => ShardReadStatus::Invalid(error.to_string()),
+        },
+        CACHE_FORMAT_VERSION if reparses_for_session_context(identity.namespace) => {
+            ShardReadStatus::Stale
+        }
         CACHE_FORMAT_VERSION => match bincode::options()
             .with_limit(max_shard_bytes)
             .deserialize(&envelope.payload)
@@ -4327,6 +4414,47 @@ fn read_shard_with_limit_unchecked(
         },
         _ => ShardReadStatus::Stale,
     }
+}
+
+/// The fork's generic envelope entry: the upstream entry, one context per
+/// message, and a Codex entry's parse-state context, which cannot ride in its
+/// positionally encoded parse state.
+type SessionContextWireEntry = (
+    CachedSourceEntry,
+    Vec<SessionContext>,
+    Option<SessionContext>,
+);
+
+/// Namespaces whose parser records `SessionContext` and whose sources reparse
+/// without loss. Their shards from before the fork envelope read as stale, so
+/// each source reparses once instead of serving context-free rows until it
+/// next changes. Claude holds retained history and acquires context through
+/// `CLAUDE_RETAINED_PARSE_GENERATION` instead; Antigravity's databases are
+/// never cached.
+const SESSION_CONTEXT_REPARSE_NAMESPACES: &[ClientId] = &[ClientId::Codex];
+
+fn reparses_for_session_context(namespace: &str) -> bool {
+    SESSION_CONTEXT_REPARSE_NAMESPACES
+        .iter()
+        .any(|client| client.as_str() == namespace)
+}
+
+fn restore_session_contexts(entry: &mut CachedSourceEntry, contexts: Vec<SessionContext>) -> bool {
+    if entry.messages.len() != contexts.len() {
+        return false;
+    }
+    for (message, context) in entry.messages.iter_mut().zip(contexts) {
+        message.session_context = context;
+    }
+    true
+}
+
+fn message_session_contexts(entry: &CachedSourceEntry) -> Vec<&SessionContext> {
+    entry
+        .messages
+        .iter()
+        .map(|message| &message.session_context)
+        .collect()
 }
 
 // Version 10 already has complete retention provenance; unlike v4-v8, only
@@ -4399,15 +4527,31 @@ fn write_shard_with_limit(
     } else if is_claude {
         let entries: Vec<_> = entries
             .iter()
-            .map(|entry| (entry, &entry.claude_checkpoint))
+            .map(|entry| {
+                (
+                    entry,
+                    &entry.claude_checkpoint,
+                    message_session_contexts(entry),
+                )
+            })
             .collect();
         bincode::options()
             .with_limit(max_shard_bytes)
             .serialize(&entries)
     } else {
+        let entries: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                let parse_context = entry
+                    .codex_incremental
+                    .as_ref()
+                    .map(|incremental| &incremental.state.session_context);
+                (entry, message_session_contexts(entry), parse_context)
+            })
+            .collect();
         bincode::options()
             .with_limit(max_shard_bytes)
-            .serialize(entries)
+            .serialize(&entries)
     }
     .map_err(std::io::Error::other)?;
     let envelope = CachedShardEnvelope {
@@ -4416,9 +4560,9 @@ fn write_shard_with_limit(
         } else if is_micode {
             MICODE_CACHE_FORMAT_VERSION
         } else if is_claude {
-            CLAUDE_CACHE_FORMAT_VERSION
+            CLAUDE_SESSION_CONTEXT_CACHE_FORMAT_VERSION
         } else {
-            CACHE_FORMAT_VERSION
+            SESSION_CONTEXT_CACHE_FORMAT_VERSION
         },
         parser_namespace: identity.namespace.to_string(),
         parser_version: identity.parser_version,
@@ -4843,6 +4987,8 @@ mod tests {
         assert_eq!(resumed.iter().map(|m| m.tokens.total()).sum::<i64>(), 660);
         // Historical rows intentionally have no inferred billing identity; a
         // complete identity backfill is a separate cache-loader operation.
+        // Neither they nor the parse state migrated with them record session
+        // context; that backfill's full reparse supplies it.
         // The frozen producer ran in UTC; newly parsed display dates follow
         // the host timezone. Compare copies in one zone without changing the
         // historical payload or the process-global timezone.
@@ -4850,6 +4996,7 @@ mod tests {
             actual.rebucket_date(&fixture_timezone);
             fresh.rebucket_date(&fixture_timezone);
             fresh.billing_identity = actual.billing_identity.clone();
+            fresh.session_context = actual.session_context.clone();
             assert_eq!(actual, fresh);
         }
         assert_eq!(fresh.state.turn_coverage, settled.state.turn_coverage);
@@ -9755,7 +9902,10 @@ mod tests {
         let envelope: CachedShardEnvelope = bincode::options()
             .deserialize_from(BufReader::new(File::open(&shard).unwrap()))
             .unwrap();
-        assert_eq!(envelope.format_version, CLAUDE_CACHE_FORMAT_VERSION);
+        assert_eq!(
+            envelope.format_version,
+            CLAUDE_SESSION_CONTEXT_CACHE_FORMAT_VERSION
+        );
         let ShardReadStatus::Loaded(entries) = read_shard(&shard, identity) else {
             panic!("a Claude envelope loads");
         };
@@ -9815,6 +9965,289 @@ mod tests {
             "retention provenance survives"
         );
         assert!(entries[0].claude_checkpoint.is_none());
+    }
+
+    fn context(cwd: &str, branch: &str) -> SessionContext {
+        SessionContext::recorded(Some(cwd), Some(branch), Some("https://host/org/repo.git"))
+    }
+
+    fn envelope_version(shard: &Path) -> u32 {
+        bincode::options()
+            .deserialize_from::<_, CachedShardEnvelope>(BufReader::new(File::open(shard).unwrap()))
+            .unwrap()
+            .format_version
+    }
+
+    fn write_envelope<T: Serialize>(
+        shard: &Path,
+        identity: CacheIdentity,
+        format_version: u32,
+        payload: &T,
+    ) {
+        let envelope = CachedShardEnvelope {
+            format_version,
+            parser_namespace: identity.namespace.to_string(),
+            parser_version: identity.parser_version,
+            payload: bincode::options().serialize(payload).unwrap(),
+        };
+        std::fs::write(shard, bincode::options().serialize(&envelope).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn session_context_survives_the_generic_envelope_with_codex_parse_state() {
+        let dir = TempDir::new().unwrap();
+        let identity = CacheIdentity::for_client(ClientId::Codex);
+        let source = write_temp_file(b"{}\n");
+        let mut entry = test_entry(identity, source.path(), "codex-session");
+        entry.messages[0].session_context = context("/work/app", "main");
+        let mut state = CodexParseState::default();
+        state.session_context = context("/work/app/crates", "main");
+        entry.codex_incremental = Some(CodexIncrementalCache {
+            state,
+            consumed_offset: 3,
+            ends_with_newline: true,
+            prefix_hash: [7; 32],
+        });
+        let shard = dir.path().join("codex.bin");
+
+        write_shard_with_limit(
+            &shard,
+            identity,
+            std::slice::from_ref(&entry),
+            MAX_CACHE_SHARD_BYTES,
+        )
+        .unwrap();
+
+        assert_eq!(
+            envelope_version(&shard),
+            SESSION_CONTEXT_CACHE_FORMAT_VERSION
+        );
+        let ShardReadStatus::Loaded(restored) = read_shard(&shard, identity) else {
+            panic!("the fork's generic envelope loads");
+        };
+        assert_eq!(restored[0].messages, entry.messages);
+        assert_eq!(
+            restored[0].messages[0].session_context,
+            context("/work/app", "main")
+        );
+        assert_eq!(
+            restored[0]
+                .codex_incremental
+                .as_ref()
+                .unwrap()
+                .state
+                .session_context,
+            context("/work/app/crates", "main"),
+            "an incremental resume continues with the context the parse ended in"
+        );
+    }
+
+    #[test]
+    fn session_context_survives_the_claude_envelope_with_its_checkpoint() {
+        let dir = TempDir::new().unwrap();
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let mut entry = claude_checkpointed_entry(&dir);
+        entry.messages[0].session_context = context("/work/app", "feature/x");
+        let shard = dir.path().join("claude.bin");
+
+        write_shard_with_limit(
+            &shard,
+            identity,
+            std::slice::from_ref(&entry),
+            MAX_CACHE_SHARD_BYTES,
+        )
+        .unwrap();
+
+        assert_eq!(
+            envelope_version(&shard),
+            CLAUDE_SESSION_CONTEXT_CACHE_FORMAT_VERSION
+        );
+        let ShardReadStatus::Loaded(restored) = read_shard(&shard, identity) else {
+            panic!("the fork's Claude envelope loads");
+        };
+        assert_eq!(
+            restored[0].messages[0].session_context,
+            context("/work/app", "feature/x")
+        );
+        assert!(restored[0].claude_checkpoint.is_some());
+        assert_eq!(restored[0].claude_checkpoint, entry.claude_checkpoint);
+    }
+
+    #[test]
+    fn pre_context_generic_shard_loads_except_where_a_reparse_adds_context() {
+        let dir = TempDir::new().unwrap();
+        let source = write_temp_file(b"{}\n");
+        let shard = dir.path().join("generic.bin");
+        for (client, reparses) in [(ClientId::Gemini, false), (ClientId::Codex, true)] {
+            let identity = CacheIdentity::for_client(client);
+            let entry = test_entry(identity, source.path(), "session");
+            write_envelope(&shard, identity, CACHE_FORMAT_VERSION, &vec![&entry]);
+
+            match read_shard(&shard, identity) {
+                ShardReadStatus::Stale => assert!(reparses, "{client:?} must keep its cache"),
+                ShardReadStatus::Loaded(entries) => {
+                    assert!(!reparses, "{client:?} must reparse to acquire context");
+                    assert_eq!(entries[0].messages, entry.messages);
+                    assert_eq!(
+                        entries[0].messages[0].session_context,
+                        SessionContext::default()
+                    );
+                }
+                _ => panic!("{client:?}: unexpected shard status"),
+            }
+        }
+    }
+
+    #[test]
+    fn pre_context_claude_envelope_loads_with_retained_rows_for_a_rebuild() {
+        let dir = TempDir::new().unwrap();
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let mut entry = claude_checkpointed_entry(&dir);
+        entry
+            .messages
+            .push(keyed_message("claude", "session", "msg_old:req_old"));
+        entry.fallback_timestamp_indices = vec![1, retention_marker(4)];
+        let shard = dir.path().join("claude-v13.bin");
+        write_envelope(
+            &shard,
+            identity,
+            CLAUDE_CACHE_FORMAT_VERSION,
+            &vec![(&entry, &entry.claude_checkpoint)],
+        );
+
+        let ShardReadStatus::Loaded(entries) = read_shard(&shard, identity) else {
+            panic!("a format-{CLAUDE_CACHE_FORMAT_VERSION} Claude shard still loads");
+        };
+        assert_eq!(entries[0].messages, entry.messages);
+        assert_eq!(
+            entries[0].retained_message_keys(),
+            HashSet::from(["msg_old:req_old".to_string()])
+        );
+        assert!(entries[0]
+            .messages
+            .iter()
+            .all(|message| message.session_context == SessionContext::default()));
+        assert!(
+            entries[0].needs_retention_provenance_migration(),
+            "generation 4 entries rebuild once to acquire context"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn generation_rebuild_adds_context_to_live_claude_rows_and_keeps_retained_history() {
+        let dir = TempDir::new().unwrap();
+        let _env = sandbox_cache_env(dir.path());
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let source = dir.path().join(".claude/projects/app/s1.jsonl");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(
+            &source,
+            concat!(
+                r#"{"type":"assistant","timestamp":"2026-05-28T10:00:01.000Z","requestId":"req_1","cwd":"/work/app","gitBranch":"main","message":{"id":"msg_1","model":"claude-sonnet-4-5","usage":{"input_tokens":10,"output_tokens":1}}}"#,
+                "\n",
+                r#"{"type":"assistant","timestamp":"2026-05-28T10:05:00.000Z","requestId":"req_2","cwd":"/work/app","gitBranch":"feature/x","message":{"id":"msg_2","model":"claude-sonnet-4-5","usage":{"input_tokens":20,"output_tokens":2}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let scan = || {
+            let mut messages = crate::parse_all_messages_with_pricing_with_env_strategy(
+                dir.path().to_str().unwrap(),
+                &["claude".to_string()],
+                None,
+                false,
+                &crate::scanner::ScannerSettings {
+                    bucket_timezone: Some("UTC".to_string()),
+                    ..Default::default()
+                },
+            );
+            messages.sort_by(|a, b| a.dedup_key.cmp(&b.dedup_key));
+            messages
+        };
+        scan();
+
+        // What a generation-4 build left behind: no context anywhere, plus a
+        // compacted-away turn that only the cache still holds.
+        let mut entry = SourceMessageCache::load().get(identity, &source).unwrap();
+        for message in &mut entry.messages {
+            message.session_context = SessionContext::default();
+        }
+        let mut retained = keyed_message("claude", "s1", "msg_old:req_old");
+        retained.set_timestamp(1_779_900_000_000);
+        entry.messages.push(retained);
+        entry.fallback_timestamp_indices = vec![entry.messages.len() - 1, retention_marker(4)];
+        let entry = entry.with_claude_checkpoint(None);
+        let mut cache = SourceMessageCache::load();
+        cache.insert(entry);
+        cache.save_if_dirty();
+        drop(cache);
+        assert!(SourceMessageCache::load()
+            .get(identity, &source)
+            .unwrap()
+            .needs_retention_provenance_migration());
+
+        let rebuilt = scan();
+
+        let summary: Vec<_> = rebuilt
+            .iter()
+            .map(|message| {
+                (
+                    message.dedup_key.as_deref().unwrap(),
+                    message.session_context.cwd.as_deref(),
+                    message.session_context.git_branch.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("msg_1:req_1", Some("/work/app"), Some("main")),
+                ("msg_2:req_2", Some("/work/app"), Some("feature/x")),
+                ("msg_old:req_old", None, None),
+            ]
+        );
+        let entry = SourceMessageCache::load().get(identity, &source).unwrap();
+        assert!(!entry.needs_retention_provenance_migration());
+        assert_eq!(
+            entry.retained_message_keys(),
+            HashSet::from(["msg_old:req_old".to_string()])
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn missing_generation_four_claude_history_keeps_tool_result_billing() {
+        let home = TempDir::new().unwrap();
+        let _env = sandbox_cache_env(home.path());
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let source = write_temp_file(b"synthetic Claude source");
+        let path = source.path().to_path_buf();
+        let mut tool = keyed_message(
+            "claude",
+            "session",
+            "claude:tool_result:session:tool_result:toolu_billing",
+        );
+        let billing = crate::sessions::BillingIdentity::Known {
+            id: "record-route".into(),
+            origin: crate::sessions::BillingIdentityOrigin::ExplicitRecord,
+        };
+        tool.billing_identity = billing.clone();
+        let retained = keyed_message("claude", "session", "retained:req");
+        let mut entry = entry_with_messages(identity, &path, vec![tool, retained]);
+        entry.fallback_timestamp_indices = vec![1, retention_marker(4)];
+        let mut cache = SourceMessageCache::load();
+        cache.insert(entry);
+        cache.save_if_dirty();
+        drop(source);
+
+        let repaired = SourceMessageCache::load()
+            .get(identity, &path)
+            .expect("retained history remains available without its source");
+        assert_eq!(
+            repaired.messages[0].billing_identity, billing,
+            "generation 4 already merged tool-result billing in either order"
+        );
     }
 
     #[test]
@@ -10004,7 +10437,10 @@ mod tests {
         let mut envelope: CachedShardEnvelope = bincode::options()
             .deserialize_from(BufReader::new(File::open(&path).unwrap()))
             .unwrap();
-        assert_eq!(envelope.format_version, CLAUDE_CACHE_FORMAT_VERSION);
+        assert_eq!(
+            envelope.format_version,
+            CLAUDE_SESSION_CONTEXT_CACHE_FORMAT_VERSION
+        );
         envelope.format_version = MICODE_CACHE_FORMAT_VERSION;
         std::fs::write(&path, bincode::options().serialize(&envelope).unwrap()).unwrap();
         // Version 12 is also the released Claude checkpoint envelope. A new

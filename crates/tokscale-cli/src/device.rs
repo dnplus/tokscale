@@ -26,42 +26,51 @@ struct StoredDevice {
 }
 
 pub fn resolve_submit_device() -> Result<SubmitDevice> {
-    if let Some(id) = env_value(DEVICE_ID_ENV) {
-        return Ok(SubmitDevice {
-            id: validate_device_id(&id)?,
-            name: env_value(DEVICE_NAME_ENV)
-                .map(|name| validate_device_name(&name))
-                .transpose()?,
-        });
+    if let Some(device) = existing_submit_device()? {
+        return Ok(device);
     }
 
-    let path = device_file_path();
     let name_override = env_value(DEVICE_NAME_ENV)
         .map(|name| validate_device_name(&name))
         .transpose()?;
-
-    if path.exists() {
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let stored: StoredDevice = serde_json::from_str(&content)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
-        return Ok(SubmitDevice {
-            id: validate_device_id(&stored.id)?,
-            name: name_override.or(stored.name),
-        });
-    }
-
     let stored = StoredDevice {
         id: format!("dev_{}", Uuid::new_v4().simple()),
         name: name_override,
         created_at: Utc::now().to_rfc3339(),
     };
-    write_stored_device(&path, &stored)?;
+    write_stored_device(&device_file_path(), &stored)?;
 
     Ok(SubmitDevice {
         id: stored.id,
         name: stored.name,
     })
+}
+
+/// The device a submit would use, from the environment or `device.json`,
+/// without creating one.
+pub fn existing_submit_device() -> Result<Option<SubmitDevice>> {
+    let name_override = env_value(DEVICE_NAME_ENV)
+        .map(|name| validate_device_name(&name))
+        .transpose()?;
+    if let Some(id) = env_value(DEVICE_ID_ENV) {
+        return Ok(Some(SubmitDevice {
+            id: validate_device_id(&id)?,
+            name: name_override,
+        }));
+    }
+
+    let path = device_file_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let stored: StoredDevice = serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(Some(SubmitDevice {
+        id: validate_device_id(&stored.id)?,
+        name: name_override.or(stored.name),
+    }))
 }
 
 /// Save `name` as this machine's device label in `device.json`, creating the

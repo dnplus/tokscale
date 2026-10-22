@@ -175,6 +175,9 @@ impl From<SessionContribution> for crate::SessionContributionV2 {
             clients: value.clients.into_iter().map(Into::into).collect(),
             first_seen: value.first_seen,
             last_seen: value.last_seen,
+            cwd: None,
+            git_branch: None,
+            repo_url: None,
         }
     }
 }
@@ -261,6 +264,7 @@ impl From<GraphResult> for crate::GraphResultV2 {
             time_metrics: value.time_metrics,
             unpriced_submission_usage: value.unpriced_submission_usage,
             incomplete_cost_dates: value.incomplete_cost_dates,
+            sessions: Vec::new(),
         }
     }
 }
