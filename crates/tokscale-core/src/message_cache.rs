@@ -10000,8 +10000,10 @@ mod tests {
         let source = write_temp_file(b"{}\n");
         let mut entry = test_entry(identity, source.path(), "codex-session");
         entry.messages[0].session_context = context("/work/app", "main");
-        let mut state = CodexParseState::default();
-        state.session_context = context("/work/app/crates", "main");
+        let state = CodexParseState {
+            session_context: context("/work/app/crates", "main"),
+            ..Default::default()
+        };
         entry.codex_incremental = Some(CodexIncrementalCache {
             state,
             consumed_offset: 3,
