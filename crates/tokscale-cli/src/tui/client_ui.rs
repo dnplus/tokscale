@@ -81,8 +81,8 @@ pub const CLIENT_UI: [ClientUi; ClientId::COUNT] = [
     // uppercase) and `m`/`M`, `i`/`I` are too, so `T` takes the next free
     // letter from "misTral".
     ClientUi { hotkey: 'T' },
-    // Grok Bot: distinct from Grok Build and its uppercase variants.
     ClientUi { hotkey: 'J' },
+    ClientUi { hotkey: 'Z' },
 ];
 
 pub fn display_name(client: ClientId) -> &'static str {

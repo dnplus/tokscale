@@ -9,9 +9,11 @@ pub mod content_extractor;
 pub mod fs_atomic;
 pub mod http;
 mod legacy_graph;
+pub mod machine_label;
 pub mod mcp;
 mod message_cache;
 pub mod model_alias;
+pub mod network;
 pub mod opencode_model_name;
 mod parser;
 pub mod paths;
@@ -56,6 +58,28 @@ static RETENTION_PROVENANCE_REBUILDS: std::sync::atomic::AtomicUsize =
 /// assert on its own transcript while others run alongside it.
 #[cfg(test)]
 static CLAUDE_RESUMED_PATHS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Runs between a SQLite lane's scan and its stability re-check, so a test can
+/// commit a write exactly where a live client does: after the scan has read
+/// the database, before the loader decides whether that read was stable.
+#[cfg(test)]
+type PathScopedSqliteScanHook = Option<(PathBuf, fn(&Path))>;
+
+#[cfg(test)]
+static AFTER_SQLITE_SCAN_HOOK: Mutex<PathScopedSqliteScanHook> = Mutex::new(None);
+
+#[cfg(test)]
+fn run_after_sqlite_scan_hook(path: &Path) {
+    let hook = AFTER_SQLITE_SCAN_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|(expected_path, _)| expected_path == path)
+        .map(|(_, hook)| *hook);
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
 
 /// Strip a CLIProxyAPI-style `(level)` reasoning-effort suffix from a model id.
 ///
@@ -220,6 +244,8 @@ pub enum GroupBy {
     WorkspaceModel,
     Session,
     ClientSession,
+    /// Machine label (see [`machine_label`]), then model.
+    MachineModel,
 }
 
 impl std::fmt::Display for GroupBy {
@@ -231,6 +257,7 @@ impl std::fmt::Display for GroupBy {
             GroupBy::WorkspaceModel => write!(f, "workspace,model"),
             GroupBy::Session => write!(f, "session,model"),
             GroupBy::ClientSession => write!(f, "client,session,model"),
+            GroupBy::MachineModel => write!(f, "machine,model"),
         }
     }
 }
@@ -249,8 +276,9 @@ impl std::str::FromStr for GroupBy {
             "client,session" | "client-session" | "client,session,model" | "client-session-model" => {
                 Ok(GroupBy::ClientSession)
             }
+            "machine,model" | "machine-model" => Ok(GroupBy::MachineModel),
             _ => Err(format!(
-                "Invalid group-by value: '{}'. Valid options: model, client,model, client,provider,model, workspace,model, session,model, client,session,model",
+                "Invalid group-by value: '{}'. Valid options: model, client,model, client,provider,model, workspace,model, session,model, client,session,model, machine,model",
                 s
             )),
         }
@@ -697,6 +725,108 @@ pub struct GraphResultV2 {
     /// Per-session aggregates, filled only for submission graphs.
     #[serde(skip)]
     pub sessions: Vec<SessionContributionV2>,
+    /// Per-client evidence of what the previous parser generation counted on
+    /// top of this snapshot, computed from the same bytes. Submission-only
+    /// protocol metadata; see [`ClientRecountProof`].
+    #[serde(skip)]
+    pub recount_proofs: BTreeMap<String, ClientRecountProof>,
+    /// How many discovered session sources each client could and could not
+    /// read during this scan. Submission uses it to withhold full-history
+    /// authority from a client whose history was only partially read.
+    #[serde(skip)]
+    pub source_reads: BTreeMap<String, SourceReadSummary>,
+}
+
+/// One (day, model) cell of a recount proof: the usage a parser generation
+/// attributes to that cell.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct RecountProofCell {
+    pub tokens: TokenBreakdown,
+    pub cost: f64,
+    pub messages: i32,
+}
+
+impl RecountProofCell {
+    fn add(&mut self, message: &UnifiedMessage) {
+        self.tokens.input += message.tokens.input.max(0);
+        self.tokens.output += message.tokens.output.max(0);
+        self.tokens.cache_read += message.tokens.cache_read.max(0);
+        self.tokens.cache_write += message.tokens.cache_write.max(0);
+        self.tokens.cache_write_1h += message.tokens.cache_write_1h.max(0);
+        self.tokens.reasoning += message.tokens.reasoning.max(0);
+        self.cost += message.cost.max(0.0);
+        self.messages += message.message_count.max(0);
+    }
+}
+
+/// What two parser generations count for one (day, model) cell when both read
+/// the same bytes.
+///
+/// `corrected` is what this scan submits for the cell. `previous` is what the
+/// generation the receiver may still have stored would have counted from the
+/// same rows, so `previous - corrected` is exactly the usage that older
+/// generation over-counted. A receiver that subtracts only that difference can
+/// heal a stored cell without ever deleting usage it has no evidence about —
+/// a source that failed to open contributes to neither side and so is left
+/// untouched.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct RecountProofEntry {
+    pub previous: RecountProofCell,
+    pub corrected: RecountProofCell,
+}
+
+/// `date -> model id -> proof`, dated and keyed exactly as the contributions
+/// this scan submits (same bucketing timezone, same model normalization).
+pub type ClientRecountProof = BTreeMap<String, BTreeMap<String, RecountProofEntry>>;
+
+/// Discovered-versus-readable session sources for one client in one scan.
+///
+/// Path-free on purpose: the submission protocol only needs to know whether
+/// the client's declared history is complete, never where it lives.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SourceReadSummary {
+    pub discovered: usize,
+    pub unreadable: usize,
+}
+
+impl SourceReadSummary {
+    /// True when every discovered source was read, including when none exists.
+    pub fn complete(self) -> bool {
+        self.unreadable == 0
+    }
+}
+
+/// Accumulates a [`ClientRecountProof`] while a client's rows are deduplicated.
+#[derive(Default)]
+struct RecountProofBuilder {
+    proof: ClientRecountProof,
+}
+
+impl RecountProofBuilder {
+    fn cell(&mut self, date: &str, model_id: &str) -> &mut RecountProofEntry {
+        self.proof
+            .entry(date.to_string())
+            .or_default()
+            .entry(model_id.to_string())
+            .or_default()
+    }
+
+    /// A row the current generation counts. Both generations counted it.
+    fn record_kept(&mut self, date: &str, model_id: &str, message: &UnifiedMessage) {
+        let entry = self.cell(date, model_id);
+        entry.previous.add(message);
+        entry.corrected.add(message);
+    }
+
+    /// A row the current generation drops as a duplicate that the previous
+    /// generation counted.
+    fn record_duplicate(&mut self, date: &str, model_id: &str, message: &UnifiedMessage) {
+        self.cell(date, model_id).previous.add(message);
+    }
+
+    fn finish(self) -> ClientRecountProof {
+        self.proof
+    }
 }
 
 /// Token-bearing usage submitted at zero cost because it cannot be priced
@@ -710,6 +840,32 @@ pub struct UnpricedSubmissionUsage {
     pub total_tokens: i64,
     pub reason: &'static str,
 }
+
+/// Submission clients the receiver only admits from a complete snapshot:
+/// the versioned-parser high-water set (`SUPPORTED_VERSIONED_PARSERS` on the
+/// receiver) plus the atomic MiMo and Antigravity source families. A
+/// date-filtered submission cannot shrink their coverage without freezing
+/// their stored history — a partial window for one of these is not
+/// submittable at all — so the submission graph keeps their messages
+/// regardless of `since`/`until`/`year`, and the scan scope names them in
+/// `fullHistoryClients`.
+///
+/// Devin CLI is in the set since its generation-2 registration: without
+/// full-history authority its submissions freeze, and its recount proof only
+/// rides on a snapshot declared complete. A database that partly failed to
+/// read is handled after the scan, when `source_reads` withholds the
+/// declaration from exactly that client.
+pub const FULL_HISTORY_SUBMIT_CLIENTS: &[&str] = &[
+    "amp",
+    "antigravity",
+    "antigravity-cli",
+    "antigravity-extension",
+    "copilot",
+    "devin-cli",
+    "droid",
+    "micode",
+    "micode-desktop",
+];
 
 #[derive(Debug, Clone, Default)]
 pub struct ReportOptions {
@@ -735,6 +891,9 @@ pub struct ModelUsage {
     pub workspace_key: Option<String>,
     pub workspace_label: Option<String>,
     pub session_id: Option<String>,
+    /// Machine label of the row; set only for [`GroupBy::MachineModel`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
     pub model: String,
     pub provider: String,
     pub input: i64,
@@ -975,6 +1134,47 @@ fn apply_source_cache_policy(
 struct StreamingParseOutcome {
     coverage: Option<claude_desktop::Coverage>,
     pending_save: Option<PendingSourceCacheSave>,
+    /// See [`GraphResultV2::recount_proofs`].
+    recount_proofs: BTreeMap<String, ClientRecountProof>,
+    /// See [`GraphResultV2::source_reads`].
+    source_reads: BTreeMap<String, SourceReadSummary>,
+}
+
+/// The day key and model id a message will carry once `flush_message` has
+/// applied the parse tail to it, or `None` when that tail drops the message.
+///
+/// A recount proof has to be keyed exactly like the contributions it
+/// accompanies, and those are built after normalization and rebucketing. Rows
+/// dropped before the tail never reach it, so the same steps are replayed on
+/// a copy here.
+fn flushed_message_identity(
+    message: &UnifiedMessage,
+    context: &FlushContext<'_>,
+) -> Option<(String, String)> {
+    if !context.include_all
+        && !retain_for_requested_clients(
+            &message.client,
+            &message.model_id,
+            &message.provider_id,
+            &context.requested,
+        )
+    {
+        return None;
+    }
+    let mut model_id = message.model_id.clone();
+    let mut provider_id = message.provider_id.clone();
+    if context.include_synthetic {
+        sessions::synthetic::normalize_synthetic_gateway_fields(&mut model_id, &mut provider_id);
+    }
+    let date = match &context.timezone {
+        Some(timezone) => {
+            let mut rebucketed = message.clone();
+            rebucketed.rebucket_date(timezone);
+            rebucketed.date
+        }
+        None => message.date.clone(),
+    };
+    Some((date, model_id))
 }
 
 fn parse_all_messages_with_pricing_with_env_strategy(
@@ -1157,6 +1357,13 @@ struct FlushContext<'a> {
     /// `date` on every cache load, so no cached entry can carry a stale day
     /// key regardless of when it was written.
     timezone: Option<bucket_tz::BucketTimezone>,
+    /// `scanner.localMachineLabel`, for every message its lane did not label
+    /// from a `scanner.machineLabels` folder.
+    ///
+    /// `None` when the setting is unset: such messages then stay unlabeled,
+    /// which [`message_machine_label`] reads as the default local label, so a
+    /// device without the setting emits exactly the messages it did before.
+    local_machine_label: Option<&'a str>,
 }
 
 fn matches_flush_filter(message: &UnifiedMessage, context: &FlushContext<'_>) -> bool {
@@ -1189,6 +1396,10 @@ fn flush_retained_message<S: MessageSink>(
 
     if let Some(timezone) = &context.timezone {
         message.rebucket_date(timezone);
+    }
+
+    if let (None, Some(local)) = (&message.machine_label, context.local_machine_label) {
+        message.machine_label = Some(local.to_string());
     }
 
     sink.accept_with_estimate_source(message, estimate_source);
@@ -1432,6 +1643,38 @@ fn emit_codex_scan_warnings(
         warnings.push(warning);
     }
     tui_signal::update_codex_scan_warnings(warnings);
+}
+
+fn parse_dsh_source(
+    path: &Path,
+    warnings: &Mutex<Vec<(PathBuf, String)>>,
+) -> sessions::dsh::DshParseResult {
+    let mut parsed = sessions::dsh::parse_dsh_file_with_cache_status(path);
+    if let Some(warning) = parsed.warning.take() {
+        warnings
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((path.to_path_buf(), warning));
+    }
+    parsed
+}
+
+fn emit_dsh_scan_warnings(warnings: Mutex<Vec<(PathBuf, String)>>) {
+    let mut warnings = warnings.into_inner().unwrap_or_else(|p| p.into_inner());
+    warnings.sort();
+    warnings.dedup_by(|a, b| a.0 == b.0);
+    let messages = if warnings.is_empty() {
+        Vec::new()
+    } else {
+        let examples = warnings
+            .iter()
+            .take(2)
+            .map(|(path, reason)| format!("{path:?} ({})", reason.escape_debug()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        vec![format!("Warning: {} incomplete DSH transcript(s). Only complete readable records are counted; totals may omit usage. These sources will be retried on the next scan. Examples: {examples}.", warnings.len())]
+    };
+    tui_signal::update_dsh_scan_warnings(messages);
 }
 
 fn parse_all_messages_streaming<S: MessageSink>(
@@ -2095,6 +2338,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         source_cache: &mut message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
         all_messages: &mut Vec<UnifiedMessage>,
+        machine_labeler: &machine_label::MachineLabeler,
         scan_client: ClientId,
         parse: F,
     ) where
@@ -2104,7 +2348,12 @@ fn parse_all_messages_streaming<S: MessageSink>(
         let outcomes: Vec<CachedParseOutcome> = scan_result
             .get(scan_client)
             .par_iter()
-            .map(|path| load_or_parse_source(cache_identity, path, source_cache, pricing, &parse))
+            .map(|path| {
+                let mut outcome =
+                    load_or_parse_source(cache_identity, path, source_cache, pricing, &parse);
+                machine_labeler.label_messages(path, &mut outcome.messages);
+                outcome
+            })
             .collect();
         for outcome in outcomes {
             all_messages.extend(outcome.messages);
@@ -2127,6 +2376,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         source_cache: &mut message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
         all_messages: &mut Vec<UnifiedMessage>,
+        machine_labeler: &machine_label::MachineLabeler,
         scan_client: ClientId,
         parse: F,
     ) where
@@ -2136,7 +2386,12 @@ fn parse_all_messages_streaming<S: MessageSink>(
         let outcomes: Vec<CachedParseOutcome> = scan_result
             .get(scan_client)
             .par_iter()
-            .map(|path| load_or_parse_source(cache_identity, path, source_cache, pricing, &parse))
+            .map(|path| {
+                let mut outcome =
+                    load_or_parse_source(cache_identity, path, source_cache, pricing, &parse);
+                machine_labeler.label_messages(path, &mut outcome.messages);
+                outcome
+            })
             .collect();
         let mut seen: HashSet<String> = HashSet::new();
         for outcome in outcomes {
@@ -2416,6 +2671,8 @@ fn parse_all_messages_streaming<S: MessageSink>(
             }
         }
         let source = sessions::micode::parse_micode_source(path);
+        #[cfg(test)]
+        run_after_sqlite_scan_hook(path);
         // A concurrent writer can commit after the read snapshot began. Never
         // label that older pair with a newer database/WAL fingerprint.
         let stable = before.as_ref().is_some_and(|fingerprint| {
@@ -2440,10 +2697,16 @@ fn parse_all_messages_streaming<S: MessageSink>(
             None
         };
         let invalidate = !stable || !source.complete || source.messages.is_empty();
-        let preserve_legacy_bytes = cached
+        let legacy = cached
             .as_ref()
             .is_some_and(|entry| entry.billing_identity_generation == 0);
-        if (!stable || !source.complete) && preserve_legacy_bytes {
+        // A failed identity migration must not discard an old amount, so a
+        // read that stopped partway replays the legacy entry. A complete read
+        // is returned even when MiMo wrote during it: it reflects the database
+        // at least as recently as the legacy entry does, and the write only
+        // keeps it out of the cache. Replaying the legacy entry there instead
+        // would freeze usage for as long as MiMo keeps writing.
+        if !source.complete && legacy {
             if let Some(mut entry) = cached {
                 for message in &mut entry.messages {
                     message.refresh_derived_fields();
@@ -2459,7 +2722,10 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 );
             }
         }
-        (source, cache_entry, invalidate && !preserve_legacy_bytes)
+        // A stable read that could not replace the legacy entry (one that found
+        // no rows) keeps it; a read that raced a write retires it like any
+        // other entry the database has moved past.
+        (source, cache_entry, invalidate && !(legacy && stable))
     }
 
     /// OpenCode's SQLite lane, where a warm scan reads only the rows that
@@ -2484,13 +2750,24 @@ fn parse_all_messages_streaming<S: MessageSink>(
             pricing: Option<&pricing::PricingService>,
             fallback: Option<message_cache::CachedSourceEntry>,
         ) -> CachedParseOutcome {
+            #[cfg(test)]
+            run_after_sqlite_scan_hook(path);
             let stable = fingerprint.as_ref().is_some_and(|f| {
                 matches!(
                     message_cache::SourceFingerprint::check_sqlite_path(path, Some(f)),
                     Some(message_cache::FingerprintStatus::Unchanged)
                 )
             });
-            if !scan.complete || !stable {
+            // Only a scan that stopped partway replays a legacy entry, which
+            // may hold usage the readable prefix does not. A complete scan
+            // reflects the database at least as recently as that entry, so it
+            // is returned even when OpenCode wrote while it ran. The write only
+            // keeps it out of the cache: the scan reads its metadata high-water
+            // (which detects session renames) after the rows, so that mark
+            // could record a change the parsed messages do not reflect. A
+            // database in active use can be written during every scan, so
+            // replaying the entry there would freeze its usage indefinitely.
+            if !scan.complete {
                 if let Some(entry) = fallback.filter(|entry| entry.billing_identity_generation == 0)
                 {
                     return CachedParseOutcome {
@@ -2813,6 +3090,12 @@ fn parse_all_messages_streaming<S: MessageSink>(
     let mut all_messages: Vec<UnifiedMessage> = Vec::new();
     let include_all = clients.is_empty();
     let include_synthetic = include_all || clients.iter().any(|c| c == "synthetic");
+    // Labels the messages of each source file under a `machineLabels` folder.
+    // A lane labels its messages where it still knows the file they came
+    // from; the flush gives every message left unlabeled the configured local
+    // label, if any.
+    let machine_labeler =
+        machine_label::MachineLabeler::from_scanner_settings(scanner_settings, Some(home_dir));
     let flush_context = {
         let timezone = bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings);
         FlushContext {
@@ -2821,6 +3104,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
             requested: clients.iter().map(String::as_str).collect(),
             include_synthetic,
             timezone: timezone.is_pinned().then_some(timezone),
+            local_machine_label: machine_labeler.configured_local_label(),
         }
     };
     let include_devin_cli = include_synthetic || clients.iter().any(|c| c == "devin-cli");
@@ -2839,11 +3123,12 @@ fn parse_all_messages_streaming<S: MessageSink>(
 
     for db_path in &scan_result.opencode_dbs {
         let CachedParseOutcome {
-            messages,
+            mut messages,
             cache_entry,
             invalidate_cache,
             ..
         } = load_or_parse_opencode_sqlite_source(db_path, &source_cache, pricing);
+        machine_labeler.label_messages(db_path, &mut messages);
 
         // Dedup across channel-suffixed dbs: the same session can end up in
         // both `opencode.db` and `opencode-<channel>.db` if the user
@@ -2877,7 +3162,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         .par_iter()
         .filter(|path| !opencode_json_superseded_by_sqlite(path, &opencode_sqlite_locations))
         .filter_map(|path| {
-            Some(load_or_parse_source(
+            let mut outcome = load_or_parse_source(
                 message_cache::CacheIdentity::for_client(ClientId::OpenCode),
                 path,
                 &source_cache,
@@ -2887,7 +3172,9 @@ fn parse_all_messages_streaming<S: MessageSink>(
                         .into_iter()
                         .collect()
                 },
-            ))
+            );
+            machine_labeler.label_messages(path, &mut outcome.messages);
+            Some(outcome)
         })
         .collect();
     for outcome in opencode_outcomes {
@@ -2910,7 +3197,9 @@ fn parse_all_messages_streaming<S: MessageSink>(
 
     for db_path in &scan_result.micode_dbs {
         // Pricing happens only after raw source identities are reconciled.
-        let (source, cache_entry, invalidate) = load_or_parse_micode_source(db_path, &source_cache);
+        let (mut source, cache_entry, invalidate) =
+            load_or_parse_micode_source(db_path, &source_cache);
+        machine_labeler.label_messages(db_path, &mut source.messages);
         micode_messages.extend(db_path, source);
         if let Some(entry) = cache_entry {
             source_cache.insert(entry);
@@ -2945,7 +3234,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
             // collapses against the same turn replayed into a forked
             // transcript. Tool-result keys embed the transcript's file stem
             // and would not — see `dedup_key_is_globally_stable`.
-            load_or_parse_source_with_fingerprint_retaining_history(
+            let mut outcome = load_or_parse_source_with_fingerprint_retaining_history(
                 message_cache::CacheIdentity::for_client(ClientId::Claude),
                 path,
                 &source_cache,
@@ -2974,7 +3263,9 @@ fn parse_all_messages_streaming<S: MessageSink>(
                        fingerprint: &message_cache::SourceFingerprint| {
                     resume_claude_source(path, entry, fingerprint, &claude_home)
                 }),
-            )
+            );
+            machine_labeler.label_messages(path, &mut outcome.messages);
+            outcome
         })
         .collect();
     if include_all || include_synthetic || clients.iter().any(|client| client == "claude") {
@@ -3011,8 +3302,13 @@ fn parse_all_messages_streaming<S: MessageSink>(
                         .iter()
                         .filter_map(|message| message.dedup_key.clone())
                         .collect();
+                    // The transcript is gone, so only its recorded path can
+                    // say which machine the retained history came from.
+                    let path = entry.path.to_path_buf();
+                    let mut messages = cached_messages(entry, pricing);
+                    machine_labeler.label_messages(&path, &mut messages);
                     CachedParseOutcome {
-                        messages: cached_messages(entry, pricing),
+                        messages,
                         retained_message_keys,
                         cache_entry: None,
                         invalidate_cache: false,
@@ -3054,6 +3350,8 @@ fn parse_all_messages_streaming<S: MessageSink>(
         .map(|(_, _, message)| message)
         .collect();
     if clients.is_empty() || clients.iter().any(|client| client == "claude") {
+        // Claude Desktop's cache databases are read from this home only, never
+        // from a scan path, so their rows keep the local machine label.
         let desktop = claude_desktop::read(Path::new(home_dir));
         if desktop.coverage.cache_databases > 0 {
             desktop_coverage = Some(desktop.coverage.clone());
@@ -3091,10 +3389,10 @@ fn parse_all_messages_streaming<S: MessageSink>(
         .get(ClientId::Codex)
         .par_iter()
         .map(|path| {
-            (
-                path.clone(),
-                load_or_parse_codex_source(path, &source_cache, pricing, &headless_roots),
-            )
+            let mut outcome =
+                load_or_parse_codex_source(path, &source_cache, pricing, &headless_roots);
+            machine_labeler.label_messages(path, &mut outcome.0.messages);
+            (path.clone(), outcome)
         })
         .collect();
     let mut codex_seen: HashSet<String> = HashSet::new();
@@ -3167,6 +3465,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &mut source_cache,
         None,
         &mut all_messages,
+        &machine_labeler,
         ClientId::Copilot,
         sessions::copilot::parse_copilot_file,
     );
@@ -3180,7 +3479,8 @@ fn parse_all_messages_streaming<S: MessageSink>(
         .map(|message| message.session_id.clone())
         .collect();
     if let Some(db_path) = &scan_result.copilot_desktop_db {
-        let desktop_msgs = sessions::copilot_desktop::parse_copilot_desktop_db(db_path);
+        let mut desktop_msgs = sessions::copilot_desktop::parse_copilot_desktop_db(db_path);
+        machine_labeler.label_messages(db_path, &mut desktop_msgs);
         all_messages.extend(
             desktop_msgs
                 .into_iter()
@@ -3192,8 +3492,11 @@ fn parse_all_messages_streaming<S: MessageSink>(
         );
     }
     if let Some(db_path) = &scan_result.copilot_session_store_db {
+        let mut session_store_msgs =
+            sessions::copilot_session_store::parse_copilot_session_store_db(db_path);
+        machine_labeler.label_messages(db_path, &mut session_store_msgs);
         all_messages.extend(
-            sessions::copilot_session_store::parse_copilot_session_store_db(db_path)
+            session_store_msgs
                 .into_iter()
                 .filter(|message| !copilot_otel_sessions.contains(&message.session_id))
                 .map(|mut message| {
@@ -3222,31 +3525,36 @@ fn parse_all_messages_streaming<S: MessageSink>(
         // request-heavy source, then feed each VS Code message through the same
         // tail instead of rebuilding `all_messages`.
         flush_lane(&mut all_messages, &flush_context, sink);
-        sessions::copilot_vscode::parse_copilot_vscode_sessions_into(
-            &scan_result.copilot_vscode_sessions,
-            &mut |mut message| {
-                let key_unique = message
-                    .dedup_key
-                    .as_deref()
-                    .is_none_or(|key| !existing_dedup_keys.contains(key));
-                let session_timestamp_unique = existing_copilot_session_timestamps
-                    .get(message.session_id.as_str())
-                    .is_none_or(|timestamps| !timestamps.contains(&message.timestamp));
-                if !key_unique || !session_timestamp_unique {
-                    return;
-                }
+        // One file per call, so each message knows the file it came from.
+        for path in &scan_result.copilot_vscode_sessions {
+            let machine_label = machine_labeler.configured_label_for(path);
+            sessions::copilot_vscode::parse_copilot_vscode_sessions_into(
+                std::slice::from_ref(path),
+                &mut |mut message| {
+                    let key_unique = message
+                        .dedup_key
+                        .as_deref()
+                        .is_none_or(|key| !existing_dedup_keys.contains(key));
+                    let session_timestamp_unique = existing_copilot_session_timestamps
+                        .get(message.session_id.as_str())
+                        .is_none_or(|timestamps| !timestamps.contains(&message.timestamp));
+                    if !key_unique || !session_timestamp_unique {
+                        return;
+                    }
 
-                apply_pricing_if_available(&mut message, pricing);
-                flush_message(message, &flush_context, sink);
-            },
-        );
+                    message.machine_label = machine_label.map(str::to_string);
+                    apply_pricing_if_available(&mut message, pricing);
+                    flush_message(message, &flush_context, sink);
+                },
+            );
+        }
     }
 
     let gemini_outcomes: Vec<(PathBuf, CachedParseOutcome)> = scan_result
         .get(ClientId::Gemini)
         .par_iter()
         .map(|path| {
-            let outcome = load_or_parse_source_with_fingerprint_and_policy(
+            let mut outcome = load_or_parse_source_with_fingerprint_and_policy(
                 message_cache::CacheIdentity::for_client(ClientId::Gemini),
                 path,
                 &source_cache,
@@ -3258,6 +3566,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                     (parsed.messages, parsed.cacheable)
                 },
             );
+            machine_labeler.label_messages(path, &mut outcome.messages);
             (path.clone(), outcome)
         })
         .collect();
@@ -3278,6 +3587,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &mut source_cache,
         pricing,
         &mut all_messages,
+        &machine_labeler,
         ClientId::Cursor,
         sessions::cursor::parse_cursor_file,
     );
@@ -3287,6 +3597,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &mut source_cache,
         pricing,
         &mut all_messages,
+        &machine_labeler,
         ClientId::Mcode,
         sessions::mcode::parse_mcode_file,
     );
@@ -3296,6 +3607,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &mut source_cache,
         pricing,
         &mut all_messages,
+        &machine_labeler,
         ClientId::Warp,
         sessions::warp::parse_warp_file,
     );
@@ -3307,14 +3619,16 @@ fn parse_all_messages_streaming<S: MessageSink>(
             // Use a Grok-aware fingerprint: legacy output depends on session
             // sidecars, while unified output reads metadata across the complete
             // sessions tree; all of those inputs must invalidate cached output.
-            load_or_parse_source_with_fingerprint(
+            let mut outcome = load_or_parse_source_with_fingerprint(
                 message_cache::CacheIdentity::for_client(ClientId::Grok),
                 path,
                 &source_cache,
                 pricing,
                 message_cache::SourceFingerprint::check_grok_path_samples_only,
                 sessions::grok::parse_grok_file,
-            )
+            );
+            machine_labeler.label_messages(path, &mut outcome.messages);
+            outcome
         })
         .collect();
     let mut grok_messages = Vec::new();
@@ -3332,14 +3646,16 @@ fn parse_all_messages_streaming<S: MessageSink>(
         .get(ClientId::Jcode)
         .par_iter()
         .map(|path| {
-            load_or_parse_source_with_fingerprint(
+            let mut outcome = load_or_parse_source_with_fingerprint(
                 message_cache::CacheIdentity::for_client(ClientId::Jcode),
                 path,
                 &source_cache,
                 pricing,
                 message_cache::SourceFingerprint::check_jcode_path_samples_only,
                 sessions::jcode::parse_jcode_file,
-            )
+            );
+            machine_labeler.label_messages(path, &mut outcome.messages);
+            outcome
         })
         .collect();
     let mut jcode_seen: HashSet<String> = HashSet::new();
@@ -3360,6 +3676,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &mut source_cache,
         pricing,
         &mut all_messages,
+        &machine_labeler,
         ClientId::Amp,
         sessions::amp::parse_amp_file,
     );
@@ -3369,13 +3686,15 @@ fn parse_all_messages_streaming<S: MessageSink>(
             .get(ClientId::Codebuff)
             .par_iter()
             .map(|path| {
-                load_or_parse_source(
+                let mut outcome = load_or_parse_source(
                     message_cache::CacheIdentity::for_client(ClientId::Codebuff),
                     path,
                     &source_cache,
                     pricing,
                     sessions::codebuff::parse_codebuff_file,
-                )
+                );
+                machine_labeler.label_messages(path, &mut outcome.messages);
+                outcome
             })
             .collect()
     } else {
@@ -3398,13 +3717,15 @@ fn parse_all_messages_streaming<S: MessageSink>(
             .get(ClientId::Codebuff)
             .par_iter()
             .map(|path| {
-                load_or_parse_source(
+                let mut outcome = load_or_parse_source(
                     message_cache::CacheIdentity::for_client(ClientId::Freebuff),
                     path,
                     &source_cache,
                     pricing,
                     sessions::freebuff::parse_freebuff_file,
-                )
+                );
+                machine_labeler.label_messages(path, &mut outcome.messages);
+                outcome
             })
             .collect()
     } else {
@@ -3421,14 +3742,16 @@ fn parse_all_messages_streaming<S: MessageSink>(
         .get(ClientId::Droid)
         .par_iter()
         .map(|path| {
-            load_or_parse_source_with_fingerprint(
+            let mut outcome = load_or_parse_source_with_fingerprint(
                 message_cache::CacheIdentity::for_client(ClientId::Droid),
                 path,
                 &source_cache,
                 pricing,
                 message_cache::SourceFingerprint::check_droid_path_samples_only,
                 sessions::droid::parse_droid_file,
-            )
+            );
+            machine_labeler.label_messages(path, &mut outcome.messages);
+            outcome
         })
         .collect();
     for outcome in droid_outcomes {
@@ -3480,10 +3803,10 @@ fn parse_all_messages_streaming<S: MessageSink>(
         let rollout_outcomes: Vec<(PathBuf, CodexSourceOutcome)> = openclaw_codex_rollouts
             .par_iter()
             .map(|path| {
-                (
-                    (*path).clone(),
-                    load_or_parse_codex_source(path, &source_cache, pricing, &headless_roots),
-                )
+                let mut outcome =
+                    load_or_parse_codex_source(path, &source_cache, pricing, &headless_roots);
+                machine_labeler.label_messages(path, &mut outcome.0.messages);
+                ((*path).clone(), outcome)
             })
             .collect();
         let mut rollout_messages = std::mem::take(&mut openclaw_owned_rollouts);
@@ -3524,40 +3847,38 @@ fn parse_all_messages_streaming<S: MessageSink>(
             .openclaw_dbs
             .par_iter()
             .map(|db_path| {
-                (
-                    db_path.clone(),
-                    // A store whose read stopped partway hands back the prefix
-                    // it got — reported for this scan, but not cacheable:
-                    // cached, it would stand in for the store on every warm
-                    // scan until the file happened to change.
-                    load_or_parse_source_with_fingerprint_and_policy(
-                        openclaw_identity,
-                        db_path,
-                        &source_cache,
-                        pricing,
-                        HistoryRetention::LiveFileOnly,
-                        message_cache::SourceFingerprint::check_sqlite_path,
-                        |path, _| {
-                            let scan = sessions::openclaw::scan_openclaw_sqlite(path);
-                            (scan.messages, scan.complete)
-                        },
-                    ),
-                )
+                // A store whose read stopped partway hands back the prefix
+                // it got — reported for this scan, but not cacheable:
+                // cached, it would stand in for the store on every warm
+                // scan until the file happened to change.
+                let mut outcome = load_or_parse_source_with_fingerprint_and_policy(
+                    openclaw_identity,
+                    db_path,
+                    &source_cache,
+                    pricing,
+                    HistoryRetention::LiveFileOnly,
+                    message_cache::SourceFingerprint::check_sqlite_path,
+                    |path, _| {
+                        let scan = sessions::openclaw::scan_openclaw_sqlite(path);
+                        (scan.messages, scan.complete)
+                    },
+                );
+                machine_labeler.label_messages(db_path, &mut outcome.messages);
+                (db_path.clone(), outcome)
             })
             .collect();
         let openclaw_jsonl_outcomes: Vec<(PathBuf, CachedParseOutcome)> = openclaw_transcripts
             .par_iter()
             .map(|path| {
-                (
-                    (*path).clone(),
-                    load_or_parse_source(
-                        openclaw_identity,
-                        path,
-                        &source_cache,
-                        pricing,
-                        sessions::openclaw::parse_openclaw_transcript,
-                    ),
-                )
+                let mut outcome = load_or_parse_source(
+                    openclaw_identity,
+                    path,
+                    &source_cache,
+                    pricing,
+                    sessions::openclaw::parse_openclaw_transcript,
+                );
+                machine_labeler.label_messages(path, &mut outcome.messages);
+                ((*path).clone(), outcome)
             })
             .collect();
         let mut openclaw_seen: HashSet<String> = HashSet::new();
@@ -3605,6 +3926,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &mut source_cache,
         pricing,
         &mut all_messages,
+        &machine_labeler,
         ClientId::Aside,
         sessions::aside::parse_aside_file,
     );
@@ -3618,6 +3940,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &mut source_cache,
         pricing,
         &mut all_messages,
+        &machine_labeler,
         ClientId::Pi,
         sessions::pi::parse_pi_file,
     );
@@ -3628,7 +3951,11 @@ fn parse_all_messages_streaming<S: MessageSink>(
     )> = scan_result
         .get(ClientId::PrimeAgent)
         .par_iter()
-        .map(|path| load_or_parse_prime_source(path, &source_cache, pricing))
+        .map(|path| {
+            let mut outcome = load_or_parse_prime_source(path, &source_cache, pricing);
+            machine_labeler.label_messages(path, &mut outcome.0.messages);
+            outcome
+        })
         .collect();
     let mut prime_agent_messages = Vec::new();
     let mut prime_agent_accounting = Vec::new();
@@ -3651,13 +3978,15 @@ fn parse_all_messages_streaming<S: MessageSink>(
         .get(ClientId::Kimchi)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(
+            let mut outcome = load_or_parse_source(
                 message_cache::CacheIdentity::for_client(ClientId::Kimchi),
                 path,
                 &source_cache,
                 pricing,
                 sessions::kimchi::parse_kimchi_file,
-            )
+            );
+            machine_labeler.label_messages(path, &mut outcome.messages);
+            outcome
         })
         .collect();
     let mut kimchi_seen: HashSet<String> = HashSet::new();
@@ -3677,14 +4006,16 @@ fn parse_all_messages_streaming<S: MessageSink>(
         .get(ClientId::Reasonix)
         .par_iter()
         .map(|path| {
-            load_or_parse_source_with_fingerprint(
+            let mut outcome = load_or_parse_source_with_fingerprint(
                 message_cache::CacheIdentity::for_client(ClientId::Reasonix),
                 path,
                 &source_cache,
                 pricing,
                 message_cache::SourceFingerprint::check_reasonix_path_samples_only,
                 sessions::reasonix::parse_reasonix_file,
-            )
+            );
+            machine_labeler.label_messages(path, &mut outcome.messages);
+            outcome
         })
         .collect();
     for outcome in reasonix_outcomes {
@@ -3701,6 +4032,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &mut source_cache,
         pricing,
         &mut all_messages,
+        &machine_labeler,
         ClientId::Senpi,
         sessions::senpi::parse_senpi_file,
     );
@@ -3710,21 +4042,48 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &mut source_cache,
         pricing,
         &mut all_messages,
+        &machine_labeler,
         ClientId::Omp,
         sessions::omp::parse_omp_file,
     );
+
+    let proma_outcomes: Vec<_> = scan_result
+        .get(ClientId::Proma)
+        .par_iter()
+        .map(|path| {
+            let mut outcome = load_or_parse_source(
+                message_cache::CacheIdentity::for_client(ClientId::Proma),
+                path,
+                &source_cache,
+                pricing,
+                sessions::proma::parse_proma_file,
+            );
+            machine_labeler.label_messages(path, &mut outcome.messages);
+            (path.clone(), outcome)
+        })
+        .collect();
+    let mut proma_sources = Vec::new();
+    for (path, outcome) in proma_outcomes {
+        proma_sources.push((path, outcome.messages));
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+    all_messages.extend(sessions::proma::reconcile_sources(proma_sources));
 
     let augment_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Augment)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(
+            let mut outcome = load_or_parse_source(
                 message_cache::CacheIdentity::for_client(ClientId::Augment),
                 path,
                 &source_cache,
                 pricing,
                 sessions::augment::parse_augment_file,
-            )
+            );
+            machine_labeler.label_messages(path, &mut outcome.messages);
+            outcome
         })
         .collect();
     let mut augment_seen: HashSet<String> = HashSet::new();
@@ -3756,7 +4115,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         .get(ClientId::CommandCode)
         .par_iter()
         .flat_map(|path| {
-            sessions::commandcode::parse_commandcode_file(path)
+            let mut messages = sessions::commandcode::parse_commandcode_file(path)
                 .into_iter()
                 .map(|mut msg| {
                     if msg.cost <= 0.0 {
@@ -3764,7 +4123,9 @@ fn parse_all_messages_streaming<S: MessageSink>(
                     }
                     msg
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            machine_labeler.label_messages(path, &mut messages);
+            messages
         })
         .collect();
     all_messages.extend(
@@ -3786,7 +4147,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         .get(ClientId::Gjc)
         .par_iter()
         .flat_map(|path| {
-            sessions::gjc::parse_gjc_file(path)
+            let mut messages = sessions::gjc::parse_gjc_file(path)
                 .into_iter()
                 .map(|mut msg| {
                     if msg.cost <= 0.0 {
@@ -3794,7 +4155,9 @@ fn parse_all_messages_streaming<S: MessageSink>(
                     }
                     msg
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            machine_labeler.label_messages(path, &mut messages);
+            messages
         })
         .collect();
     all_messages.extend(
@@ -3812,7 +4175,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         .get(ClientId::Junie)
         .par_iter()
         .flat_map(|path| {
-            sessions::junie::parse_junie_file(path)
+            let mut messages = sessions::junie::parse_junie_file(path)
                 .into_iter()
                 .map(|mut msg| {
                     if msg.cost <= 0.0 {
@@ -3820,7 +4183,9 @@ fn parse_all_messages_streaming<S: MessageSink>(
                     }
                     msg
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            machine_labeler.label_messages(path, &mut messages);
+            messages
         })
         .collect();
     all_messages.extend(
@@ -3832,7 +4197,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
     // ZCode v2 CLI stores authoritative model usage in SQLite.
     if let Some(db_path) = &scan_result.zcode_db {
         let CachedParseOutcome {
-            messages,
+            mut messages,
             cache_entry,
             ..
         } = load_or_parse_sqlite_source(
@@ -3842,6 +4207,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
             pricing,
             sessions::zcode::parse_zcode_sqlite,
         );
+        machine_labeler.label_messages(db_path, &mut messages);
         all_messages.extend(messages);
         if let Some(entry) = cache_entry {
             source_cache.insert(entry);
@@ -3855,13 +4221,15 @@ fn parse_all_messages_streaming<S: MessageSink>(
         .get(ClientId::CherryStudio)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(
+            let mut outcome = load_or_parse_source(
                 message_cache::CacheIdentity::for_client(ClientId::CherryStudio),
                 path,
                 &source_cache,
                 pricing,
                 sessions::cherrystudio::parse_cherrystudio_file,
-            )
+            );
+            machine_labeler.label_messages(path, &mut outcome.messages);
+            outcome
         })
         .collect();
     for outcome in cherrystudio_outcomes {
@@ -3876,7 +4244,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
     // only the rows the transcript lane cannot see (see its doc comment).
     if let Some(db_path) = &scan_result.cherrystudio_db {
         let CachedParseOutcome {
-            messages,
+            mut messages,
             cache_entry,
             ..
         } = load_or_parse_sqlite_source(
@@ -3886,26 +4254,52 @@ fn parse_all_messages_streaming<S: MessageSink>(
             pricing,
             sessions::cherrystudio::parse_cherrystudio_sqlite,
         );
+        machine_labeler.label_messages(db_path, &mut messages);
         all_messages.extend(messages);
         if let Some(entry) = cache_entry {
             source_cache.insert(entry);
         }
     }
 
-    // DeepSeek Harness (DSH) zstd JSONL transcripts. Every `assistant/message`
-    // carries authoritative usage but never a cost, so pricing is the only cost
-    // source — the generic source cache (which reprices unconditionally) is
-    // safe here, same as opencodereview. Forking copies the parent's completed
-    // prefix into the child transcript verbatim, so the lane also needs one
-    // cross-file dedup pass on the per-call `message.id`.
-    parse_cached_lane_deduped(
-        &scan_result,
-        &mut source_cache,
-        pricing,
-        &mut all_messages,
-        ClientId::Dsh,
-        sessions::dsh::parse_dsh_file,
-    );
+    // Keep the whole source's accounting state while streaming its records.
+    // Partial input must not become a warm cache that suppresses future retries.
+    let dsh_warnings = Mutex::new(Vec::new());
+    let dsh_identity = message_cache::CacheIdentity::for_client(ClientId::Dsh);
+    let dsh_outcomes: Vec<_> = scan_result
+        .get(ClientId::Dsh)
+        .par_iter()
+        .map(|path| {
+            let mut outcome = load_or_parse_source_with_fingerprint_and_policy(
+                dsh_identity,
+                path,
+                &source_cache,
+                pricing,
+                HistoryRetention::LiveFileOnly,
+                message_cache::SourceFingerprint::check_path_samples_only,
+                |path, _| {
+                    let parsed = parse_dsh_source(path, &dsh_warnings);
+                    (parsed.messages, parsed.cacheable)
+                },
+            );
+            machine_labeler.label_messages(path, &mut outcome.messages);
+            (path, outcome)
+        })
+        .collect();
+    let mut dsh_seen = HashSet::new();
+    for (path, outcome) in dsh_outcomes {
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut dsh_seen, message)),
+        );
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        } else if outcome.invalidate_cache {
+            source_cache.remove(dsh_identity, path);
+        }
+    }
+    emit_dsh_scan_warnings(dsh_warnings);
 
     // LM Studio local-server logs can retain or repeat the same final response
     // across files. Response IDs provide a stable cross-file dedup key, while
@@ -3916,6 +4310,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &mut source_cache,
         pricing,
         &mut all_messages,
+        &machine_labeler,
         ClientId::LmStudio,
         sessions::lmstudio::parse_lmstudio_file,
     );
@@ -3928,13 +4323,15 @@ fn parse_all_messages_streaming<S: MessageSink>(
         .get(ClientId::Unsloth)
         .par_iter()
         .map(|db_path| {
-            load_or_parse_sqlite_source(
+            let mut outcome = load_or_parse_sqlite_source(
                 message_cache::CacheIdentity::for_client(ClientId::Unsloth),
                 db_path,
                 &source_cache,
                 pricing,
                 sessions::unsloth::parse_unsloth_sqlite,
-            )
+            );
+            machine_labeler.label_messages(db_path, &mut outcome.messages);
+            outcome
         })
         .collect();
     let mut unsloth_seen = HashSet::new();
@@ -3959,6 +4356,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &mut source_cache,
         pricing,
         &mut all_messages,
+        &machine_labeler,
         ClientId::Hindsight,
         sessions::hindsight::parse_hindsight_file,
     );
@@ -3977,6 +4375,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &mut source_cache,
         pricing,
         &mut all_messages,
+        &machine_labeler,
         ClientId::Muse,
         sessions::muse::parse_muse_file,
     );
@@ -3988,6 +4387,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &mut source_cache,
         pricing,
         &mut all_messages,
+        &machine_labeler,
         ClientId::Vibe,
         sessions::vibe::parse_vibe_file,
     );
@@ -3998,13 +4398,15 @@ fn parse_all_messages_streaming<S: MessageSink>(
         .get(ClientId::Zcode)
         .par_iter()
         .flat_map(|path| {
-            sessions::zcode::parse_zcode_file(path)
+            let mut messages = sessions::zcode::parse_zcode_file(path)
                 .into_iter()
                 .map(|mut msg| {
                     apply_pricing_if_available(&mut msg, pricing);
                     msg
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            machine_labeler.label_messages(path, &mut messages);
+            messages
         })
         .collect();
     all_messages.extend(zcode_messages);
@@ -4020,6 +4422,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &mut source_cache,
         pricing,
         &mut all_messages,
+        &machine_labeler,
         ClientId::OpenCodeReview,
         sessions::opencodereview::parse_opencodereview_file,
     );
@@ -4034,14 +4437,16 @@ fn parse_all_messages_streaming<S: MessageSink>(
             } else {
                 sessions::kimi::parse_kimi_file
             };
-            load_or_parse_source_with_fingerprint(
+            let mut outcome = load_or_parse_source_with_fingerprint(
                 message_cache::CacheIdentity::for_client(ClientId::Kimi),
                 path,
                 &source_cache,
                 pricing,
                 message_cache::SourceFingerprint::check_kimi_path_samples_only,
                 parse,
-            )
+            );
+            machine_labeler.label_messages(path, &mut outcome.messages);
+            outcome
         })
         .collect();
     // Keep each path paired with its messages so the workspace lookup can key
@@ -4068,6 +4473,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &mut source_cache,
         pricing,
         &mut all_messages,
+        &machine_labeler,
         ClientId::Qwen,
         sessions::qwen::parse_qwen_file,
     );
@@ -4076,14 +4482,16 @@ fn parse_all_messages_streaming<S: MessageSink>(
         .get(ClientId::RooCode)
         .par_iter()
         .map(|path| {
-            load_or_parse_source_with_fingerprint(
+            let mut outcome = load_or_parse_source_with_fingerprint(
                 message_cache::CacheIdentity::for_client(ClientId::RooCode),
                 path,
                 &source_cache,
                 pricing,
                 message_cache::SourceFingerprint::check_roo_path_samples_only,
                 sessions::roocode::parse_roocode_file,
-            )
+            );
+            machine_labeler.label_messages(path, &mut outcome.messages);
+            outcome
         })
         .collect();
     for outcome in roocode_outcomes {
@@ -4097,14 +4505,16 @@ fn parse_all_messages_streaming<S: MessageSink>(
         .get(ClientId::KiloCode)
         .par_iter()
         .map(|path| {
-            load_or_parse_source_with_fingerprint(
+            let mut outcome = load_or_parse_source_with_fingerprint(
                 message_cache::CacheIdentity::for_client(ClientId::KiloCode),
                 path,
                 &source_cache,
                 pricing,
                 message_cache::SourceFingerprint::check_roo_path_samples_only,
                 sessions::kilocode::parse_kilocode_file,
-            )
+            );
+            machine_labeler.label_messages(path, &mut outcome.messages);
+            outcome
         })
         .collect();
     for outcome in kilocode_outcomes {
@@ -4118,14 +4528,16 @@ fn parse_all_messages_streaming<S: MessageSink>(
         .get(ClientId::Cline)
         .par_iter()
         .map(|path| {
-            load_or_parse_source_with_fingerprint(
+            let mut outcome = load_or_parse_source_with_fingerprint(
                 message_cache::CacheIdentity::for_client(ClientId::Cline),
                 path,
                 &source_cache,
                 pricing,
                 message_cache::SourceFingerprint::check_cline_path_samples_only,
                 sessions::cline::parse_cline_file,
-            )
+            );
+            machine_labeler.label_messages(path, &mut outcome.messages);
+            outcome
         })
         .collect();
     let mut cline_seen: HashSet<String> = HashSet::new();
@@ -4146,6 +4558,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         &mut source_cache,
         pricing,
         &mut all_messages,
+        &machine_labeler,
         ClientId::Mux,
         sessions::mux::parse_mux_file,
     );
@@ -4165,14 +4578,16 @@ fn parse_all_messages_streaming<S: MessageSink>(
     let fx_outcomes: Vec<CachedParseOutcome> = fx_paths
         .par_iter()
         .map(|path| {
-            load_or_parse_source_with_fingerprint(
+            let mut outcome = load_or_parse_source_with_fingerprint(
                 message_cache::CacheIdentity::for_client(ClientId::Fx),
                 path,
                 &source_cache,
                 pricing,
                 message_cache::SourceFingerprint::check_fx_path_samples_only,
                 sessions::fx::parse_fx_file,
-            )
+            );
+            machine_labeler.label_messages(path, &mut outcome.messages);
+            outcome
         })
         .collect();
     let mut fx_lane: Vec<(PathBuf, Vec<UnifiedMessage>)> = Vec::with_capacity(fx_outcomes.len());
@@ -4189,13 +4604,14 @@ fn parse_all_messages_streaming<S: MessageSink>(
 
     // Kilo CLI: SQLite database
     if let Some(db_path) = &scan_result.kilo_db {
-        let kilo_messages: Vec<UnifiedMessage> = sessions::kilo::parse_kilo_sqlite(db_path)
+        let mut kilo_messages: Vec<UnifiedMessage> = sessions::kilo::parse_kilo_sqlite(db_path)
             .into_iter()
             .map(|mut msg| {
                 apply_pricing_if_available(&mut msg, pricing);
                 msg
             })
             .collect();
+        machine_labeler.label_messages(db_path, &mut kilo_messages);
         all_messages.extend(kilo_messages);
     }
 
@@ -4207,18 +4623,24 @@ fn parse_all_messages_streaming<S: MessageSink>(
     let hermes_databases = scan_result
         .hermes_db_paths()
         .into_iter()
-        .map(|db_path| parse_hermes_sqlite_with_pricing(&db_path, pricing, &hermes_bucket_timezone))
+        .map(|db_path| {
+            let mut messages =
+                parse_hermes_sqlite_with_pricing(&db_path, pricing, &hermes_bucket_timezone);
+            machine_labeler.label_messages(&db_path, &mut messages);
+            messages
+        })
         .collect();
     all_messages.extend(select_best_covered_hermes_groups(hermes_databases));
 
     if let Some(db_path) = &scan_result.goose_db {
-        let goose_messages: Vec<UnifiedMessage> = sessions::goose::parse_goose_sqlite(db_path)
+        let mut goose_messages: Vec<UnifiedMessage> = sessions::goose::parse_goose_sqlite(db_path)
             .into_iter()
             .map(|mut msg| {
                 apply_pricing_if_available(&mut msg, pricing);
                 msg
             })
             .collect();
+        machine_labeler.label_messages(db_path, &mut goose_messages);
         all_messages.extend(goose_messages);
     }
 
@@ -4226,27 +4648,66 @@ fn parse_all_messages_streaming<S: MessageSink>(
     // be configured through scanner extra roots, so parse and dedupe all of
     // them instead of silently ignoring non-default databases.
     let mut devin_cli_session_ids: HashSet<String> = HashSet::new();
+    let mut recount_proofs: BTreeMap<String, ClientRecountProof> = BTreeMap::new();
+    let mut source_reads: BTreeMap<String, SourceReadSummary> = BTreeMap::new();
     if include_devin_cli {
         let devin_cli_outcomes: Vec<CachedParseOutcome> = scan_result
             .devin_dbs
             .par_iter()
             .map(|db_path| {
-                load_or_parse_sqlite_source(
+                let mut outcome = load_or_parse_sqlite_source(
                     message_cache::CacheIdentity::for_client(ClientId::DevinCli),
                     db_path,
                     &source_cache,
                     pricing,
                     sessions::devin::parse_devin_cli_sqlite,
-                )
+                );
+                machine_labeler.label_messages(db_path, &mut outcome.messages);
+                outcome
             })
             .collect();
+        // The parser cannot report a failed open or query: both yield an
+        // empty row set, which is indistinguishable from a database with no
+        // usage. Probe each discovered database separately (a warm cache
+        // never calls the parser) so submission can withhold full-history
+        // authority instead of letting a half-read history pass as complete.
+        let unreadable = scan_result
+            .devin_dbs
+            .iter()
+            .filter(|db_path| !sessions::devin::devin_cli_source_is_readable(db_path))
+            .count();
+        source_reads.insert(
+            ClientId::DevinCli.as_str().to_string(),
+            SourceReadSummary {
+                discovered: scan_result.devin_dbs.len(),
+                unreadable,
+            },
+        );
+        // Devin CLI generation 1 keyed these rows by row id and so counted
+        // every persisted copy of an API request; the request_id key collapses
+        // them. Record both views from the same rows so the receiver can
+        // subtract exactly the over-count instead of trusting a lower total.
         let mut devin_cli_seen = HashSet::new();
+        let mut devin_cli_proof = RecountProofBuilder::default();
         for outcome in devin_cli_outcomes {
-            for message in outcome
-                .messages
-                .into_iter()
-                .filter(|message| should_keep_deduped_message(&mut devin_cli_seen, message))
-            {
+            for message in outcome.messages {
+                let kept = should_keep_deduped_message(&mut devin_cli_seen, &message);
+                if let Some((date, model_id)) = flushed_message_identity(&message, &flush_context) {
+                    if kept {
+                        devin_cli_proof.record_kept(&date, &model_id, &message);
+                    } else if sessions::devin::is_devin_cli_request_dedup_key(
+                        message.dedup_key.as_deref(),
+                    ) {
+                        // Only a request_id collision is a generation
+                        // difference. Row keys are unique per database, so a
+                        // row-key collision across databases was dropped by
+                        // generation 1 as well and proves nothing.
+                        devin_cli_proof.record_duplicate(&date, &model_id, &message);
+                    }
+                }
+                if !kept {
+                    continue;
+                }
                 devin_cli_session_ids.insert(message.session_id.clone());
                 all_messages.push(message);
             }
@@ -4254,16 +4715,21 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 source_cache.insert(entry);
             }
         }
+        let proof = devin_cli_proof.finish();
+        if !proof.is_empty() {
+            recount_proofs.insert(ClientId::DevinCli.as_str().to_string(), proof);
+        }
     }
 
     for db_path in scan_result.zed_db_paths() {
-        let outcome = load_or_parse_sqlite_source(
+        let mut outcome = load_or_parse_sqlite_source(
             message_cache::CacheIdentity::for_client(ClientId::Zed),
             &db_path,
             &source_cache,
             pricing,
             sessions::zed::parse_zed_sqlite,
         );
+        machine_labeler.label_messages(&db_path, &mut outcome.messages);
         all_messages.extend(outcome.messages);
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
@@ -4278,14 +4744,16 @@ fn parse_all_messages_streaming<S: MessageSink>(
             // their token counts from the sibling `messages.jsonl`, so that
             // file must participate in the cache key or an append landing
             // after the last `session.json` write is ignored forever.
-            load_or_parse_source_with_fingerprint(
+            let mut outcome = load_or_parse_source_with_fingerprint(
                 message_cache::CacheIdentity::for_client(ClientId::Kiro),
                 path,
                 &source_cache,
                 pricing,
                 message_cache::SourceFingerprint::check_kiro_path_samples_only,
                 sessions::kiro::parse_kiro_file,
-            )
+            );
+            machine_labeler.label_messages(path, &mut outcome.messages);
+            outcome
         })
         .collect();
     // Collect Kiro file messages before extending so snapshot suppression can
@@ -4303,13 +4771,14 @@ fn parse_all_messages_streaming<S: MessageSink>(
     ));
 
     if let Some(db_path) = &scan_result.kiro_db {
-        let kiro_db_messages: Vec<UnifiedMessage> = sessions::kiro::parse_kiro_sqlite(db_path)
+        let mut kiro_db_messages: Vec<UnifiedMessage> = sessions::kiro::parse_kiro_sqlite(db_path)
             .into_iter()
             .map(|mut msg| {
                 apply_pricing_if_available(&mut msg, pricing);
                 msg
             })
             .collect();
+        machine_labeler.label_messages(db_path, &mut kiro_db_messages);
         all_messages.extend(kiro_db_messages);
     }
 
@@ -4318,7 +4787,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
     // `rebucket_days` pass cannot recover a split this grouping collapsed.
     let crush_bucket_timezone = bucket_tz::BucketTimezone::from_scanner_settings(scanner_settings);
     for source in &scan_result.crush_dbs {
-        let crush_messages: Vec<UnifiedMessage> =
+        let mut crush_messages: Vec<UnifiedMessage> =
             sessions::crush::parse_crush_sqlite_in(&source.db_path, &crush_bucket_timezone)
                 .into_iter()
                 .map(|mut msg| {
@@ -4327,16 +4796,25 @@ fn parse_all_messages_streaming<S: MessageSink>(
                     msg
                 })
                 .collect();
+        machine_labeler.label_messages(&source.db_path, &mut crush_messages);
         all_messages.extend(crush_messages);
     }
 
-    all_messages.extend(parse_antigravity_family_messages(&scan_result, pricing));
+    all_messages.extend(parse_antigravity_family_messages(
+        &scan_result,
+        pricing,
+        &machine_labeler,
+    ));
 
     // Trae API dump uses exact dollar_float totals, so pricing lookup is not needed.
     let trae_messages: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Trae)
         .par_iter()
-        .flat_map(|path| sessions::trae::parse_trae_file("trae", path))
+        .flat_map(|path| {
+            let mut messages = sessions::trae::parse_trae_file("trae", path);
+            machine_labeler.label_messages(path, &mut messages);
+            messages
+        })
         .collect();
     let deduped_trae_messages = dedupe_latest_trae_messages(trae_messages);
     all_messages.extend(deduped_trae_messages);
@@ -4345,13 +4823,15 @@ fn parse_all_messages_streaming<S: MessageSink>(
         .get(ClientId::CodeBuddy)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(
+            let mut outcome = load_or_parse_source(
                 message_cache::CacheIdentity::for_client(ClientId::CodeBuddy),
                 path,
                 &source_cache,
                 pricing,
                 sessions::codebuddy::parse_codebuddy_file,
-            )
+            );
+            machine_labeler.label_messages(path, &mut outcome.messages);
+            outcome
         })
         .collect();
     let mut codebuddy_seen: HashSet<String> = HashSet::new();
@@ -4380,7 +4860,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
             .get(ClientId::DevinDesktop)
             .par_iter()
             .map(|path| {
-                load_or_parse_source_with_fingerprint_context(
+                let mut outcome = load_or_parse_source_with_fingerprint_context(
                     message_cache::CacheIdentity::for_client(ClientId::DevinDesktop),
                     path,
                     &source_cache,
@@ -4416,7 +4896,9 @@ fn parse_all_messages_streaming<S: MessageSink>(
                             )
                         }
                     },
-                )
+                );
+                machine_labeler.label_messages(path, &mut outcome.messages);
+                outcome
             })
             .collect();
         for outcome in devin_desktop_outcomes {
@@ -4437,25 +4919,29 @@ fn parse_all_messages_streaming<S: MessageSink>(
     let workbuddy_detailed_outcomes: Vec<CachedParseOutcome> = workbuddy_detailed_paths
         .par_iter()
         .map(|path| {
-            load_or_parse_source(
+            let mut outcome = load_or_parse_source(
                 message_cache::CacheIdentity::for_client(ClientId::WorkBuddy),
                 path,
                 &source_cache,
                 pricing,
                 sessions::workbuddy::parse_workbuddy_file,
-            )
+            );
+            machine_labeler.label_messages(path, &mut outcome.messages);
+            outcome
         })
         .collect();
     let workbuddy_fallback_outcomes: Vec<CachedParseOutcome> = workbuddy_fallback_paths
         .par_iter()
         .map(|path| {
-            load_or_parse_sqlite_source(
+            let mut outcome = load_or_parse_sqlite_source(
                 message_cache::CacheIdentity::for_client(ClientId::WorkBuddy),
                 path,
                 &source_cache,
                 pricing,
                 sessions::workbuddy::parse_workbuddy_file,
-            )
+            );
+            machine_labeler.label_messages(path, &mut outcome.messages);
+            outcome
         })
         .collect();
     let mut workbuddy_detailed_messages = Vec::new();
@@ -4479,13 +4965,14 @@ fn parse_all_messages_streaming<S: MessageSink>(
 
     if include_synthetic {
         if let Some(db_path) = &scan_result.synthetic_db {
-            let outcome = load_or_parse_sqlite_source(
+            let mut outcome = load_or_parse_sqlite_source(
                 message_cache::CacheIdentity::synthetic(),
                 db_path,
                 &source_cache,
                 pricing,
                 sessions::synthetic::parse_octofriend_sqlite,
             );
+            machine_labeler.label_messages(db_path, &mut outcome.messages);
             all_messages.extend(outcome.messages);
             if let Some(entry) = outcome.cache_entry {
                 source_cache.insert(entry);
@@ -4509,6 +4996,8 @@ fn parse_all_messages_streaming<S: MessageSink>(
     StreamingParseOutcome {
         coverage: desktop_coverage,
         pending_save,
+        recount_proofs,
+        source_reads,
     }
 }
 
@@ -4968,8 +5457,15 @@ fn aggregate_model_usage_entries_with_rollup(
             GroupBy::ClientSession => {
                 format!("{}:{}:{}", msg.client, msg.session_id, normalized)
             }
+            GroupBy::MachineModel => {
+                let machine = message_machine_label(&msg);
+                format!("{}:{}:{}", machine.len(), machine, normalized)
+            }
         };
-        let merge_clients = matches!(group_by, GroupBy::Model | GroupBy::WorkspaceModel);
+        let merge_clients = matches!(
+            group_by,
+            GroupBy::Model | GroupBy::WorkspaceModel | GroupBy::MachineModel
+        );
         let session_grouped = matches!(group_by, GroupBy::Session | GroupBy::ClientSession);
         let entry = model_map.entry(key).or_insert_with(|| ModelUsage {
             client: msg.client.clone(),
@@ -4990,6 +5486,11 @@ fn aggregate_model_usage_entries_with_rollup(
             },
             session_id: if session_grouped {
                 Some(msg.session_id.clone())
+            } else {
+                None
+            },
+            machine: if matches!(group_by, GroupBy::MachineModel) {
+                Some(message_machine_label(&msg).to_string())
             } else {
                 None
             },
@@ -5066,6 +5567,15 @@ fn aggregate_model_usage_entries_with_rollup(
     });
 
     entries
+}
+
+/// A message's machine label. An unlabeled message is local: either no
+/// `scanner.localMachineLabel` is set, or it was built outside a scan.
+pub fn message_machine_label(message: &UnifiedMessage) -> &str {
+    message
+        .machine_label
+        .as_deref()
+        .unwrap_or(machine_label::DEFAULT_LOCAL_MACHINE_LABEL)
 }
 
 fn positive_token_total(tokens: &TokenBreakdown) -> i64 {
@@ -5419,6 +5929,7 @@ async fn generate_graph_with_loaded_pricing(
     options: ReportOptions,
     pricing: Option<&pricing::PricingService>,
     pricing_requirement: GraphPricingRequirement,
+    date_filter_exempt_clients: Option<&BTreeSet<String>>,
 ) -> Result<GraphResultV2, String> {
     let start = Instant::now();
     let captured_pricing = pricing.map(pricing::PricingService::with_cost_provenance_capture);
@@ -5442,8 +5953,13 @@ async fn generate_graph_with_loaded_pricing(
     // is what made this path hold every message at once (#1209); the sink
     // applies the same date filters per message and drops each one after it
     // has landed in the day map and produced its session span.
-    let mut sink = GraphSink::new(Some(&options), pricing, pricing_requirement);
-    if matches!(pricing_requirement, GraphPricingRequirement::Lenient)
+    let mut sink = GraphSink::new(
+        Some(&options),
+        date_filter_exempt_clients,
+        pricing,
+        pricing_requirement,
+    );
+    let parse_outcome = if matches!(pricing_requirement, GraphPricingRequirement::Lenient)
         && recovery::applicable(&home_dir)
     {
         // Local recovery requires native-session reconciliation. Submission
@@ -5451,7 +5967,7 @@ async fn generate_graph_with_loaded_pricing(
         // `LenientSourceOnly`, whose callers compare against what submission
         // sends and must not see the never-submitted overlay.
         let mut collector = GraphMessageCollector::default();
-        parse_all_messages_streaming_with_env_strategy(
+        let outcome = parse_all_messages_streaming_with_env_strategy(
             &home_dir,
             &clients,
             pricing,
@@ -5469,6 +5985,7 @@ async fn generate_graph_with_loaded_pricing(
             let source = collector.cost_estimates.take(&message);
             sink.accept_with_estimate_source(message, source);
         }
+        outcome
     } else {
         parse_all_messages_streaming_with_env_strategy(
             &home_dir,
@@ -5477,10 +5994,13 @@ async fn generate_graph_with_loaded_pricing(
             options.use_env_roots,
             &options.scanner_settings,
             &mut sink,
-        );
-    }
+        )
+    };
 
-    sink.finish(start, &bucket_timezone)
+    let mut result = sink.finish(start, &bucket_timezone)?;
+    result.recount_proofs = parse_outcome.recount_proofs;
+    result.source_reads = parse_outcome.source_reads;
+    Ok(result)
 }
 
 /// Messages buffered before a batch is folded away.
@@ -5506,6 +6026,11 @@ struct GraphSink<'a> {
     /// `Some` when the sink is fed straight from the parse and must apply the
     /// report's date filters itself; `None` when the caller already filtered.
     filter: Option<&'a ReportOptions>,
+    /// Clients exempt from the `filter`'s date bounds: the receiver admits
+    /// them only from a complete snapshot, so a date-bounded submission must
+    /// ship their whole history or freeze them entirely. Set by the
+    /// submission path only; `None` for local reports.
+    date_filter_exempt_clients: Option<&'a BTreeSet<String>>,
     pricing: Option<&'a pricing::PricingService>,
     requirement: GraphPricingRequirement,
     buffer: Vec<(UnifiedMessage, Option<EstimateSource>)>,
@@ -5525,11 +6050,13 @@ struct GraphSink<'a> {
 impl<'a> GraphSink<'a> {
     fn new(
         filter: Option<&'a ReportOptions>,
+        date_filter_exempt_clients: Option<&'a BTreeSet<String>>,
         pricing: Option<&'a pricing::PricingService>,
         requirement: GraphPricingRequirement,
     ) -> Self {
         Self {
             filter,
+            date_filter_exempt_clients,
             pricing,
             requirement,
             buffer: Vec::new(),
@@ -5700,7 +6227,13 @@ impl MessageSink for GraphSink<'_> {
             return;
         }
         if let Some(options) = self.filter {
-            if !message_passes_report_filter(&message, options) {
+            // Exempt clients carry full-history authority: the scan already
+            // read their complete sources, and a partial window for them
+            // freezes rather than scopes. See FULL_HISTORY_SUBMIT_CLIENTS.
+            let exempt = self
+                .date_filter_exempt_clients
+                .is_some_and(|set| set.contains(message.client.as_str()));
+            if !exempt && !message_passes_report_filter(&message, options) {
                 return;
             }
         }
@@ -5718,7 +6251,7 @@ fn parse_all_messages_streaming_with_env_strategy<S: MessageSink>(
     use_env_roots: bool,
     scanner_settings: &scanner::ScannerSettings,
     sink: &mut S,
-) {
+) -> StreamingParseOutcome {
     parse_all_messages_streaming(
         home_dir,
         clients,
@@ -5727,7 +6260,7 @@ fn parse_all_messages_streaming_with_env_strategy<S: MessageSink>(
         scanner_settings,
         SourceCachePolicy::Persistent,
         sink,
-    );
+    )
 }
 
 /// Collecting form of the submit-report build, retained as the test surface for
@@ -5748,7 +6281,7 @@ fn build_graph_from_messages(
     // sink applies none of its own. Delegating rather than duplicating keeps
     // this path and the streaming one on identical aggregation code, and lets
     // this function's tests stand as the sink's correctness proof.
-    let mut sink = GraphSink::new(None, pricing, pricing_requirement);
+    let mut sink = GraphSink::new(None, None, pricing, pricing_requirement);
     for message in filtered {
         sink.accept(message);
     }
@@ -5934,15 +6467,34 @@ pub async fn get_time_metrics_report(options: ReportOptions) -> Result<TimeMetri
 /// Version of [`generate_graph`] that retains cost provenance.
 pub async fn generate_graph_v2(options: ReportOptions) -> Result<GraphResultV2, String> {
     let pricing = pricing::PricingService::get_or_init().await?;
-    generate_graph_with_loaded_pricing(options, Some(&pricing), GraphPricingRequirement::Lenient)
-        .await
+    generate_graph_with_loaded_pricing(
+        options,
+        Some(&pricing),
+        GraphPricingRequirement::Lenient,
+        None,
+    )
+    .await
 }
 
 /// Version of [`generate_submission_graph`] that retains cost provenance.
-pub async fn generate_submission_graph_v2(options: ReportOptions) -> Result<GraphResultV2, String> {
+///
+/// `full_history_clients` is the list the submission declares complete in
+/// `scanScope.fullHistoryClients`: their messages bypass `since`/`until`/`year`
+/// so the payload actually contains the coverage it claims. Passing the same
+/// list the scan scope serializes keeps the declaration and the shipped data
+/// from diverging; see [`FULL_HISTORY_SUBMIT_CLIENTS`].
+pub async fn generate_submission_graph_v2(
+    options: ReportOptions,
+    full_history_clients: &BTreeSet<String>,
+) -> Result<GraphResultV2, String> {
     let pricing = pricing::PricingService::get_or_init().await?;
-    generate_graph_with_loaded_pricing(options, Some(&pricing), GraphPricingRequirement::Submission)
-        .await
+    generate_graph_with_loaded_pricing(
+        options,
+        Some(&pricing),
+        GraphPricingRequirement::Submission,
+        Some(full_history_clients),
+    )
+    .await
 }
 
 /// Version of [`generate_local_graph_report`] that retains cost provenance.
@@ -5954,6 +6506,7 @@ pub async fn generate_local_graph_report_v2(
         options,
         pricing.as_deref(),
         GraphPricingRequirement::Lenient,
+        None,
     )
     .await
 }
@@ -5976,6 +6529,7 @@ pub async fn generate_source_graph_report_v2(
         options,
         pricing.as_deref(),
         GraphPricingRequirement::LenientSourceOnly,
+        None,
     )
     .await
 }
@@ -6471,6 +7025,9 @@ where
 }
 
 async fn load_pricing_for_local_parse() -> Option<Arc<pricing::PricingService>> {
+    if network::is_offline() {
+        return pricing::PricingService::get_or_init().await.ok();
+    }
     if std::env::var("TOKSCALE_PRICING_CACHE_ONLY")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
@@ -7184,6 +7741,18 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Omp, omp_count);
     messages.extend(omp_msgs);
 
+    let proma_sources = scan_result
+        .get(ClientId::Proma)
+        .par_iter()
+        .map(|path| (path.clone(), sessions::proma::parse_proma_file(path)))
+        .collect();
+    let proma_messages = sessions::proma::reconcile_sources(proma_sources);
+    counts.set(
+        ClientId::Proma,
+        proma_messages.len().min(i32::MAX as usize) as i32,
+    );
+    messages.extend(proma_messages.iter().map(unified_to_parsed));
+
     let augment_msgs_raw: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Augment)
         .par_iter()
@@ -7309,11 +7878,13 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
 
     // DeepSeek Harness zstd JSONL transcripts. A fork's seeded prefix repeats
     // the parent's rows verbatim in a second file, so dedup across the lane.
+    let dsh_warnings = Mutex::new(Vec::new());
     let dsh_msgs_raw: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Dsh)
         .par_iter()
-        .flat_map(|path| sessions::dsh::parse_dsh_file(path))
+        .flat_map(|path| parse_dsh_source(path, &dsh_warnings).messages)
         .collect();
+    emit_dsh_scan_warnings(dsh_warnings);
     let mut dsh_seen: HashSet<String> = HashSet::new();
     let dsh_msgs: Vec<ParsedMessage> = dsh_msgs_raw
         .into_iter()
@@ -7643,7 +8214,13 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Crush, crush_count);
     messages.extend(crush_msgs);
 
-    let antigravity_msgs = parse_antigravity_family_messages(&scan_result, None);
+    // `ParsedMessage` carries no machine label: this lane only counts and
+    // lists messages per client, so it reads every file as local.
+    let antigravity_msgs = parse_antigravity_family_messages(
+        &scan_result,
+        None,
+        &machine_label::MachineLabeler::default(),
+    );
     for client in [
         ClientId::Antigravity,
         ClientId::AntigravityCli,
@@ -7996,6 +8573,7 @@ type AntigravitySourceParser = fn(&Path) -> Vec<UnifiedMessage>;
 fn parse_antigravity_family_messages(
     scan_result: &scanner::ScanResult,
     pricing: Option<&pricing::PricingService>,
+    machine_labeler: &machine_label::MachineLabeler,
 ) -> Vec<UnifiedMessage> {
     let sources: [(ClientId, AntigravitySourceParser); 3] = [
         (
@@ -8017,7 +8595,11 @@ fn parse_antigravity_family_messages(
         let mut source_messages: Vec<UnifiedMessage> = scan_result
             .get(client)
             .par_iter()
-            .flat_map_iter(|path| parse(path))
+            .flat_map_iter(|path| {
+                let mut messages = parse(path);
+                machine_labeler.label_messages(path, &mut messages);
+                messages
+            })
             .collect();
         if let Some(pricing) = pricing {
             for message in &mut source_messages {
@@ -8112,6 +8694,7 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
         estimate_status: msg.estimate_status,
         copilot_context: None,
         session_context: Default::default(),
+        machine_label: None,
     }
 }
 
@@ -8449,6 +9032,71 @@ mod tests {
         assert_eq!(copilot.len(), 1, "the Copilot snapshots still coalesce");
         assert_eq!(copilot[0].tokens.input, 1000);
         assert_eq!(copilot[0].tokens.output, 20);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn proma_reconciles_current_index_and_live_sources_on_cold_warm_and_direct_scans() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let root = source_home.path().join(".proma");
+        let sdk = root.join("sdk-config/sessions/native.jsonl");
+        let ui = root.join("agent-sessions/ui.jsonl");
+        std::fs::create_dir_all(sdk.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(ui.parent().unwrap()).unwrap();
+        std::fs::write(&sdk, concat!(
+            "{\"type\":\"session\",\"version\":3,\"id\":\"fork\",\"timestamp\":\"2026-05-05T12:00:00Z\"}\n",
+            "{\"type\":\"message\",\"id\":\"entry\",\"timestamp\":\"2026-05-05T12:01:00Z\",\"message\":{\"role\":\"assistant\",\"model\":\"mimo-v2.5-pro\",\"usage\":{\"input\":100,\"output\":20,\"cost\":{\"total\":0.5}}}}\n"
+        )).unwrap();
+        std::fs::write(
+            &ui,
+            serde_json::json!({
+                "type":"assistant", "uuid":"copied-ui-entry", "session_id":"deleted-parent",
+                "_createdAt":1778000000123i64,
+                "message":{"model":"mimo-v2.5-pro","usage":{"input_tokens":100,"output_tokens":20}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let clients = ["proma".to_string()];
+        for (phase, expected_count) in [(0, 2), (1, 1), (2, 1), (3, 1)] {
+            if phase == 1 {
+                std::fs::write(root.join("agent-sessions.json"),serde_json::json!({
+                    "sessions":[{"id":"ui", "sdkSessionId":"fork", "piEntryBindings":{"copied-ui-entry":"entry"}}]
+                }).to_string()).unwrap();
+            }
+            if phase == 3 {
+                std::fs::remove_file(&sdk).unwrap();
+            }
+            let messages = parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &clients,
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+            );
+            assert_eq!(messages.len(), expected_count, "phase {phase}");
+            assert_eq!(
+                messages.iter().map(|m| m.tokens.total()).sum::<i64>(),
+                120 * expected_count as i64
+            );
+            assert!(messages
+                .iter()
+                .all(|m| !m.dedup_key.as_deref().unwrap().starts_with('{')));
+            let direct = parse_local_clients(LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().into()),
+                use_env_roots: false,
+                clients: Some(clients.to_vec()),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+            })
+            .unwrap();
+            assert_eq!(direct.messages.len(), expected_count);
+            assert_eq!(direct.counts.get(ClientId::Proma), expected_count as i32);
+        }
     }
 
     #[test]
@@ -8902,7 +9550,7 @@ mod tests {
         ] {
             assert!(!message_passes_report_filter(&message, &options));
         }
-        let mut sink = GraphSink::new(None, None, GraphPricingRequirement::Submission);
+        let mut sink = GraphSink::new(None, None, None, GraphPricingRequirement::Submission);
         sink.accept(message.clone());
         assert!(sink.buffer.is_empty());
         assert!(crate::aggregate_by_date(vec![message.clone()]).is_empty());
@@ -8920,7 +9568,7 @@ mod tests {
 
     #[test]
     fn graph_sink_keeps_only_one_bounded_pricing_batch() {
-        let mut sink = GraphSink::new(None, None, GraphPricingRequirement::Lenient);
+        let mut sink = GraphSink::new(None, None, None, GraphPricingRequirement::Lenient);
         for timestamp in 1..=(GRAPH_SINK_BATCH * 2 + 1) {
             sink.accept(UnifiedMessage::new(
                 "copilot",
@@ -9185,6 +9833,65 @@ mod tests {
         assert_eq!(monthly_reasoning, 18);
         assert_eq!(monthly_reasoning, model_reasoning);
         assert_eq!(monthly_reasoning, hourly_reasoning);
+    }
+
+    #[test]
+    fn submission_sink_keeps_exempt_clients_outside_the_date_window() {
+        let message = |client: &str, date: &str| {
+            let mut msg = UnifiedMessage::new(
+                client,
+                "model",
+                "provider",
+                format!("{client}-{date}"),
+                1_767_225_600_000,
+                TokenBreakdown {
+                    input: 10,
+                    output: 5,
+                    ..TokenBreakdown::default()
+                },
+                0.0,
+            );
+            msg.date = date.to_string();
+            msg
+        };
+        let tz = crate::BucketTimezone::default();
+        let options = ReportOptions {
+            since: Some("2026-02-01".to_string()),
+            until: Some("2026-02-28".to_string()),
+            ..ReportOptions::default()
+        };
+        let exempt = BTreeSet::from(["droid".to_string()]);
+
+        let mut sink = GraphSink::new(
+            Some(&options),
+            Some(&exempt),
+            None,
+            GraphPricingRequirement::Lenient,
+        );
+        for message in [
+            message("droid", "2025-12-01"),
+            message("droid", "2026-02-10"),
+            message("codex", "2025-12-01"),
+            message("codex", "2026-02-10"),
+        ] {
+            sink.accept(message);
+        }
+        let result = sink.finish(std::time::Instant::now(), &tz).expect("graph");
+
+        let droid_days: Vec<&str> = result
+            .contributions
+            .iter()
+            .filter(|day| day.clients.iter().any(|c| c.client == "droid"))
+            .map(|day| day.date.as_str())
+            .collect();
+        assert_eq!(droid_days, vec!["2025-12-01", "2026-02-10"]);
+        let codex_days: Vec<&str> = result
+            .contributions
+            .iter()
+            .filter(|day| day.clients.iter().any(|c| c.client == "codex"))
+            .map(|day| day.date.as_str())
+            .collect();
+        assert_eq!(codex_days, vec!["2026-02-10"]);
     }
 
     #[test]
@@ -10713,7 +11420,22 @@ mod tests {
             GroupBy::from_str("client-session-model").unwrap(),
             GroupBy::ClientSession
         );
+        assert_eq!(
+            GroupBy::from_str("machine,model").unwrap(),
+            GroupBy::MachineModel
+        );
+        assert_eq!(
+            GroupBy::from_str("machine-model").unwrap(),
+            GroupBy::MachineModel
+        );
+        assert_eq!(
+            GroupBy::from_str("Machine, Model").unwrap(),
+            GroupBy::MachineModel
+        );
         assert!(GroupBy::from_str("unknown").is_err());
+        assert!(GroupBy::from_str("unknown")
+            .unwrap_err()
+            .contains("machine,model"));
     }
 
     #[test]
@@ -10730,6 +11452,7 @@ mod tests {
             GroupBy::WorkspaceModel,
             GroupBy::Session,
             GroupBy::ClientSession,
+            GroupBy::MachineModel,
         ];
 
         for variant in variants {
@@ -10737,6 +11460,61 @@ mod tests {
             let parsed = GroupBy::from_str(&rendered).unwrap();
             assert_eq!(parsed, variant);
         }
+    }
+
+    #[test]
+    fn test_group_by_machine_model_displays_as_machine_comma_model() {
+        assert_eq!(GroupBy::MachineModel.to_string(), "machine,model");
+    }
+
+    #[test]
+    fn test_machine_model_splits_one_model_across_machines() {
+        let labeled = |client: &str, session: &str, machine: Option<&str>| {
+            let mut message =
+                make_workspace_message(client, "gpt-5.4", "openai", session, 1.0, None, None);
+            message.machine_label = machine.map(str::to_string);
+            message
+        };
+        let messages = vec![
+            labeled("codex", "s1", Some("local")),
+            labeled("claude", "s2", Some("local")),
+            labeled("codex", "s3", Some("steven")),
+            // A message built outside a scan carries no label and counts as local.
+            labeled("codex", "s4", None),
+        ];
+
+        let mut entries = aggregate_model_usage_entries(messages.clone(), &GroupBy::MachineModel);
+        entries.sort_by(|a, b| a.machine.cmp(&b.machine));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].machine.as_deref(), Some("local"));
+        assert_eq!(entries[0].model, "gpt-5.4");
+        assert_eq!(entries[0].input, 30);
+        assert_eq!(entries[0].message_count, 3);
+        assert_eq!(entries[0].merged_clients.as_deref(), Some("codex, claude"));
+        assert_eq!(entries[1].machine.as_deref(), Some("steven"));
+        assert_eq!(entries[1].input, 10);
+        assert_eq!(entries[1].message_count, 1);
+
+        // Other groupings keep merging across machines and leave `machine` unset.
+        let merged = aggregate_model_usage_entries(messages, &GroupBy::Model);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].input, 40);
+        assert_eq!(merged[0].machine, None);
+    }
+
+    #[test]
+    fn test_machine_model_rows_serialize_machine_only_when_set() {
+        let mut message =
+            make_workspace_message("codex", "gpt-5.4", "openai", "s1", 1.0, None, None);
+        message.machine_label = Some("steven".to_string());
+        let machine_rows =
+            aggregate_model_usage_entries(vec![message.clone()], &GroupBy::MachineModel);
+        let value = serde_json::to_value(&machine_rows[0]).unwrap();
+        assert_eq!(value["machine"], serde_json::json!("steven"));
+
+        let model_rows = aggregate_model_usage_entries(vec![message], &GroupBy::Model);
+        let value = serde_json::to_value(&model_rows[0]).unwrap();
+        assert!(value.get("machine").is_none());
     }
 
     #[test]
@@ -11729,6 +12507,7 @@ mod tests {
             requested: HashSet::from(["synthetic"]),
             include_synthetic: true,
             timezone: None,
+            local_machine_label: None,
         };
         let mut message = UnifiedMessage::new(
             "codex",
@@ -17746,7 +18525,8 @@ mod tests {
             &rollout,
             transcript
                 .replace("gpt-5.2", "combo/aggregate-fixture")
-                .replace("2026-04-30T11:00:03Z", "2026-04-30T11:00:10Z"),
+                // Keep the equal-token sibling outside the 30s late-usage window.
+                .replace("2026-04-30T11:00:03Z", "2026-04-30T11:01:10Z"),
         )
         .unwrap();
 
@@ -18837,6 +19617,7 @@ mod tests {
             requested: HashSet::new(),
             include_synthetic: true,
             timezone: Some(crate::bucket_tz::BucketTimezone::Local),
+            local_machine_label: None,
         };
         flush_lane(&mut vec![message.clone()], &context, &mut collector);
         assert_eq!(scan.take_cost_estimate_source(&message), None);
@@ -18851,7 +19632,7 @@ mod tests {
         recovery::merge(&mut collector.messages, vec![recovered], vec![], |_| true);
         assert_eq!(collector.messages.len(), 2);
         let calculations = scan.detailed_calculation_count();
-        let mut sink = GraphSink::new(None, Some(&scan), GraphPricingRequirement::Lenient);
+        let mut sink = GraphSink::new(None, None, Some(&scan), GraphPricingRequirement::Lenient);
         for message in collector.messages {
             let source = collector.cost_estimates.take(&message);
             if message.session_id == "native" {
@@ -21774,6 +22555,105 @@ mod tests {
         assert_eq!(parsed.messages[0].session_id, "external-session");
     }
 
+    /// The recount proof must be built from the same rows the snapshot is,
+    /// with the request_id duplicates generation 2 drops counted on the
+    /// `previous` side only; and a database that cannot be read must show up
+    /// in the source summary rather than pass as "no usage".
+    #[test]
+    fn devin_cli_scan_proves_request_id_duplicates_and_reports_unreadable_sources() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let db_dir = temp_dir.path().join(".local/share/devin/cli");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let conn = rusqlite::Connection::open(db_dir.join("sessions.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY,
+                 working_directory TEXT NOT NULL,
+                 backend_type TEXT NOT NULL,
+                 model TEXT NOT NULL,
+                 title TEXT,
+                 agent_mode TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 last_activity_at INTEGER NOT NULL
+             );
+             CREATE TABLE message_nodes (
+                 row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id TEXT NOT NULL,
+                 node_id INTEGER NOT NULL,
+                 parent_node_id INTEGER,
+                 chat_message TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 metadata TEXT
+             );
+             INSERT INTO sessions (id, working_directory, backend_type, model, agent_mode, created_at, last_activity_at)
+             VALUES ('sess', '/tmp/project', 'windsurf', 'gpt-5', 'accept-edits', 1, 1);",
+        )
+        .unwrap();
+        let rows = [
+            // One API request persisted twice: generation 1 counted both.
+            r#"{"role":"assistant","metadata":{"request_id":"req-1","generation_model":"gpt-5","metrics":{"input_tokens":67,"output_tokens":103}}}"#,
+            r#"{"role":"assistant","metadata":{"request_id":"req-1","generation_model":"gpt-5","metrics":{"input_tokens":67,"output_tokens":103},"extensions":{"chisel/tool_call_content":{}}}}"#,
+            r#"{"role":"assistant","metadata":{"request_id":"req-2","generation_model":"gpt-5","metrics":{"input_tokens":10,"output_tokens":5}}}"#,
+            // An older row without request_id keeps its row key in both.
+            r#"{"role":"assistant","metadata":{"generation_model":"gpt-5","metrics":{"input_tokens":20,"output_tokens":5}}}"#,
+        ];
+        for chat in rows {
+            conn.execute(
+                "INSERT INTO message_nodes (session_id, node_id, chat_message, created_at) VALUES ('sess', 1, ?1, 1700000000)",
+                [chat],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        // A second discovered database that is not a database at all. The
+        // parser reads nothing from it, exactly as it would from an empty one.
+        let broken_dir = temp_dir.path().join("broken");
+        std::fs::create_dir_all(&broken_dir).unwrap();
+        std::fs::write(broken_dir.join("sessions.db"), b"not a sqlite database").unwrap();
+        let mut extra_scan_paths = std::collections::BTreeMap::new();
+        extra_scan_paths.insert("devin-cli".to_string(), vec![broken_dir]);
+
+        let mut messages: Vec<UnifiedMessage> = Vec::new();
+        let outcome = super::parse_all_messages_streaming(
+            temp_dir.path().to_str().unwrap(),
+            &["devin-cli".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings {
+                extra_scan_paths,
+                ..Default::default()
+            },
+            SourceCachePolicy::InMemory,
+            &mut messages,
+        );
+
+        assert_eq!(
+            messages.len(),
+            3,
+            "generation 2 collapses the duplicate request"
+        );
+        let proof = outcome
+            .recount_proofs
+            .get("devin-cli")
+            .expect("devin-cli recount proof");
+        let date = messages[0].date.clone();
+        assert!(messages.iter().all(|message| message.date == date));
+        let entry = &proof[&date]["gpt-5"];
+        assert_eq!(entry.corrected.tokens.input, 67 + 10 + 20);
+        assert_eq!(entry.corrected.tokens.output, 103 + 5 + 5);
+        assert_eq!(entry.corrected.messages, 3);
+        assert_eq!(entry.previous.tokens.input, 67 * 2 + 10 + 20);
+        assert_eq!(entry.previous.tokens.output, 103 * 2 + 5 + 5);
+        assert_eq!(entry.previous.messages, 4);
+        assert_eq!(proof.len(), 1);
+
+        let reads = outcome.source_reads["devin-cli"];
+        assert_eq!(reads.discovered, 2);
+        assert_eq!(reads.unreadable, 1);
+        assert!(!reads.complete());
+    }
+
     #[test]
     fn test_parse_local_clients_devin_zero_cli_usage_does_not_suppress_desktop() {
         let temp_dir = tempfile::TempDir::new().unwrap();
@@ -22270,6 +23150,7 @@ mod tests {
                 },
                 None,
                 GraphPricingRequirement::Lenient,
+                None,
             ))
             .unwrap();
 
@@ -24728,6 +25609,228 @@ mod tests {
                 .get(identity, &path)
                 .is_some());
         }
+    }
+
+    /// Installs [`crate::AFTER_SQLITE_SCAN_HOOK`] for one test and clears it again
+    /// even if the test panics, so no later scan inherits the write.
+    struct AfterSqliteScanHook;
+
+    impl AfterSqliteScanHook {
+        fn set(path: &std::path::Path, hook: fn(&std::path::Path)) -> Self {
+            *crate::AFTER_SQLITE_SCAN_HOOK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some((path.to_path_buf(), hook));
+            Self
+        }
+    }
+
+    impl Drop for AfterSqliteScanHook {
+        fn drop(&mut self) {
+            *crate::AFTER_SQLITE_SCAN_HOOK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+    }
+
+    static AFTER_SQLITE_SCAN_HOOK_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn count_after_sqlite_scan_hook_call(_: &std::path::Path) {
+        AFTER_SQLITE_SCAN_HOOK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn after_sqlite_scan_hook_runs_only_for_its_database() {
+        AFTER_SQLITE_SCAN_HOOK_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let temp = tempfile::TempDir::new().unwrap();
+        let expected = temp.path().join("expected.db");
+        let other = temp.path().join("other.db");
+        let hook = AfterSqliteScanHook::set(&expected, count_after_sqlite_scan_hook_call);
+
+        crate::run_after_sqlite_scan_hook(&other);
+        assert_eq!(
+            AFTER_SQLITE_SCAN_HOOK_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        crate::run_after_sqlite_scan_hook(&expected);
+        assert_eq!(
+            AFTER_SQLITE_SCAN_HOOK_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        drop(hook);
+    }
+
+    /// Downgrades the cached entry for `path` to one written before billing
+    /// identity existed, which is what an upgrade from an older build leaves.
+    fn mark_cache_entry_legacy(client: ClientId, path: &std::path::Path) {
+        let identity = message_cache::CacheIdentity::for_client(client);
+        let mut cache = message_cache::SourceMessageCache::load();
+        let mut entry = cache
+            .take(identity, path)
+            .expect("the first scan caches the database");
+        entry.billing_identity_generation = 0;
+        cache.insert(entry);
+        cache.save_if_dirty();
+    }
+
+    /// Stands in for OpenCode committing a message while a scan is reading.
+    fn commit_opencode_row_during_scan(path: &std::path::Path) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute(
+                "INSERT OR IGNORE INTO message (id, session_id, time_created, time_updated, data)
+                 VALUES ('msg-during-scan', 'session-1', 9900, 9900, ?1)",
+                [timed_opencode_payload("msg-during-scan", 40)],
+            )
+            .unwrap();
+    }
+
+    /// An OpenCode database in active use can be written during every scan. A
+    /// legacy cache entry must not be replayed over a complete scan for that
+    /// reason alone: the entry never gets replaced, and every report and
+    /// submission freezes at the usage it held.
+    #[test]
+    #[serial_test::serial]
+    fn opencode_complete_scan_that_raced_a_write_replaces_a_legacy_cache_entry() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let db_dir = source_home.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join("opencode.db");
+        let conn = create_timed_opencode_db(&db_path);
+        insert_timed_opencode_row(&conn, "msg-old", 1_000, 50);
+        let scan = || {
+            parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["opencode".to_string()],
+                None,
+            )
+        };
+        assert_eq!(total_output_tokens(&scan()), 50);
+        mark_cache_entry_legacy(ClientId::OpenCode, &db_path);
+
+        // Usage recorded after the legacy entry was written, then a scan that
+        // OpenCode writes into while it runs.
+        insert_timed_opencode_row(&conn, "msg-new", 2_000, 60);
+        let hook = AfterSqliteScanHook::set(&db_path, commit_opencode_row_during_scan);
+        let raced = scan();
+        drop(hook);
+        assert_eq!(
+            total_output_tokens(&raced),
+            110,
+            "the complete scan, not the legacy entry, must be reported"
+        );
+        let identity = message_cache::CacheIdentity::for_client(ClientId::OpenCode);
+        assert!(
+            message_cache::SourceMessageCache::load()
+                .get(identity, &db_path)
+                .is_none(),
+            "the legacy entry the database moved past must be retired"
+        );
+
+        // Once the database is quiet, a scan sees every row and caches it
+        // under the current generation.
+        assert_eq!(total_output_tokens(&scan()), 150);
+        assert_eq!(
+            message_cache::SourceMessageCache::load()
+                .get(identity, &db_path)
+                .expect("a stable scan caches the database")
+                .billing_identity_generation,
+            1
+        );
+    }
+
+    fn micode_row_payload(output: i64) -> String {
+        format!(
+            r#"{{
+                "role": "assistant",
+                "modelID": "mimo-v2.5-pro",
+                "providerID": "mimo",
+                "cost": 0.05,
+                "tokens": {{ "input": 100, "output": {output}, "reasoning": 0, "cache": {{ "read": 0, "write": 0 }} }},
+                "time": {{ "created": 1700000000000.0 }}
+            }}"#
+        )
+    }
+
+    /// Stands in for MiMo Code committing a message while a scan is reading.
+    fn commit_micode_row_during_scan(path: &std::path::Path) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute(
+                "INSERT OR IGNORE INTO message (id, session_id, data)
+                 VALUES ('msg-during-scan', 'ses_1', ?1)",
+                [micode_row_payload(40)],
+            )
+            .unwrap();
+    }
+
+    /// MiMo Code's lane has the same legacy fallback as OpenCode's, so a
+    /// database written during the scan must not freeze its usage either.
+    #[test]
+    #[serial_test::serial]
+    fn micode_complete_scan_that_raced_a_write_replaces_a_legacy_cache_entry() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let micode_dir = source_home.path().join(".local/share/mimocode");
+        std::fs::create_dir_all(&micode_dir).unwrap();
+        let db_path = micode_dir.join("mimocode.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        let insert = |id: &str, output: i64| {
+            conn.execute(
+                "INSERT INTO message (id, session_id, data) VALUES (?1, 'ses_1', ?2)",
+                rusqlite::params![id, micode_row_payload(output)],
+            )
+            .unwrap();
+        };
+        insert("msg-old", 50);
+        let scan = || {
+            parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["micode".to_string()],
+                None,
+            )
+        };
+        assert_eq!(total_output_tokens(&scan()), 50);
+        mark_cache_entry_legacy(ClientId::MiMoCode, &db_path);
+
+        insert("msg-new", 60);
+        let hook = AfterSqliteScanHook::set(&db_path, commit_micode_row_during_scan);
+        let raced = scan();
+        drop(hook);
+        assert_eq!(
+            total_output_tokens(&raced),
+            110,
+            "the complete scan, not the legacy entry, must be reported"
+        );
+        let identity = message_cache::CacheIdentity::for_client(ClientId::MiMoCode);
+        assert!(
+            message_cache::SourceMessageCache::load()
+                .get(identity, &db_path)
+                .is_none(),
+            "the legacy entry the database moved past must be retired"
+        );
+
+        assert_eq!(total_output_tokens(&scan()), 150);
+        assert_eq!(
+            message_cache::SourceMessageCache::load()
+                .get(identity, &db_path)
+                .expect("a stable scan caches the database")
+                .billing_identity_generation,
+            1
+        );
     }
 
     #[cfg(unix)]

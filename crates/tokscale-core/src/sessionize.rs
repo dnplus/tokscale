@@ -516,6 +516,7 @@ mod tests {
             estimate_status: crate::sessions::EstimateStatus::Unpriced,
             copilot_context: None,
             session_context: Default::default(),
+            machine_label: None,
             duration_ms: None,
         }
     }

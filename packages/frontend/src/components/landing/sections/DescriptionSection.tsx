@@ -7,23 +7,22 @@ export function DescriptionSection() {
   return (
     <DescriptionSectionWrapper>
       <DescriptionText>
-        A high-performance CLI tool
+        A high-performance CLI tool{" "}
         <br />
-        and visualization dashboard
+        and visualization dashboard{" "}
         <br />
-        for tracking token usage and costs
+        for tracking token usage and costs{" "}
         <br />
         across multiple AI coding agents.
       </DescriptionText>
 
       <ClientLogosContainer>
         <ClientLogosFadeLeft />
-        <Image
+        <ClientLogos
           src="/assets/landing/client-logos-grid.svg"
           alt="Supported AI coding clients"
           width={965}
           height={100}
-          style={{ width: "100%", maxWidth: 965, height: "auto" }}
         />
         <ClientLogosFadeRight />
       </ClientLogosContainer>
@@ -63,9 +62,15 @@ const DescriptionText = styled.p`
   letter-spacing: -0.03em;
   text-align: center;
   color: #b6c0d4;
+  text-wrap: balance;
 
+  /* The desktop line breaks leave single words on a line once the text wraps. */
   @media (max-width: 768px) {
     font-size: 28px;
+
+    br {
+      display: none;
+    }
   }
 
   @media (max-width: 480px) {
@@ -93,7 +98,7 @@ const ClientLogosFadeLeft = styled.div`
   pointer-events: none;
 
   @media (max-width: 768px) {
-    width: 120px;
+    width: 56px;
   }
 `;
 
@@ -108,7 +113,20 @@ const ClientLogosFadeRight = styled.div`
   pointer-events: none;
 
   @media (max-width: 768px) {
-    width: 120px;
+    width: 56px;
+  }
+`;
+
+/* Phones show the middle of the strip at a readable size instead of shrinking all of it. */
+const ClientLogos = styled(Image)`
+  flex: 0 0 auto;
+  width: 100%;
+  max-width: 965px;
+  height: auto;
+
+  @media (max-width: 768px) {
+    width: max(100%, 560px);
+    max-width: none;
   }
 `;
 

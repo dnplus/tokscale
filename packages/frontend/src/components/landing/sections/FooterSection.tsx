@@ -80,8 +80,9 @@ const FooterNav = styled.nav`
   gap: 20px;
 
   @media (max-width: 480px) {
-    flex-direction: column;
-    gap: 4px;
+    flex-wrap: wrap;
+    column-gap: 20px;
+    row-gap: 0;
   }
 `;
 
