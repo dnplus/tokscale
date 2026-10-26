@@ -50,16 +50,6 @@ pub(crate) async fn get_with_retry(
 mod tests {
     use super::*;
 
-    /// Reserve a port, then release it, so a connect to it is refused rather
-    /// than timing out. Binding first is what makes the port reliably free:
-    /// hardcoding one would race any other listener on the machine.
-    fn refused_url() -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
-        let port = listener.local_addr().expect("read the bound port").port();
-        drop(listener);
-        format!("http://127.0.0.1:{port}/pricing.json")
-    }
-
     // @keep: this is the #1238 regression, and the assertion is deliberately
     // not on reqwest's or hyper's wording.
     //
@@ -71,12 +61,18 @@ mod tests {
     // message `get_with_retry` returns must carry more than Display does.
     #[tokio::test]
     async fn network_error_carries_the_cause_display_alone_would_drop() {
-        let url = refused_url();
-        let client = pricing_client().expect("build the pricing client");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let address = listener.local_addr().expect("read the bound address");
+        let url = format!("http://{address}/pricing.json");
+        let client = crate::http::client_builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .expect("build the pricing client");
 
         let message = get_with_retry(&client, &url, "TestSource")
             .await
-            .expect_err("a connect to a closed port must fail");
+            .expect_err("a server that never responds must time out");
 
         assert!(
             message.starts_with("TestSource network error: "),
@@ -86,11 +82,11 @@ mod tests {
         // The bare Display, which is what this code used to print. Anchoring on
         // "longer than Display" rather than on the literal cause text keeps a
         // dependency bump from reddening this test for rewording its prose.
-        let displayed = crate::http::client()
+        let displayed = client
             .get(&url)
             .send()
             .await
-            .expect_err("a connect to a closed port must fail")
+            .expect_err("a server that never responds must time out")
             .to_string();
         assert!(
             message.len() > format!("TestSource network error: {displayed}").len(),
