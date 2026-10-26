@@ -285,7 +285,8 @@ const MiddleContentInner = styled.div`
   }
 
   @media (max-width: 480px) {
-    padding: 100px 16px 24px;
+    /* Start the copy below the smaller phone icon instead of over it. */
+    padding: 148px 16px 24px;
     gap: 24px;
   }
 `;
@@ -300,13 +301,13 @@ const Avatar3D = styled.div`
   z-index: 1;
 
   @media (max-width: 480px) {
-    width: 200px;
-    height: 200px;
-    top: -20px;
+    width: 184px;
+    height: 184px;
+    top: -16px;
 
     img {
-      width: 200px !important;
-      height: 200px !important;
+      width: 184px !important;
+      height: 184px !important;
     }
   }
 `;
@@ -345,6 +346,8 @@ const HeadingText = styled.p`
   letter-spacing: -0.02em;
   text-align: center;
   color: #92e7ff;
+
+  text-wrap: balance;
 
   @media (max-width: 768px) {
     font-size: 28px;

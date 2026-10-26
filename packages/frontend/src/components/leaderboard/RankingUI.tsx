@@ -311,6 +311,12 @@ export const SegmentedGroup = styled.div`
   &::-webkit-scrollbar {
     display: none;
   }
+
+  /* Wrap instead of hiding options past the edge, like the profile range tabs. */
+  @media (max-width: 640px) {
+    flex-wrap: wrap;
+    overflow-x: visible;
+  }
 `;
 
 export const SegmentButton = styled.button<{ $active: boolean }>`

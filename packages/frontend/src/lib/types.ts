@@ -60,6 +60,7 @@ export const SUPPORTED_CLIENT_TYPES = [
   "muse",
   "aside",
   "vibe",
+  "proma",
 ] as const;
 
 export type CcMirrorClientType = `cc-mirror/${string}`;

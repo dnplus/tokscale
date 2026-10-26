@@ -87,7 +87,11 @@ export function QuickstartSection() {
                   <CommandText>bunx tokscale@latest</CommandText>
                   <GradientAccent />
                 </CommandInputArea>
-                <CopyBtn onClick={tui.copy}>
+                <CopyBtn
+                  type="button"
+                  onClick={tui.copy}
+                  aria-label={tui.copied ? "Copied bunx tokscale@latest" : "Copy bunx tokscale@latest"}
+                >
                   <CopyBtnText>{tui.copied ? "Copied!" : "Copy"}</CopyBtnText>
                 </CopyBtn>
               </CommandBox>
@@ -117,7 +121,13 @@ export function QuickstartSection() {
                   <CommandText>bunx tokscale@latest submit</CommandText>
                   <GradientAccent $delay />
                 </CommandInputArea>
-                <CopyBtn onClick={submit.copy}>
+                <CopyBtn
+                  type="button"
+                  onClick={submit.copy}
+                  aria-label={
+                    submit.copied ? "Copied bunx tokscale@latest submit" : "Copy bunx tokscale@latest submit"
+                  }
+                >
                   <CopyBtnText>{submit.copied ? "Copied!" : "Copy"}</CopyBtnText>
                 </CopyBtn>
               </CommandBox>
@@ -223,6 +233,9 @@ const QuickstartCard = styled.div<{ $position: "left" | "right" }>`
   }
 
   @media (max-width: 900px) {
+    /* Stacked cards size to their content; a zero flex basis pins them at min-height. */
+    flex: 0 0 auto;
+
     ${({ $position }) =>
       $position === "left" && css`
       border-right: none;
@@ -251,6 +264,14 @@ const CardScreenshot = styled.div`
   position: absolute;
   top: 32px;
   right: 32px;
+
+  /* In flow on phones so a wrapped title cannot slide under the artwork. */
+  @media (max-width: 560px) {
+    position: relative;
+    top: auto;
+    right: auto;
+    margin-bottom: 24px;
+  }
 `;
 
 const CardContent = styled.div`
@@ -281,6 +302,12 @@ const CommandBox = styled.div`
   background: #010a15;
   border: 1px solid #10233e;
   border-radius: 12px;
+
+  /* Stack on phones so the whole command stays readable. */
+  @media (max-width: 560px) {
+    flex-direction: column;
+    align-items: stretch;
+  }
 `;
 
 const CommandInputArea = styled.div`
@@ -295,20 +322,37 @@ const CommandInputArea = styled.div`
   border-radius: 8px;
   height: 36px;
   overflow: hidden;
+
+  @media (max-width: 560px) {
+    height: auto;
+    min-height: 44px;
+    padding: 10px 12px;
+  }
 `;
 
-const CommandText = styled.span`
-  font-family: "Inconsolata", monospace !important;
+/* A <code> element picks up the loaded mono font from the global code rule. */
+const CommandText = styled.code`
   font-weight: 700;
   font-size: 16px;
   line-height: 0.94em;
-  letter-spacing: -0.05em;
+  letter-spacing: -0.03em;
   text-align: center;
   color: #9ad7ed;
   white-space: nowrap;
 
+  @media (max-width: 560px) {
+    line-height: 1.4em;
+    text-align: left;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
   @media (max-width: 480px) {
     font-size: 14px;
+  }
+
+  @media (max-width: 360px) {
+    font-size: 13px;
   }
 `;
 
@@ -355,6 +399,11 @@ const CopyBtn = styled.button`
   }
   &:active {
     transform: scale(0.97);
+  }
+
+  @media (max-width: 560px) {
+    width: 100%;
+    height: 44px;
   }
 `;
 

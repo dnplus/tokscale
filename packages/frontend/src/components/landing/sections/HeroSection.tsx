@@ -130,6 +130,17 @@ export function HeroSection({ stargazersCount }: HeroSectionProps) {
                 height={28}
               />
             </TrustedByLogos>
+            <TrustedByNote>
+              Based on{" "}
+              <TooltipLink
+                href="https://github.com/junhoyeo/tokscale"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                tokscale
+              </TooltipLink>{" "}
+              community reports
+            </TrustedByNote>
             <CursorTooltip
               $visible={isHovered}
               style={{
@@ -290,12 +301,18 @@ const HeroTitle = styled.h1`
   letter-spacing: -0.05em;
   color: #ffffff;
 
+  text-wrap: balance;
+
   @media (max-width: 900px) {
     text-align: center;
   }
 
   @media (max-width: 480px) {
     font-size: 36px;
+  }
+
+  @media (max-width: 360px) {
+    font-size: 32px;
   }
 `;
 
@@ -509,6 +526,27 @@ const CursorTooltip = styled.div<{ $visible: boolean }>`
   z-index: 1000;
   opacity: ${({ $visible }) => ($visible ? 1 : 0)};
   transition: opacity 0.15s ease;
+
+  /* Touch screens have no hover; TrustedByNote shows the same text instead. */
+  @media (hover: none) {
+    display: none;
+  }
+`;
+
+const TrustedByNote = styled.p`
+  display: none;
+  font-family: var(--font-figtree), "Figtree", sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #8292b1;
+
+  @media (hover: none) {
+    display: block;
+  }
+
+  @media (max-width: 900px) {
+    text-align: center;
+  }
 `;
 
 const TooltipLink = styled.a`
