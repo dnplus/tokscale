@@ -529,7 +529,10 @@ mod tests {
             let mut input = payload();
             attach(&mut input, from_report(&report(), "2026-10-26T09:00:00Z"));
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let client = tokscale_core::http::client_builder()
+                .no_proxy()
+                .build()
+                .unwrap();
             let reply = rt
                 .block_on(send(
                     &client,
@@ -558,7 +561,10 @@ mod tests {
             let mut input = payload();
             attach(&mut input, from_report(&report(), "2026-10-26T09:00:00Z"));
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let client = tokscale_core::http::client_builder()
+                .no_proxy()
+                .build()
+                .unwrap();
             let reply = rt
                 .block_on(send(
                     &client,
@@ -584,7 +590,10 @@ mod tests {
             let mut input = payload();
             attach(&mut input, from_report(&report(), "2026-10-26T09:00:00Z"));
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let client = tokscale_core::http::client_builder()
+                .no_proxy()
+                .build()
+                .unwrap();
             let reply = rt
                 .block_on(send(
                     &client,
@@ -605,7 +614,7 @@ mod tests {
         let mut input = payload();
         attach(&mut input, from_report(&report(), "2026-10-26T09:00:00Z"));
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let client = reqwest::Client::builder()
+        let client = tokscale_core::http::client_builder()
             .no_proxy()
             .resolve("tokscale.ai", address)
             .build()
@@ -650,7 +659,10 @@ mod tests {
             let rt = tokio::runtime::Runtime::new().unwrap();
             let reply = rt
                 .block_on(send(
-                    &reqwest::Client::builder().no_proxy().build().unwrap(),
+                    &tokscale_core::http::client_builder()
+                        .no_proxy()
+                        .build()
+                        .unwrap(),
                     &url,
                     "fixture-upload",
                     &input,
