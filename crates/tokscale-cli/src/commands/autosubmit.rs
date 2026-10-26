@@ -386,7 +386,7 @@ fn print_scheduled_target_notice(no_quota: bool) {
         credentials.username
     );
     if !no_quota && !is_official_api_url(api_url) {
-        println!("  Quota readings are uploaded to {api_url}/api/quota after each submit.");
+        println!("  Quota readings are included in /api/submit; {api_url}/api/quota is the fallback for older servers.");
     }
     if let Ok(env_url) = std::env::var("TOKSCALE_API_URL") {
         if crate::auth::normalize_api_url(&env_url).ok().as_deref() != Some(api_url) {
@@ -569,8 +569,7 @@ pub fn record_quota_result(now_ms: i64, result: &Result<()>) -> Result<()> {
 /// `auth`'s token. This performs no origin check: callers pass the URL already
 /// paired with the token (`auth::api_url_for` for the logged-in server, the
 /// saved URL for an extra target).
-pub fn upload_quota(auth: &crate::auth::ApiTokenAuth, api_url: &str) -> Result<()> {
-    let body = quota_body()?;
+pub fn upload_quota(auth: &crate::auth::ApiTokenAuth, api_url: &str, body: &str) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let response = tokscale_core::http::client_builder()
@@ -579,7 +578,7 @@ pub fn upload_quota(auth: &crate::auth::ApiTokenAuth, api_url: &str) -> Result<(
             .post(quota_endpoint(api_url))
             .header("Authorization", format!("Bearer {}", auth.token))
             .header("Content-Type", "application/json")
-            .body(body)
+            .body(body.to_owned())
             .send()
             .await
             .map_err(|err| {
@@ -601,18 +600,6 @@ pub fn upload_quota(auth: &crate::auth::ApiTokenAuth, api_url: &str) -> Result<(
     })
 }
 
-/// The usage document, fetched once per process: a submit to extra targets
-/// uploads the same reading to every server instead of refetching each
-/// account. A failed fetch is not cached, so the next upload retries it.
-fn quota_body() -> Result<String> {
-    static BODY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    if let Some(body) = BODY.get() {
-        return Ok(body.clone());
-    }
-    let body = crate::commands::usage::usage_json()?;
-    Ok(BODY.get_or_init(|| body).clone())
-}
-
 /// Official hosts do not implement the quota upload extension.
 pub fn is_official_api_url(api_url: &str) -> bool {
     reqwest::Url::parse(api_url)
@@ -625,13 +612,14 @@ pub fn is_official_api_url(api_url: &str) -> bool {
 pub fn after_submit_quota(
     no_quota: bool,
     api_url: &str,
+    embedded: bool,
     upload: impl FnOnce() -> Result<()>,
     mut warn: impl FnMut(&str),
 ) -> Option<Result<()>> {
     if no_quota || is_official_api_url(api_url) {
         return None;
     }
-    let result = upload();
+    let result = if embedded { Ok(()) } else { upload() };
     if let Err(error) = &result {
         warn(&format!("Warning: quota upload failed: {error}"));
     }
@@ -2543,6 +2531,7 @@ mod tests {
         let result = after_submit_quota(
             false,
             "https://pacafe.example",
+            false,
             || {
                 called = true;
                 Ok(())
@@ -2558,6 +2547,7 @@ mod tests {
         assert!(after_submit_quota(
             true,
             "https://pacafe.example",
+            false,
             || panic!("must not upload"),
             |_| panic!("must not warn")
         )
@@ -2574,6 +2564,7 @@ mod tests {
             assert!(after_submit_quota(
                 false,
                 url,
+                false,
                 || panic!("must not upload"),
                 |_| panic!("must not warn")
             )
@@ -2594,6 +2585,7 @@ mod tests {
             let result = after_submit_quota(
                 false,
                 "https://pacafe.example",
+                false,
                 || Err(anyhow!(message.to_string())),
                 |warning| warnings.push(warning.to_owned()),
             );

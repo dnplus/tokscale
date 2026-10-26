@@ -5,6 +5,7 @@ mod client_diagnostics;
 mod commands;
 mod cursor;
 mod device;
+mod embedded_quota;
 mod extra_targets;
 mod hindsight;
 mod paths;
@@ -5553,6 +5554,8 @@ struct TsTokenContributionData {
     provenance: Option<TsSubmissionProvenance>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sessions: Option<Vec<TsSessionContribution>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quota: Option<embedded_quota::QuotaReport>,
 }
 
 /// One agent session's usage and where it ran. This is the whole set of
@@ -5810,6 +5813,7 @@ fn to_ts_token_contribution_data(
         },
         provenance: None,
         sessions: to_ts_session_contributions(&graph.sessions),
+        quota: None,
     }
 }
 
@@ -6775,7 +6779,7 @@ fn submit_imported_graph(payload: &TsTokenContributionData) -> Result<()> {
     })?;
     eprintln!("{}", "\n  Submitting as imported history...".bright_black());
     let rt = tokio::runtime::Runtime::new()?;
-    post_submission(&rt, &auth_token, payload, SubmitMode::Interactive)
+    post_submission(&rt, &auth_token, payload, SubmitMode::Interactive).map(|_| ())
 }
 
 /// Drop the (date, client) rows of an imported graph that this machine's own
@@ -7648,7 +7652,10 @@ fn run_submit_command(
     );
     println!();
 
-    if graph_result.summary.total_tokens == 0 {
+    let with_quota = !no_quota
+        && (!commands::autosubmit::is_official_api_url(&primary_url)
+            || extra_plan.has_quota_target());
+    if graph_result.summary.total_tokens == 0 && !with_quota {
         println!("{}", "  No usage data found to submit.\n".yellow());
         return Ok(());
     }
@@ -7662,16 +7669,32 @@ fn run_submit_command(
     println!("{}", "  Submitting to server...".bright_black());
 
     let submit_device = device::resolve_submit_device()?;
-    let submit_payload =
+    let mut submit_payload =
         to_ts_token_contribution_data(&graph_result, Some(&submit_device), scan_scope);
+    if with_quota {
+        embedded_quota::attach(&mut submit_payload, embedded_quota::report());
+    }
     // Before the primary upload, which exits the process when it fails.
     extra_plan.submit_all(&rt, &submit_payload, no_quota);
-    post_submission(&rt, &auth_token, &submit_payload, mode)?;
+    let quota_stored = if graph_result.summary.total_tokens == 0
+        && commands::autosubmit::is_official_api_url(&primary_url)
+    {
+        false
+    } else {
+        post_submission(&rt, &auth_token, &submit_payload, mode)?
+    };
     let api_url = auth::api_url_for(&auth_token)?;
     if let Some(result) = commands::autosubmit::after_submit_quota(
         no_quota,
         &api_url,
-        || commands::autosubmit::upload_quota(&auth_token, &api_url),
+        quota_stored,
+        || {
+            commands::autosubmit::upload_quota(
+                &auth_token,
+                &api_url,
+                &embedded_quota::legacy_body(),
+            )
+        },
         |warning| eprintln!("  {}", warning.replace(&auth_token.token, "[REDACTED]")),
     ) {
         if result.is_ok() {
@@ -7705,7 +7728,7 @@ fn post_submission(
     auth_token: &auth::ApiTokenAuth,
     submit_payload: &TsTokenContributionData,
     mode: SubmitMode,
-) -> Result<()> {
+) -> Result<bool> {
     use colored::Colorize;
 
     let api_url = auth::api_url_for(auth_token)?;
@@ -7714,37 +7737,34 @@ fn post_submission(
     let submit_payload =
         rt.block_on(submit_compat::prepare_submission(&api_url, submit_payload))?;
 
-    let response = rt.block_on(async {
-        tokscale_core::http::client()
-            .post(format!("{}/api/submit", api_url))
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", auth_token.token))
-            .json(&*submit_payload)
-            .send()
-            .await
-    });
+    let response = rt.block_on(embedded_quota::send(
+        &tokscale_core::http::client(),
+        &api_url,
+        &auth_token.token,
+        &submit_payload,
+    ));
 
     match response {
         Ok(resp) => {
-            let status = resp.status();
+            let status = resp.status;
+            let quota_stored = resp.quota_stored;
             let body: SubmitResponse =
-                rt.block_on(async { resp.json().await })
-                    .unwrap_or_else(|err| SubmitResponse {
-                        submission_id: None,
-                        username: None,
-                        metrics: None,
-                        warnings: None,
-                        // Same reason as the transport arm below: reqwest's
-                        // Display for a decode failure is the bare "error
-                        // decoding response body", and the serde cause naming
-                        // the offending field is only reachable via `source()`.
-                        error: Some(format!(
-                            "Server returned {} with unparseable response: {}",
-                            status,
-                            tokscale_core::pricing::describe_error(&err)
-                        )),
-                        details: None,
-                    });
+                serde_json::from_slice(&resp.body).unwrap_or_else(|err| SubmitResponse {
+                    submission_id: None,
+                    username: None,
+                    metrics: None,
+                    warnings: None,
+                    // Same reason as the transport arm below: reqwest's
+                    // Display for a decode failure is the bare "error
+                    // decoding response body", and the serde cause naming
+                    // the offending field is only reachable via `source()`.
+                    error: Some(format!(
+                        "Server returned {} with unparseable response: {}",
+                        status,
+                        tokscale_core::pricing::describe_error(&err)
+                    )),
+                    details: None,
+                });
 
             if !status.is_success() {
                 let error = body
@@ -7814,6 +7834,7 @@ fn post_submission(
                     println!();
                 }
             }
+            Ok(quota_stored)
         }
         Err(err) => {
             // `err` alone renders every transport failure as the same
@@ -7831,8 +7852,6 @@ fn post_submission(
             std::process::exit(1);
         }
     }
-
-    Ok(())
 }
 
 fn spawn_warm_tui_cache_detached() {
