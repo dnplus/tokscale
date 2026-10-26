@@ -1663,6 +1663,48 @@ fn write_cursor_usage_cache(base: &Path) {
     .unwrap();
 }
 
+fn write_cursor_usage_cache_with_model(cache_dir: &Path, model: &str) {
+    fs::create_dir_all(cache_dir).unwrap();
+    fs::write(
+        cache_dir.join("usage.json"),
+        serde_json::json!({
+            "_tokscale": {"version": 1, "accountId": "active-account"},
+            "usageEventsDisplay": [{
+                "timestamp": "1788171994838",
+                "model": model,
+                "kind": "USAGE_EVENT_KIND_USAGE_BASED",
+                "chargedCents": 3,
+                "tokenUsage": {"inputTokens": 100, "outputTokens": 50, "totalCents": 3},
+                "conversationId": "b92fdbf1-36d4-4d78-bd5b-afcb939eab16"
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_cursor_cache_follows_tokscale_config_dir() {
+    let tmp = create_empty_fixture_dir();
+    let config_dir = tmp.path().join("isolated-config");
+    write_cursor_usage_cache_with_model(&config_dir.join("cursor-cache"), "override-cursor-model");
+    let home_cache = tmp.path().join(".config/tokscale/cursor-cache");
+    write_cursor_usage_cache_with_model(&home_cache, "home-cursor-model");
+
+    cmd_with_home(tmp.path())
+        .env("TOKSCALE_CONFIG_DIR", &config_dir)
+        .env("APPDATA", tmp.path().join("AppData/Roaming"))
+        .args(["models", "--json", "--client", "cursor", "--no-spinner"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("override-cursor-model"))
+        .stdout(predicate::str::contains("home-cursor-model").not());
+    assert!(
+        home_cache.join("usage.json").exists(),
+        "the default-location cache must be left in place"
+    );
+}
+
 fn write_cursor_desktop_session(base: &Path) {
     use base64::Engine;
     let payload =

@@ -1705,6 +1705,11 @@ fn cursor_setup_state(home_dir: &Option<String>) -> Option<CursorSetupState> {
             .join(".config/tokscale/cursor-cache/usage*.json")
             .to_string_lossy()
             .to_string()
+    } else if crate::paths::is_config_dir_overridden() {
+        crate::paths::get_config_dir()
+            .join("cursor-cache/usage*.json")
+            .to_string_lossy()
+            .to_string()
     } else {
         "~/.config/tokscale/cursor-cache/usage*.json".to_string()
     };
