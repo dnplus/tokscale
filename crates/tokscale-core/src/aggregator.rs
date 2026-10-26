@@ -395,6 +395,8 @@ pub fn generate_graph_result_v2(
         unpriced_submission_usage: Vec::new(),
         incomplete_cost_dates: std::collections::BTreeSet::new(),
         sessions: Vec::new(),
+        recount_proofs: std::collections::BTreeMap::new(),
+        source_reads: std::collections::BTreeMap::new(),
     }
 }
 
@@ -1205,6 +1207,7 @@ mod tests {
             estimate_status: crate::sessions::EstimateStatus::Unpriced,
             copilot_context: None,
             session_context: Default::default(),
+            machine_label: None,
         }
     }
 
@@ -1880,6 +1883,7 @@ mod tests {
             estimate_status: crate::sessions::EstimateStatus::Unpriced,
             copilot_context: None,
             session_context: Default::default(),
+            machine_label: None,
             duration_ms: None,
         }
     }

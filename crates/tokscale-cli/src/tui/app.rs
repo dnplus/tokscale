@@ -26,7 +26,7 @@ use super::glyph_probe::AmbientWidth;
 use super::i18n::{format_count, tr, MessageKey, TuiLanguage};
 use super::privacy::looks_like_email;
 use super::settings::Settings;
-use super::themes::{Theme, ThemeName};
+use super::themes::{terminal_prefers_light, Theme, ThemeName};
 use super::ui::dialog::{ClientPickerDialog, ConfirmDialog, DialogStack, LanguagePickerDialog};
 use super::ui::widgets::{get_model_color, get_provider_from_model, get_provider_shade};
 use crate::ui_glyphs::Glyphs;
@@ -453,7 +453,10 @@ impl App {
                 .parse()
                 .unwrap_or_else(|_| settings.theme_name())
         };
-        let theme = if settings.tui_light_mode {
+        let light_mode = settings
+            .tui_light_mode
+            .unwrap_or_else(|| terminal_prefers_light(std::env::vars()));
+        let theme = if light_mode {
             Theme::from_name_for_current_terminal_light(theme_name)
         } else {
             Theme::from_name_for_current_terminal(theme_name)
@@ -1123,6 +1126,11 @@ impl App {
     }
 
     fn fetch_subscription_usage_with_status(&mut self, preserve_status: bool) {
+        if tokscale_core::network::is_offline() {
+            self.usage_fetch_attempted = true;
+            self.set_status("Offline: showing cached usage; refresh requires online mode");
+            return;
+        }
         if self.usage_rx.is_some() {
             if preserve_status {
                 self.usage_fetch_preserve_status = true;
@@ -1223,6 +1231,9 @@ impl App {
     /// stats are missing or older than the cache TTL. Attempts are throttled
     /// so an offline machine or expired token does not retry on every tick.
     fn maybe_refresh_remote_stats(&mut self) {
+        if tokscale_core::network::is_offline() {
+            return;
+        }
         const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
         if self.remote_stats_rx.is_some() {
@@ -1339,6 +1350,10 @@ impl App {
     }
 
     fn start_codex_login(&mut self) {
+        if tokscale_core::network::is_offline() {
+            self.set_status("Codex login is unavailable in offline mode");
+            return;
+        }
         if self.codex_login_rx.is_some() {
             self.set_status("Codex login already in progress");
             return;
@@ -1574,6 +1589,10 @@ impl App {
     }
 
     fn reset_codex_rate_limits(&mut self, account_id: &str) {
+        if tokscale_core::network::is_offline() {
+            self.set_status("Codex reset is unavailable in offline mode");
+            return;
+        }
         if self.codex_reset_rx.is_some() {
             self.set_status("Codex reset already in progress");
             return;
@@ -2051,7 +2070,7 @@ impl App {
 
     fn cycle_theme(&mut self) {
         let new_theme = self.theme.name.next();
-        self.theme = if self.settings.tui_light_mode {
+        self.theme = if self.theme.is_light() {
             Theme::from_name_for_current_terminal_light(new_theme)
         } else {
             Theme::from_name_for_current_terminal(new_theme)
@@ -2069,20 +2088,16 @@ impl App {
         }
     }
     fn toggle_light_mode(&mut self) {
-        self.settings.tui_light_mode = !self.settings.tui_light_mode;
-        let light_mode = self.settings.tui_light_mode;
+        let light_mode = !self.theme.is_light();
+        self.settings.tui_light_mode = Some(light_mode);
         let name = self.theme.name;
-        self.theme = if self.settings.tui_light_mode {
+        self.theme = if light_mode {
             Theme::from_name_for_current_terminal_light(name)
         } else {
             Theme::from_name_for_current_terminal(name)
         };
         self.dialog_stack.set_theme(self.theme.clone());
-        let state = if self.settings.tui_light_mode {
-            "on"
-        } else {
-            "off"
-        };
+        let state = if light_mode { "on" } else { "off" };
         if let Err(e) = Settings::update_and_save("tuiLightMode", light_mode) {
             self.set_status(&format!("Light mode: {} (save failed: {})", state, e));
         } else {
@@ -3166,6 +3181,7 @@ mod tests {
                 session_count: 1,
                 workspace_key: None,
                 workspace_label: None,
+                machine: None,
                 group_key: String::new(),
                 daily: Vec::new(),
             },
@@ -3180,6 +3196,7 @@ mod tests {
                 session_count: 1,
                 workspace_key: None,
                 workspace_label: None,
+                machine: None,
                 group_key: String::new(),
                 daily: Vec::new(),
             },
@@ -3222,6 +3239,7 @@ mod tests {
                 session_count: 1,
                 workspace_key: None,
                 workspace_label: None,
+                machine: None,
                 group_key: String::new(),
                 daily: Vec::new(),
             },
@@ -3236,6 +3254,7 @@ mod tests {
                 session_count: 1,
                 workspace_key: None,
                 workspace_label: None,
+                machine: None,
                 group_key: String::new(),
                 daily: Vec::new(),
             },
@@ -3277,6 +3296,7 @@ mod tests {
             session_count: 1,
             workspace_key: None,
             workspace_label: None,
+            machine: None,
             group_key: String::new(),
             daily: Vec::new(),
         }];
@@ -3589,6 +3609,7 @@ mod tests {
                 session_count: 1,
                 workspace_key: None,
                 workspace_label: None,
+                machine: None,
                 group_key: String::new(),
                 daily: Vec::new(),
             })
@@ -4274,6 +4295,7 @@ mod tests {
             client: "claude".to_string(),
             workspace_key: None,
             workspace_label: None,
+            machine: None,
             tokens: TokenBreakdown::default(),
             cost,
             performance: Default::default(),
@@ -4783,6 +4805,7 @@ mod tests {
             ])
             .env(MARKER, test_name)
             .env("TOKSCALE_CONFIG_DIR", temp.path())
+            .env_remove("COLORFGBG")
             .output()
             .unwrap();
         assert!(
@@ -4793,6 +4816,83 @@ mod tests {
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
         false
+    }
+
+    #[test]
+    fn tui_follows_terminal_background_without_saved_light_mode() {
+        if !settings_test_runs_in_child("tui_follows_terminal_background_without_saved_light_mode")
+        {
+            return;
+        }
+
+        let path = crate::paths::get_config_dir().join("settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // SAFETY: this body runs alone in a dedicated child test process.
+        unsafe { env::set_var("COLORFGBG", "0;15") };
+
+        fs::write(&path, b"{}").unwrap();
+        assert!(make_app().theme.is_light());
+
+        fs::write(&path, br#"{"tuiLightMode":false}"#).unwrap();
+        assert!(!make_app().theme.is_light());
+
+        unsafe { env::set_var("COLORFGBG", "15;0") };
+        fs::write(&path, b"{}").unwrap();
+        assert!(!make_app().theme.is_light());
+
+        fs::write(&path, br#"{"tuiLightMode":true}"#).unwrap();
+        assert!(make_app().theme.is_light());
+    }
+
+    #[test]
+    fn offline_tui_blocks_background_and_interactive_network_actions() {
+        if !settings_test_runs_in_child(
+            "offline_tui_blocks_background_and_interactive_network_actions",
+        ) {
+            return;
+        }
+        tokscale_core::network::go_offline();
+        let mut app = make_app();
+        app.usage_fetcher = || panic!("offline usage must not start a fetcher");
+        app.start_codex_login();
+        assert!(!app.is_codex_login_running());
+        app.reset_codex_rate_limits("offline-test-account");
+        assert!(app.codex_reset_rx.is_none());
+        app.maybe_refresh_remote_stats();
+        assert!(app.remote_stats_rx.is_none());
+        assert!(app.remote_stats_last_attempt.is_none());
+        app.current_tab = Tab::Usage;
+        app.refresh_usage();
+        assert!(app.usage_rx.is_none());
+        assert!(app.usage_fetch_attempted);
+        assert!(!crate::should_auto_sync_cursor_for_local_report(
+            &None, &None
+        ));
+        assert!(crate::amp::auto_sync_status().warning.is_none());
+        assert!(
+            crate::tui::remote::fetch_remote_stats("fixture", "fixture", "http://127.0.0.1:9")
+                .unwrap_err()
+                .to_string()
+                .contains("offline")
+        );
+
+        app.background_loading = false;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| crate::tui::ui::render(frame, &mut app))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains("Offline: showing cached usage"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -4948,7 +5048,7 @@ mod tests {
                 if event.code == KeyCode::Char('p') {
                     assert_eq!(app.theme.name, ThemeName::Blue.next());
                 } else {
-                    assert!(app.settings.tui_light_mode);
+                    assert_eq!(app.settings.tui_light_mode, Some(true));
                 }
             }
         }
@@ -5772,6 +5872,7 @@ mod tests {
             client: "claude".to_string(),
             workspace_key: workspace.map(String::from),
             workspace_label: workspace.map(String::from),
+            machine: None,
             tokens: TokenBreakdown::default(),
             cost,
             performance: Default::default(),
@@ -5925,6 +6026,7 @@ mod tests {
                 client: "claude".to_string(),
                 workspace_key: None,
                 workspace_label: None,
+                machine: None,
                 tokens: TokenBreakdown::default(),
                 cost: 10.0,
                 performance: Default::default(),
@@ -5939,6 +6041,7 @@ mod tests {
                 client: "codex".to_string(),
                 workspace_key: None,
                 workspace_label: None,
+                machine: None,
                 tokens: TokenBreakdown::default(),
                 cost: 1.0,
                 performance: Default::default(),
@@ -5998,6 +6101,7 @@ mod tests {
                 client: "claude".to_string(),
                 workspace_key: None,
                 workspace_label: None,
+                machine: None,
                 tokens: TokenBreakdown::default(),
                 cost: 10.0,
                 performance: Default::default(),
@@ -6012,6 +6116,7 @@ mod tests {
                 client: "codex".to_string(),
                 workspace_key: None,
                 workspace_label: None,
+                machine: None,
                 tokens: TokenBreakdown::default(),
                 cost: 5.0,
                 performance: Default::default(),
@@ -6050,6 +6155,7 @@ mod tests {
             client: "opencode".to_string(),
             workspace_key: None,
             workspace_label: None,
+            machine: None,
             tokens: TokenBreakdown::default(),
             cost: 3.0,
             performance: Default::default(),
