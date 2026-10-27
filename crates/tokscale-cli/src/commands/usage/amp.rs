@@ -301,14 +301,21 @@ fn fetch_via_cli() -> Option<Result<UsageOutput>> {
     )
 }
 
+const API_URL: &str = "https://ampcode.com/api/internal";
+const KEY_RECOVERY: &str = "Run `amp login` or update AMP_API_KEY.";
+
 fn fetch_via_api(api_key: &str) -> Result<UsageOutput> {
+    usage_output_from_text(&fetch_display_text(API_URL, api_key)?)
+}
+
+fn fetch_display_text(url: &str, api_key: &str) -> Result<String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let display_text = rt.block_on(async {
+    rt.block_on(async {
         let client = super::helpers::http_client()?;
         let resp = client
-            .post("https://ampcode.com/api/internal")
+            .post(url)
             .header("Authorization", format!("Bearer {api_key}"))
             .header("Content-Type", "application/json")
             .json(&serde_json::json!({
@@ -319,14 +326,21 @@ fn fetch_via_api(api_key: &str) -> Result<UsageOutput> {
             .await?;
 
         if !resp.status().is_success() {
-            anyhow::bail!("Amp usage request failed (HTTP {})", resp.status());
+            return Err(super::helpers::http_failure(
+                "Amp",
+                resp.status(),
+                KEY_RECOVERY,
+            ));
         }
 
         let body: ApiResponse = resp.json().await?;
         if body.ok == Some(false) {
             let error = body.error.as_ref();
             if error.and_then(|e| e.code.as_deref()) == Some("auth-required") {
-                anyhow::bail!("Amp API key was rejected. Run `amp login` or update AMP_API_KEY.");
+                return Err(super::helpers::usage_failure(
+                    super::helpers::UsageFailureReason::AuthRejected,
+                    format!("Amp API key was rejected. {KEY_RECOVERY}"),
+                ));
             }
             let msg = error
                 .and_then(|e| e.message.as_deref())
@@ -334,8 +348,7 @@ fn fetch_via_api(api_key: &str) -> Result<UsageOutput> {
             anyhow::bail!("Amp API returned an error: {msg}");
         }
         Ok(body.result.and_then(|r| r.display_text).unwrap_or_default())
-    })?;
-    usage_output_from_text(&display_text)
+    })
 }
 
 pub fn fetch() -> Result<UsageOutput> {
@@ -347,7 +360,9 @@ pub fn fetch() -> Result<UsageOutput> {
     match (read_api_key()?, cli_error) {
         (Some(api_key), None) => fetch_via_api(&api_key),
         (Some(api_key), Some(cli_error)) => fetch_via_api(&api_key).map_err(|api_error| {
-            anyhow::anyhow!("{api_error} (amp usage also failed: {cli_error:#})")
+            let message = format!("{api_error} (amp usage also failed: {cli_error:#})");
+            // Keep the API failure's reason in the chain.
+            api_error.context(message)
         }),
         (None, Some(cli_error)) => Err(cli_error),
         (None, None) => anyhow::bail!(
@@ -359,6 +374,32 @@ pub fn fetch() -> Result<UsageOutput> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_failures_name_the_key_only_when_it_was_rejected() {
+        use super::super::helpers::{failure_reason, UsageFailureReason};
+        for (status, body, reason, names_key) in [
+            (401, "{}", UsageFailureReason::AuthRejected, true),
+            (
+                200,
+                r#"{"ok":false,"error":{"code":"auth-required"}}"#,
+                UsageFailureReason::AuthRejected,
+                true,
+            ),
+            (429, "{}", UsageFailureReason::RateLimited, false),
+            (503, "{}", UsageFailureReason::Unavailable, false),
+        ] {
+            let (url, _) =
+                super::super::test_server::spawn_server(move |_, _| (status, body.into()));
+            let error = fetch_display_text(&url, "test-key").unwrap_err();
+            assert_eq!(failure_reason(&error), Some(reason), "HTTP {status}");
+            assert_eq!(
+                error.to_string().contains("amp login"),
+                names_key,
+                "{error}"
+            );
+        }
+    }
 
     // `amp usage` output from a real account (email redacted). The API's
     // displayText is the same text without the markdown bold.

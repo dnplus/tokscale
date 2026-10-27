@@ -18,6 +18,89 @@ fn http_client_with_timeout(timeout: std::time::Duration) -> Result<reqwest::Cli
         .build()?)
 }
 
+/// Why a provider could not report usage. Set where the failure is known so
+/// that callers never have to infer it from message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageFailureReason {
+    /// The stored login was rejected; only the app that owns it can renew it.
+    AuthRejected,
+    RateLimited,
+    Unavailable,
+    Timeout,
+    Network,
+    Malformed,
+}
+
+#[derive(Debug)]
+pub struct UsageFailure {
+    pub reason: UsageFailureReason,
+    message: String,
+}
+
+impl std::fmt::Display for UsageFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UsageFailure {}
+
+pub fn usage_failure(reason: UsageFailureReason, message: impl Into<String>) -> anyhow::Error {
+    UsageFailure {
+        reason,
+        message: message.into(),
+    }
+    .into()
+}
+
+/// The plain-language failure for an unsuccessful usage response. `recovery`
+/// says how to renew a rejected login and is shown for 401/403 only: a rate
+/// limit or an outage is not fixed by logging in again.
+pub fn http_failure(what: &str, status: reqwest::StatusCode, recovery: &str) -> anyhow::Error {
+    let code = status.as_u16();
+    let (reason, message) = match code {
+        401 | 403 => (
+            UsageFailureReason::AuthRejected,
+            format!("{what} rejected the stored login (HTTP {code}). {recovery}"),
+        ),
+        429 => (
+            UsageFailureReason::RateLimited,
+            format!("{what} is rate-limiting requests (HTTP 429); try again later"),
+        ),
+        500..=599 => (
+            UsageFailureReason::Unavailable,
+            format!("{what} is temporarily unavailable (HTTP {code}); try again later"),
+        ),
+        _ => (
+            UsageFailureReason::Unavailable,
+            format!("{what} request failed (HTTP {code})"),
+        ),
+    };
+    usage_failure(reason, message)
+}
+
+pub fn failure_reason(error: &anyhow::Error) -> Option<UsageFailureReason> {
+    error.chain().find_map(|cause| {
+        if let Some(failure) = cause.downcast_ref::<UsageFailure>() {
+            return Some(failure.reason);
+        }
+        if cause.is::<serde_json::Error>() {
+            return Some(UsageFailureReason::Malformed);
+        }
+        let http = cause.downcast_ref::<reqwest::Error>()?;
+        if http.is_timeout() {
+            Some(UsageFailureReason::Timeout)
+        } else if http.is_connect() {
+            Some(UsageFailureReason::Network)
+        } else if http.is_decode() {
+            Some(UsageFailureReason::Malformed)
+        } else {
+            None
+        }
+    })
+}
+
 pub fn capitalize(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
@@ -230,6 +313,50 @@ pub fn atomic_write_secret(path: &std::path::Path, data: &[u8]) -> std::io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_failure_tells_only_rejected_logins_to_renew_them() {
+        use reqwest::StatusCode;
+        let cases = [
+            (401, UsageFailureReason::AuthRejected, true),
+            (403, UsageFailureReason::AuthRejected, true),
+            (429, UsageFailureReason::RateLimited, false),
+            (500, UsageFailureReason::Unavailable, false),
+            (503, UsageFailureReason::Unavailable, false),
+            (404, UsageFailureReason::Unavailable, false),
+        ];
+        for (code, reason, shows_recovery) in cases {
+            let error = http_failure(
+                "Example",
+                StatusCode::from_u16(code).unwrap(),
+                "Run 'example login'.",
+            );
+            assert_eq!(failure_reason(&error), Some(reason), "HTTP {code}");
+            let message = error.to_string();
+            assert!(message.contains(&format!("HTTP {code}")), "{message}");
+            assert_eq!(
+                message.contains("example login"),
+                shows_recovery,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_reason_survives_context_and_ignores_untyped_errors() {
+        let typed = http_failure("Example", reqwest::StatusCode::UNAUTHORIZED, "")
+            .context("while fetching usage");
+        assert_eq!(
+            failure_reason(&typed),
+            Some(UsageFailureReason::AuthRejected)
+        );
+        let malformed = anyhow::Error::from(serde_json::from_str::<u8>("{").unwrap_err());
+        assert_eq!(
+            failure_reason(&malformed),
+            Some(UsageFailureReason::Malformed)
+        );
+        assert_eq!(failure_reason(&anyhow::anyhow!("HTTP 401")), None);
+    }
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;

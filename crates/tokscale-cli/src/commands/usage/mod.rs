@@ -156,6 +156,8 @@ pub struct UsageFetchDiagnostic {
     pub kind: UsageFetchDiagnosticKind,
     #[serde(default)]
     pub severity: UsageFetchDiagnosticSeverity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<helpers::UsageFailureReason>,
     pub message: String,
 }
 
@@ -204,7 +206,29 @@ impl UsageFetchDiagnostic {
             account,
             kind,
             severity,
+            reason: None,
             message: message.into(),
+        }
+    }
+
+    fn from_error(
+        provider: impl Into<String>,
+        account: Option<UsageAccount>,
+        error: &anyhow::Error,
+    ) -> Self {
+        let reason = helpers::failure_reason(error);
+        let message = match reason {
+            // reqwest's own text names the URL but not what happened.
+            Some(helpers::UsageFailureReason::Timeout)
+                if error.downcast_ref::<helpers::UsageFailure>().is_none() =>
+            {
+                format!("request timed out; check the network, then retry ({error})")
+            }
+            _ => error.to_string(),
+        };
+        Self {
+            reason,
+            ..Self::new(provider, account, message)
         }
     }
 
@@ -243,11 +267,7 @@ impl UsageFetchReport {
     ) -> Self {
         Self {
             outputs: Vec::new(),
-            diagnostics: vec![UsageFetchDiagnostic::new(
-                provider,
-                account,
-                error.to_string(),
-            )],
+            diagnostics: vec![UsageFetchDiagnostic::from_error(provider, account, &error)],
         }
     }
 
@@ -909,6 +929,24 @@ mod tests {
         assert_eq!(report.outputs.len(), 1);
         assert_eq!(report.diagnostics.len(), 1);
         assert_eq!(report.diagnostics[0].message, "stale diagnostic");
+    }
+
+    #[test]
+    fn failure_reason_reaches_json_reports_only_when_known() {
+        let typed = UsageFetchReport::from_error(
+            "Example",
+            None,
+            helpers::http_failure("Example", reqwest::StatusCode::TOO_MANY_REQUESTS, ""),
+        );
+        let value = serde_json::to_value(&typed.diagnostics[0]).unwrap();
+        assert_eq!(value["reason"], "rate_limited");
+        let untyped = UsageFetchReport::from_error("Example", None, anyhow::anyhow!("boom"));
+        let value = serde_json::to_value(&untyped.diagnostics[0]).unwrap();
+        assert!(value.get("reason").is_none(), "{value}");
+        let legacy: UsageFetchDiagnostic =
+            serde_json::from_value(serde_json::json!({"provider": "Example", "message": "boom"}))
+                .unwrap();
+        assert_eq!(legacy.reason, None);
     }
 
     #[test]

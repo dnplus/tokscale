@@ -139,7 +139,7 @@ async fn fetch_task_usage(client: &reqwest::Client, token: &str) -> Result<Value
     let resp = bearer_request(client, token, TASK_USAGE_URL).send().await?;
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        anyhow::bail!("NEEDS_AUTH");
+        return Err(login_rejected(status));
     }
     if !status.is_success() {
         anyhow::bail!("Grok task usage request failed (HTTP {status})");
@@ -160,7 +160,7 @@ async fn fetch_billing_grpc(client: &reqwest::Client, token: &str) -> Result<Vec
         .await?;
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        anyhow::bail!("NEEDS_AUTH");
+        return Err(login_rejected(status));
     }
     if !status.is_success() {
         anyhow::bail!("Grok billing request failed (HTTP {status})");
@@ -742,7 +742,7 @@ async fn fetch_proxy_billing(
         .await?;
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        anyhow::bail!("NEEDS_AUTH");
+        return Err(login_rejected(status));
     }
     if !status.is_success() {
         anyhow::bail!("Grok proxy billing request failed (HTTP {status})");
@@ -884,6 +884,33 @@ fn usage_output(
     }
 }
 
+const LOGIN_RECOVERY: &str = "Run 'grok login', then retry.";
+
+fn login_rejected(status: reqwest::StatusCode) -> anyhow::Error {
+    super::helpers::http_failure("Grok", status, LOGIN_RECOVERY)
+}
+
+/// The final failure after every candidate failed. Candidate errors are kept
+/// as text, so a rejected login is recognized by the phrase `http_failure`
+/// gives it and leads the message, since it is the one the user can fix.
+fn unavailable(errors: &[String]) -> anyhow::Error {
+    let detail = if errors.is_empty() {
+        "no usage or active subscription data returned".to_string()
+    } else {
+        errors.join("; ")
+    };
+    if errors
+        .iter()
+        .any(|error| error.contains("rejected the stored login"))
+    {
+        return super::helpers::usage_failure(
+            super::helpers::UsageFailureReason::AuthRejected,
+            format!("Grok rejected the stored login. {LOGIN_RECOVERY} ({detail})"),
+        );
+    }
+    anyhow::anyhow!("Grok usage unavailable: {detail}")
+}
+
 pub fn fetch() -> Result<UsageOutput> {
     let credentials = read_credentials()?;
     let mut errors = Vec::new();
@@ -950,12 +977,7 @@ pub fn fetch() -> Result<UsageOutput> {
         return Ok(output);
     }
 
-    let detail = if errors.is_empty() {
-        "no usage or active subscription data returned".to_string()
-    } else {
-        errors.join("; ")
-    };
-    anyhow::bail!("Grok usage unavailable: {detail}");
+    Err(unavailable(&errors))
 }
 
 #[cfg(test)]
@@ -976,6 +998,45 @@ mod tests {
             user_id: Some("user-test".into()),
             direct_xai: true,
         }
+    }
+
+    #[test]
+    fn rejected_login_leads_with_its_recovery_instead_of_an_internal_sentinel() {
+        use crate::commands::usage::helpers::{failure_reason, UsageFailureReason};
+        for status in [401, 403] {
+            let (url, _) = spawn_server(move |_, _| (status, "{}".into()));
+            let usage = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(fetch_proxy_usage(
+                    &super::super::helpers::http_client().unwrap(),
+                    &direct_credentials(),
+                    &url,
+                ));
+            let error = unavailable(&usage.errors);
+            assert_eq!(
+                failure_reason(&error),
+                Some(UsageFailureReason::AuthRejected)
+            );
+            assert!(error
+                .to_string()
+                .starts_with("Grok rejected the stored login. Run 'grok login'"));
+            assert!(!error.to_string().contains("NEEDS_AUTH"), "{error}");
+        }
+        let (url, _) = spawn_server(|_, _| (503, "{}".into()));
+        let usage = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fetch_proxy_usage(
+                &super::super::helpers::http_client().unwrap(),
+                &direct_credentials(),
+                &url,
+            ));
+        let error = unavailable(&usage.errors);
+        assert_eq!(failure_reason(&error), None);
+        assert!(!error.to_string().contains("grok login"), "{error}");
     }
 
     #[test]
