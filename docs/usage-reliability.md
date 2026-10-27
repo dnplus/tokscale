@@ -151,3 +151,23 @@
 | 額度未知 | 0%、100% 或空卡 | 「額度未知」，不畫進度條，PA Cafe 收到 null |
 | 時窗已經過了 resets_at 的舊值 | 不適用 | 「已重置，未知」 |
 | 換了帳號 | 不適用 | 不沿用舊帳號的值（負向測試） |
+
+## 8. 實作結果（2026/10/27）
+
+| 設計 | PR | 和設計稿不同的地方 |
+|---|---|---|
+| D1 | [#47](https://github.com/dnplus/tokscale/pull/47) `up/claude-keep-sample-on-auth-failure` | **範圍縮小**：只有在 401/403 **而且** token 已經過了自己的 `expiresAt`（閒置過期）時才保留樣本，最多 7 天。沒過期的 token 被拒絕、5xx、逾時，仍維持上游刻意的 fail closed，因為上游有明確的測試 `policy_never_falls_back_on_auth_or_transport_failures`。沒有 `resets_at` 的時窗也一併移除。`utilization` 改成可以缺的部分沒做。 |
+| D3 | [#48](https://github.com/dnplus/tokscale/pull/48) `up/usage-failure-reasons` | 只接了 Z.ai、Amp、Grok，以及通用的逾時、連線、解析錯誤。Codex 沒接（避免和 upstream-small-prs 衝突）。Kimi 在 #49 處理。Colab（fork 專屬）的 429/5xx 誤導訊息、MiniMax Token Plan 只走 `eprintln` 的問題，還沒處理。 |
+| D5 | [#49](https://github.com/dnplus/tokscale/pull/49) `up/kimi-read-only-auth` | 照設計做：完全不續期、不寫檔。 |
+| D4 | [#50](https://github.com/dnplus/tokscale/pull/50) `up/usage-unknown-not-zero` | 只做了 Grok 的 task usage 和 MiniMax。Grok 的 unified 週期沒給百分比就當成 0，這是上游刻意設計、有測試，所以保留。`percent_known`，以及空卡片顯示「額度未知」都**還沒做**，Colab、Amp、Warp 的資訊列仍然是 0/100。 |
+| D2 | [#51](https://github.com/dnplus/tokscale/pull/51) `up/usage-last-known-good` | 沒有 `resets_at` 的資訊列會保留（Claude 那邊則是移除），因為它們沒有證據顯示已經過期。Claude 和 Warp 不經過這一層。 |
+| F1 | [#52](https://github.com/dnplus/tokscale/pull/52) `feat/embedded-quota-freshness` | 錯誤分類暫時沿用字串比對，等 #48 合進 fork 後再改讀 `reason`。PA Cafe 接收端要配合的改動列在 PR 說明裡。 |
+
+還沒做的（後續）：
+- `percent_known`，以及空卡片顯示「額度未知」。
+- Colab 的錯誤訊息。
+- MiniMax Token Plan 改走 diagnostics。
+- Warp 的 `workspaces` 改成寬容解析。
+- Claude 的 `utilization` 改成寬容解析。
+- Claude 遇到 5xx 或逾時時仍然沒有最後已知值。
+- F1 改用 `reason` 分類。
