@@ -3660,12 +3660,10 @@ fn parse_all_messages_streaming<S: MessageSink>(
         for (outcome, _) in cursor_outcomes {
             let keep = sessions::cursor::cursor_event_snapshot_keep_mask(&outcome.messages);
             for (message, kept) in outcome.messages.into_iter().zip(keep) {
-                // The proof is keyed by the Cursor client; Grok Bot rows from
-                // the same caches are submitted under their own client.
-                let proof_identity = (message.client == ClientId::Cursor.as_str())
-                    .then(|| flushed_message_identity(&message, &flush_context))
-                    .flatten();
-                if let Some((date, model_id)) = proof_identity {
+                // The proof covers every row of the Cursor caches, Grok Bot
+                // included: receivers credit Cursor and Grok Bot as one Cursor
+                // ledger, and un-split history stored them together.
+                if let Some((date, model_id)) = flushed_message_identity(&message, &flush_context) {
                     if kept {
                         cursor_proof.record_kept(&date, &model_id, &message);
                     } else if sessions::cursor::is_cursor_event_dedup_key(
@@ -12969,6 +12967,62 @@ mod tests {
         assert_eq!(entry.corrected.tokens.input, 60);
         assert_eq!(entry.previous.messages, 4);
         assert_eq!(entry.corrected.messages, 2);
+    }
+
+    /// Receivers credit Cursor and Grok Bot as one Cursor ledger, and un-split
+    /// history stored bot rows as Cursor, so the Cursor proof must describe
+    /// the duplicates of rows classified as Grok Bot too.
+    #[test]
+    fn cursor_recount_proof_covers_rows_classified_as_grok_bot() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cursor_cache_dir = source_home.path().join(".config/tokscale/cursor-cache");
+        std::fs::create_dir_all(&cursor_cache_dir).unwrap();
+        let bot = "11111111-1234-1234-1234-123456789abc";
+        let row = |conversation: &str, model: &str, event: &str, input: i64| {
+            serde_json::json!({
+                "timestamp": "1792841120156",
+                "model": model,
+                "usageEventId": event,
+                "tokenUsage": { "inputTokens": input },
+                "conversationId": conversation,
+            })
+        };
+        let json = serde_json::json!({
+            "usageEventsDisplay": [
+                row(bot, "grok-bot-default", "bot-event", 10),
+                row(bot, "grok-bot-default", "bot-event", 30),
+                row("cursor-conversation", "gpt-5", "cursor-event", 5),
+            ]
+        });
+        std::fs::write(
+            cursor_cache_dir.join("usage.json"),
+            serde_json::to_vec(&json).unwrap(),
+        )
+        .unwrap();
+
+        let mut messages = Vec::new();
+        let outcome = super::parse_all_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &["cursor".to_string(), "grok-bot".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            SourceCachePolicy::InMemory,
+            &mut messages,
+        );
+
+        let bot_rows: Vec<_> = messages.iter().filter(|m| m.client == "grok-bot").collect();
+        assert_eq!(bot_rows.len(), 1, "one surviving bot snapshot");
+        let proof = &outcome.recount_proofs["cursor"][&bot_rows[0].date];
+        let bot_entry = &proof["grok-bot-default"];
+        assert_eq!(bot_entry.previous.messages, 2);
+        assert_eq!(bot_entry.corrected.messages, 1);
+        assert_eq!(
+            bot_entry.previous.tokens.input, 40,
+            "the previous side counts every bot snapshot"
+        );
+        assert_eq!(proof["gpt-5"].previous.messages, 1);
+        assert!(!outcome.recount_proofs.contains_key("grok-bot"));
     }
 
     #[test]
