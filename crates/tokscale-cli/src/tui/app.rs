@@ -9,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 use tokscale_core::ClientId;
 
-use crate::commands::usage::{UsageFetchReport, UsageOutput};
+use crate::commands::usage::{UsageAccount, UsageFetchReport, UsageOutput};
 use crate::ClientFilter;
 
 use ratatui::style::Color;
@@ -1395,12 +1395,11 @@ impl App {
     }
 
     fn confirm_codex_account_switch(&mut self, account_id: &str) {
-        if self.subscription_usage.iter().any(|usage| {
-            usage
-                .account
-                .as_ref()
-                .is_some_and(|account| account.id == account_id && account.is_active)
-        }) {
+        let Some(account) = self.saved_codex_account(account_id) else {
+            self.set_status("Codex account not found");
+            return;
+        };
+        if account.is_active {
             self.set_status("Codex account already active");
             return;
         }
@@ -1416,12 +1415,11 @@ impl App {
     }
 
     fn confirm_codex_account_removal(&mut self, account_id: &str) {
-        if self.subscription_usage.iter().any(|usage| {
-            usage
-                .account
-                .as_ref()
-                .is_some_and(|account| account.id == account_id && account.is_active)
-        }) {
+        let Some(account) = self.saved_codex_account(account_id) else {
+            self.set_status("Codex account not found");
+            return;
+        };
+        if account.is_active {
             self.set_status("Switch Codex accounts before removing the current account");
             return;
         }
@@ -1453,6 +1451,16 @@ impl App {
         if let Some(account_id) = account_id {
             self.reset_codex_rate_limits(&account_id);
         }
+    }
+
+    /// Only Codex cards carry saved Codex identities; other providers reuse
+    /// the account slot for things the Codex store does not own.
+    fn saved_codex_account(&self, account_id: &str) -> Option<&UsageAccount> {
+        self.subscription_usage
+            .iter()
+            .filter(|usage| usage.provider == "Codex")
+            .filter_map(|usage| usage.account.as_ref())
+            .find(|account| account.id == account_id)
     }
 
     fn codex_account_label(&self, account_id: &str) -> String {
@@ -3460,6 +3468,7 @@ mod tests {
 
     fn usage_output(provider: &str, account: Option<UsageAccount>) -> UsageOutput {
         UsageOutput {
+            freshness: None,
             provider: provider.to_string(),
             account,
             credential_source: None,
@@ -5194,6 +5203,34 @@ mod tests {
     }
 
     #[test]
+    fn test_usage_initial_tab_schedules_background_load() {
+        let app = App::new_with_cached_data(
+            TuiConfig {
+                initial_tab: Some(Tab::Usage),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(app.current_tab, Tab::Usage);
+        assert!(app.usage_fetch_attempted);
+        assert!(app.is_fetching_usage());
+    }
+
+    #[test]
+    fn test_pending_usage_load_keeps_quit_responsive_without_another_fetch() {
+        let mut app = make_app();
+        app.current_tab = Tab::Usage;
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        app.usage_rx = Some(receiver);
+        app.usage_fetcher = || panic!("a pending Usage load must not create another fetch");
+        app.refresh_usage();
+        assert!(app.is_fetching_usage());
+        assert!(app.handle_key_event(key(KeyCode::Char('q'))));
+        assert!(app.should_quit);
+    }
+
+    #[test]
     fn test_handle_key_refresh_usage_tab_reports_fetch_failure_diagnostic() {
         let mut app = make_app();
         app.usage_fetcher = failing_usage_fetcher;
@@ -5496,10 +5533,18 @@ mod tests {
     #[test]
     fn test_handle_mouse_click_codex_remove_opens_confirmation_dialog() {
         let mut app = make_app();
+        app.subscription_usage = vec![usage_output(
+            "Codex",
+            Some(UsageAccount {
+                id: "acct_personal".to_string(),
+                label: Some("personal".to_string()),
+                is_active: false,
+            }),
+        )];
         app.add_click_area(
             Rect::new(0, 0, 10, 2),
             ClickAction::CodexRemoveAccount {
-                account_id: "acct_work".to_string(),
+                account_id: "acct_personal".to_string(),
             },
         );
 
@@ -5542,6 +5587,80 @@ mod tests {
             app.status_message.as_deref(),
             Some("Switch Codex accounts before removing the current account")
         );
+    }
+
+    /// Antigravity model groups and MiniMax Token Plan sites reuse the account
+    /// slot. A Use/Remove click carrying one of their ids, whether or not it is
+    /// marked active, must be refused before any Codex dialog opens; the same
+    /// id on a Codex card is accepted (positive control).
+    #[test]
+    fn test_codex_account_actions_refuse_ids_from_non_codex_cards() {
+        let click = |app: &mut App, action: ClickAction| {
+            app.click_areas.clear();
+            app.add_click_area(Rect::new(0, 0, 10, 2), action);
+            app.handle_mouse_event(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            });
+        };
+
+        for provider in ["Antigravity", "MiniMax Token Plan"] {
+            for is_active in [false, true] {
+                for remove in [false, true] {
+                    let mut app = make_app();
+                    app.subscription_usage = vec![usage_output(
+                        provider,
+                        Some(UsageAccount {
+                            id: "external_account".to_string(),
+                            label: None,
+                            is_active,
+                        }),
+                    )];
+                    let account_id = "external_account".to_string();
+                    let action = if remove {
+                        ClickAction::CodexRemoveAccount { account_id }
+                    } else {
+                        ClickAction::CodexUseAccount { account_id }
+                    };
+
+                    click(&mut app, action);
+
+                    assert!(
+                        !app.dialog_stack.is_active(),
+                        "{provider} active={is_active} remove={remove}"
+                    );
+                    assert_eq!(
+                        app.status_message.as_deref(),
+                        Some("Codex account not found"),
+                        "{provider} active={is_active} remove={remove}"
+                    );
+                }
+            }
+        }
+
+        for remove in [false, true] {
+            let mut app = make_app();
+            app.subscription_usage = vec![usage_output(
+                "Codex",
+                Some(UsageAccount {
+                    id: "external_account".to_string(),
+                    label: None,
+                    is_active: false,
+                }),
+            )];
+            let account_id = "external_account".to_string();
+            let action = if remove {
+                ClickAction::CodexRemoveAccount { account_id }
+            } else {
+                ClickAction::CodexUseAccount { account_id }
+            };
+
+            click(&mut app, action);
+
+            assert!(app.dialog_stack.is_active(), "remove={remove}");
+        }
     }
 
     #[test]

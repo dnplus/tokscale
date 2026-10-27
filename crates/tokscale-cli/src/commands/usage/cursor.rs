@@ -143,6 +143,7 @@ pub fn fetch() -> Result<UsageOutput> {
                 .map(str::to_string)
         });
         Ok(UsageOutput {
+            freshness: None,
             provider: PROVIDER.to_string(),
             account: None,
             credential_source: Some(auth.credential_source.into()),
@@ -215,6 +216,7 @@ fn grok_bot_account_report(
             // No personal allowance is a successful empty result, not a failure.
             Ok(None) => {}
             Ok(Some(parsed)) => report.outputs.push(UsageOutput {
+                freshness: None,
                 provider: GROK_BOT_PROVIDER.to_string(),
                 account: Some(identity),
                 credential_source: Some("grok-bot-app".into()),
@@ -287,6 +289,7 @@ fn fetch_grok_bot_desktop() -> Result<Option<UsageOutput>> {
             return Ok(None);
         }
         Ok(Some(UsageOutput {
+            freshness: None,
             provider: GROK_BOT_PROVIDER.to_string(),
             account: None,
             credential_source: Some(auth.credential_source.into()),
