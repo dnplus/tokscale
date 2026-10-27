@@ -47,7 +47,16 @@ import {
   type ParserHighWaterPlan,
 } from "@/lib/db/parserHighWater";
 import { MICODE_FAMILY, planMiCodeTransition } from "@/lib/db/micodeTransition";
-import { CURSOR_GROK_BOT_FAMILY, CURSOR_GROK_BOT_PARSER_VERSIONS, planGrokBotTransition } from "@/lib/db/grokBotTransition";
+import {
+  applyCursorSplit,
+  CURSOR_GROK_BOT_PARSER_VERSIONS,
+  cursorLedgerPersistedVersion,
+  foldGrokBotContributions,
+  foldStoredGrokBot,
+  grokBotPairDeclared,
+  splitCursorUnion,
+  submissionTouchesGrokBot,
+} from "@/lib/db/cursorGrokBot";
 import {
   ANTIGRAVITY_FAMILY,
   planAntigravityTransition,
@@ -853,6 +862,18 @@ export async function POST(request: Request) {
       }
 
       const deviceParserStates = (submittedDevice.parserStates ?? {}) as DeviceParserStates;
+      // Grok Bot is a partition of the Cursor ledger (see cursorGrokBot.ts):
+      // everything below plans and merges the Cursor/Grok Bot union as
+      // `cursor`, and the written Cursor cell is split again per day.
+      const storedCursorFamily = foldStoredGrokBot(existingDeviceDays);
+      existingDeviceDays = storedCursorFamily.days;
+      const familyContributions = foldGrokBotContributions(data.contributions);
+      const familySubmittedClients = new Set<string>(submittedClients);
+      if (familySubmittedClients.delete("grok-bot")) familySubmittedClients.add("cursor");
+      const grokBotPartitionDeclared =
+        !isBackfill && grokBotPairDeclared(data.scanScope?.parserVersions);
+      const grokBotSnapshot = foldParserClientSnapshot(data.contributions, "grok-bot");
+      const cursorFamilySnapshot = foldParserClientSnapshot(familyContributions, "cursor");
       // Clients whose parsers can re-attribute prior history use high-water
       // plans. Antigravity and MiMo are handled below as atomic source families
       // because their presentation surfaces can overlap; the remaining
@@ -868,7 +889,7 @@ export async function POST(request: Request) {
       )) {
         if ((ANTIGRAVITY_FAMILY as readonly string[]).includes(client)) continue;
         const wasScanned =
-          submittedClients.has(client) ||
+          familySubmittedClients.has(client) ||
           Boolean(
             data.scanScope &&
               Object.prototype.hasOwnProperty.call(
@@ -904,12 +925,20 @@ export async function POST(request: Request) {
                 client
               ),
           existingLegacyDays: existingClientDays,
-          incomingDays: foldParserClientSnapshot(data.contributions, client),
+          incomingDays: foldParserClientSnapshot(familyContributions, client),
           state: ownValue(deviceParserStates, client),
-          persistedVersion: ownValue(
-            submittedDevice.parserVersions as Record<string, number> | undefined,
-            client
-          ),
+          persistedVersion: client === "cursor"
+            ? cursorLedgerPersistedVersion(
+                ownValue(
+                  submittedDevice.parserVersions as Record<string, number> | undefined,
+                  client
+                ),
+                ownValue(deviceParserStates, client) != null
+              )
+            : ownValue(
+                submittedDevice.parserVersions as Record<string, number> | undefined,
+                client
+              ),
           recountProof: isBackfill
             ? undefined
             : ownValue(
@@ -972,23 +1001,18 @@ export async function POST(request: Request) {
         }
         if (micodePlan.warning) warnings.push(micodePlan.warning);
       }
-      // Shared Cursor credit must move to Grok Bot atomically, never be added twice.
-      const grokBotPlan = planGrokBotTransition({
-        submittedClients,
-        incomingVersions: data.scanScope?.parserVersions,
-        persistedVersions: submittedDevice.parserVersions ?? undefined,
-        fullHistory: data.scanScope?.fullHistory === true,
-        isBackfill,
-        contributions: data.contributions,
-        existingDays: existingDeviceDays,
-      });
-      if (grokBotPlan.mode !== "status-quo") {
-        for (const client of CURSOR_GROK_BOT_FAMILY) {
-          parserPlans.set(client, grokBotPlan.mode === "replace"
-            ? { mode: "replace", increments: {}, layoutDays: grokBotPlan.layouts![client] }
-            : { mode: "freeze", increments: {} });
-        }
-        if (grokBotPlan.warning) warnings.push(grokBotPlan.warning);
+      // A payload that carries the Grok Bot partition must declare it with
+      // the Cursor ledger generation it was split from. Anything else (an
+      // older fork CLI's cursor 4, a bot-only scan, an import) freezes the
+      // whole family: stored Cursor and Grok Bot cells are kept as they are.
+      if (
+        submissionTouchesGrokBot(data.contributions, data.scanScope?.parserVersions) &&
+        !grokBotPartitionDeclared
+      ) {
+        parserPlans.set("cursor", { mode: "freeze", increments: {} });
+        warnings.push(
+          `Preserved Cursor and Grok Bot together: a Grok Bot split is accepted only with parser generations cursor ${CURSOR_GROK_BOT_PARSER_VERSIONS.cursor} and grok-bot ${CURSOR_GROK_BOT_PARSER_VERSIONS["grok-bot"]}. No Cursor/Grok Bot token or cost changes were applied; update the CLI and submit again.`
+        );
       }
       const antigravityPlan = planAntigravityTransition({
         submittedClients,
@@ -1015,6 +1039,10 @@ export async function POST(request: Request) {
         }
         if (antigravityPlan.warning) warnings.push(antigravityPlan.warning);
       }
+      // Snapshot attribution is trusted only when the Cursor ledger itself
+      // accepted this submit; a frozen one must not move stored attribution.
+      const grokBotPartitionAccepted =
+        grokBotPartitionDeclared && parserPlans.get("cursor")?.mode !== "freeze";
       const plannedIncrementClients = [...parserPlans].filter(
         ([, plan]) =>
           plan.mode === "incremental" || plan.mode === "baseline-legacy"
@@ -1073,7 +1101,7 @@ export async function POST(request: Request) {
         !isBackfill && declaredFullHistoryClients.size > 0;
 
       const daysToProcess = new Map(
-        data.contributions.map((day) => [day.date, day] as const)
+        familyContributions.map((day) => [day.date, day] as const)
       );
       const layoutOnlyDates = expandDaysForReplaceLayouts(
         daysToProcess,
@@ -1162,7 +1190,7 @@ export async function POST(request: Request) {
           }
         }
 
-        const clientsToMerge = new Set(submittedClients);
+        const clientsToMerge = new Set(familySubmittedClients);
         // A day the submission never covered is in the write set only so a
         // replace layout can empty its own cell there. The other clients were
         // not resubmitted for that day at all, so their stored cells did not
@@ -1370,6 +1398,13 @@ export async function POST(request: Request) {
               }
             }
           }
+          applyCursorSplit(mergedClientBreakdown, splitCursorUnion({
+            union: ownValue(mergedClientBreakdown, "cursor"),
+            stored: storedCursorFamily.stored.get(incomingDay.date),
+            snapshotBot: ownValue(grokBotSnapshot, incomingDay.date),
+            snapshotDatesFamily: ownValue(cursorFamilySnapshot, incomingDay.date) !== undefined,
+            partitionAccepted: grokBotPartitionAccepted,
+          }));
           applyReplaceLayouts(
             mergedClientBreakdown,
             incomingDay.date,
@@ -1406,6 +1441,13 @@ export async function POST(request: Request) {
             incomingClientBreakdown,
             incomingDay.totals?.costIsComplete ?? true
           );
+          applyCursorSplit(insertedClientBreakdown, splitCursorUnion({
+            union: ownValue(insertedClientBreakdown, "cursor"),
+            stored: undefined,
+            snapshotBot: ownValue(grokBotSnapshot, incomingDay.date),
+            snapshotDatesFamily: ownValue(cursorFamilySnapshot, incomingDay.date) !== undefined,
+            partitionAccepted: grokBotPartitionAccepted,
+          }));
           applyReplaceLayouts(
             insertedClientBreakdown,
             incomingDay.date,
@@ -1472,7 +1514,6 @@ export async function POST(request: Request) {
       if (
         advancedParserStates.length > 0 ||
         micodePlan.parserVersions ||
-        grokBotPlan.parserVersions ||
         antigravityPlan.parserVersions
       ) {
         const parserStatesForUpdate = Object.fromEntries(
@@ -1488,7 +1529,6 @@ export async function POST(request: Request) {
             parserVersions: {
               ...(submittedDevice.parserVersions ?? {}),
               ...micodePlan.parserVersions,
-              ...grokBotPlan.parserVersions,
               ...antigravityPlan.parserVersions,
               ...Object.fromEntries(
                 advancedParserStates.map(([client, state]) => [
