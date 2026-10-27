@@ -736,8 +736,11 @@ describe("POST Cursor/Grok Bot partition of the Cursor ledger", () => {
   });
   const ledger = () => devices.get("one")!.parserStates.cursor as { version: number; aggregate: { tokens: number } } | undefined;
 
-  it("keeps the receiver on upstream's Cursor generation", () => {
+  it("keeps the CLI and the receiver on upstream's Cursor generation", () => {
+    const sender = readFileSync(resolve(__dirname, "../../../../crates/tokscale-cli/src/main.rs"), "utf8");
     expect(versions.cursor).toBe(SUPPORTED_VERSIONED_PARSERS.cursor);
+    expect(sender).toContain(`const CURSOR_SUBMISSION_PARSER_VERSION: u32 = ${versions.cursor};`);
+    expect(sender).toContain(`const GROK_BOT_SUBMISSION_PARSER_VERSION: u32 = ${versions["grok-bot"]};`);
   });
 
   it("baselines a new device on the union and repeats identically", async () => {

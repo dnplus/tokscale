@@ -5353,12 +5353,15 @@ struct TsTimeMetrics {
 }
 
 const SUBMISSION_PARSER_VERSION: u32 = 1;
-// Atomic Cursor/Grok Bot family reclassification; synchronized with the server.
 // The Cursor parser collapses repeated `usageEventId` snapshots (and the
 // matching legacy id-less row) once per cache file. The raw rows remain in the
 // parser cache so the scan can ship the same per-day recount proof used for
 // Devin CLI.
-const CURSOR_SUBMISSION_PARSER_VERSION: u32 = 4;
+const CURSOR_SUBMISSION_PARSER_VERSION: u32 = 2;
+// Grok Bot is a partition of the Cursor ledger, not a ledger of its own: the
+// receiver credits Cursor + Grok Bot as Cursor generation 2 and splits the
+// written cells. Sent only to receivers that advertise this exact pair; see
+// `submit_compat`.
 const GROK_BOT_SUBMISSION_PARSER_VERSION: u32 = 1;
 const COPILOT_SUBMISSION_PARSER_VERSION: u32 = 2;
 // Amp v2 moves existing exported messages from synthesized creation-time dates
@@ -5511,7 +5514,12 @@ fn submission_recount_proofs(
             .flat_map(|day| {
                 day.clients
                     .iter()
-                    .filter(|submission| &submission.client == client)
+                    // The Cursor proof describes the Cursor ledger, whose
+                    // cells are the Cursor + Grok Bot union.
+                    .filter(|submission| {
+                        &submission.client == client
+                            || (client == "cursor" && submission.client == "grok-bot")
+                    })
                     .map(|submission| (day.date.as_str(), submission.model_id.as_str()))
             })
             .collect();
@@ -11095,7 +11103,7 @@ mod tests {
         let clients = vec!["cursor".to_string(), "grok-bot".to_string()];
         for full_history in [true, false] {
             let scope = submit_scan_scope(Some(&clients), full_history, true).unwrap();
-            assert_eq!(scope.parser_versions.get("cursor"), Some(&4));
+            assert_eq!(scope.parser_versions.get("cursor"), Some(&2));
             assert_eq!(scope.parser_versions.get("grok-bot"), Some(&1));
             assert_eq!(scope.full_history, full_history);
             assert_eq!(scope.parser_versions.len(), 2);
