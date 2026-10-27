@@ -872,6 +872,7 @@ fn parse_usage_response(resp: &serde_json::Value) -> Result<UsageOutput> {
     }
 
     Ok(UsageOutput {
+        freshness: None,
         provider: "Copilot".into(),
         account: None,
         credential_source: None,

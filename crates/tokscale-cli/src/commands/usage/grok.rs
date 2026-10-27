@@ -741,6 +741,7 @@ fn usage_output(
     metrics: Vec<UsageMetric>,
 ) -> UsageOutput {
     UsageOutput {
+        freshness: None,
         provider: "Grok".into(),
         account: None,
         credential_source: None,

@@ -1,6 +1,13 @@
 //! Receiver-first rollout for payload features older receivers reject: the
-//! atomic Cursor/Grok Bot accounting family and per-session metadata.
-//! Never fold Bot back into Cursor: a migrated ledger may already contain both.
+//! Grok Bot partition of the Cursor ledger and per-session metadata.
+//!
+//! Grok Bot rows come from the Cursor caches and are counted in the Cursor
+//! ledger (generation 2, with its recount proof) on every receiver. A receiver
+//! that advertises the exact partition pair gets them split; a receiver with
+//! no Grok Bot contract (tokscale.ai, older self-hosted ones) gets them folded
+//! back into Cursor, which is exactly what an un-split CLI sends it. A receiver
+//! that knows Grok Bot at another generation gets neither: its stored split
+//! belongs to a contract this CLI no longer speaks, so the family is withheld.
 use std::borrow::Cow;
 use std::time::Duration;
 
@@ -36,26 +43,47 @@ fn is_family(client: &str) -> bool {
     matches!(client, "cursor" | "grok-bot")
 }
 
-fn touches_family(payload: &TsTokenContributionData) -> bool {
-    payload
-        .summary
-        .clients
-        .iter()
-        .any(|client| is_family(client))
+fn touches(payload: &TsTokenContributionData, member: impl Fn(&str) -> bool) -> bool {
+    payload.summary.clients.iter().any(|client| member(client))
         || payload
             .contributions
             .iter()
-            .any(|day| day.clients.iter().any(|cell| is_family(&cell.client)))
+            .any(|day| day.clients.iter().any(|cell| member(&cell.client)))
         || payload
             .scan_scope
             .as_ref()
-            .is_some_and(|scope| scope.parser_versions.keys().any(|client| is_family(client)))
+            .is_some_and(|scope| scope.parser_versions.keys().any(|client| member(client)))
+}
+
+fn touches_family(payload: &TsTokenContributionData) -> bool {
+    touches(payload, is_family)
+}
+
+/// Sessions count here (not for the family) so a fold also relabels them.
+fn touches_grok_bot(payload: &TsTokenContributionData) -> bool {
+    touches(payload, |client| client == "grok-bot")
+        || payload
+            .sessions
+            .as_ref()
+            .is_some_and(|sessions| sessions.iter().any(|session| session.client == "grok-bot"))
+}
+
+/// How a receiver takes Cursor and Grok Bot usage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum CursorGrokBot {
+    /// No Grok Bot contract: send Grok Bot as the Cursor usage it is counted as.
+    #[default]
+    Fold,
+    /// The exact Cursor ledger generation and Grok Bot partition this CLI sends.
+    Split,
+    /// Grok Bot at another generation: withhold both clients.
+    Strip,
 }
 
 /// What the receiver accepts beyond the legacy payload, from `GET /api/submit`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ReceiverCapabilities {
-    pub(crate) cursor_grok_bot: bool,
+    pub(crate) cursor_grok_bot: CursorGrokBot,
     pub(crate) sessions: bool,
 }
 
@@ -75,11 +103,19 @@ fn parse_capabilities(status: StatusCode, body: &[u8]) -> Result<ReceiverCapabil
     let body: serde_json::Value = serde_json::from_slice(body)
         .context("Invalid submission capability response; no usage was uploaded")?;
     let capabilities = &body["capabilities"];
-    let versions = &capabilities["cursorGrokBot"]["parserVersions"];
+    let family = &capabilities["cursorGrokBot"];
+    let versions = &family["parserVersions"];
+    let cursor_grok_bot = if family.is_null() {
+        CursorGrokBot::Fold
+    } else if versions["cursor"].as_u64() == Some(CURSOR_SUBMISSION_PARSER_VERSION as u64)
+        && versions["grok-bot"].as_u64() == Some(GROK_BOT_SUBMISSION_PARSER_VERSION as u64)
+    {
+        CursorGrokBot::Split
+    } else {
+        CursorGrokBot::Strip
+    };
     Ok(ReceiverCapabilities {
-        cursor_grok_bot: versions["cursor"].as_u64()
-            == Some(CURSOR_SUBMISSION_PARSER_VERSION as u64)
-            && versions["grok-bot"].as_u64() == Some(GROK_BOT_SUBMISSION_PARSER_VERSION as u64),
+        cursor_grok_bot,
         sessions: capabilities["sessions"]["version"].as_u64()
             == Some(SESSIONS_SUBMISSION_VERSION as u64),
     })
@@ -138,8 +174,10 @@ pub(crate) async fn prepare_submission<'a>(
         }
         Err(error) => return Err(error),
     };
-    if family && !capabilities.cursor_grok_bot {
-        eprintln!("  This receiver does not support atomic Cursor/Grok Bot accounting. Both clients are excluded from this upload; their previously credited history is unchanged. Local statistics are unaffected. Upgrade the receiver to submit this family.");
+    match capabilities.cursor_grok_bot {
+        CursorGrokBot::Strip if family => eprintln!("  This receiver accounts Cursor/Grok Bot under a different parser generation. Both clients are excluded from this upload; their previously credited history is unchanged. Local statistics are unaffected. Upgrade the receiver to submit this family."),
+        CursorGrokBot::Fold if touches_grok_bot(payload) => eprintln!("  This receiver does not separate Grok Bot from Cursor, so Grok Bot usage was uploaded as Cursor usage. Local statistics are unaffected."),
+        _ => {}
     }
     prepare_for_capability(payload, capabilities).context(
         "The receiver does not support Cursor/Grok Bot and no compatible usage remains; no usage was uploaded. Upgrade the receiver before retrying."
@@ -152,29 +190,129 @@ pub(crate) fn prepare_for_capability(
     payload: &TsTokenContributionData,
     capabilities: ReceiverCapabilities,
 ) -> Option<Cow<'_, TsTokenContributionData>> {
-    let strip_family = !capabilities.cursor_grok_bot && touches_family(payload);
+    let withhold_family = capabilities.cursor_grok_bot == CursorGrokBot::Strip;
+    let strip_family = withhold_family && touches_family(payload);
+    let fold_bot = capabilities.cursor_grok_bot == CursorGrokBot::Fold && touches_grok_bot(payload);
     let strip_sessions = payload.sessions.as_ref().is_some_and(|sessions| {
         !capabilities.sessions
-            || (!capabilities.cursor_grok_bot
-                && sessions.iter().any(|session| is_family(&session.client)))
+            || (withhold_family && sessions.iter().any(|session| is_family(&session.client)))
     });
-    if !strip_family && !strip_sessions {
+    if !strip_family && !fold_bot && !strip_sessions {
         return Some(Cow::Borrowed(payload));
     }
     let mut filtered = if strip_family {
         without_family(payload)?
+    } else if fold_bot {
+        with_grok_bot_folded(payload)
     } else {
         payload.clone()
     };
     if !capabilities.sessions {
         filtered.sessions = None;
-    } else if !capabilities.cursor_grok_bot {
+    } else if withhold_family {
         if let Some(sessions) = &mut filtered.sessions {
             sessions.retain(|session| !is_family(&session.client));
         }
         filtered.sessions.take_if(|sessions| sessions.is_empty());
     }
     Some(Cow::Owned(filtered))
+}
+
+/// The payload as an un-split CLI sends it: every Grok Bot row, declaration and
+/// session moved to Cursor. Days, summary totals and years are unchanged
+/// because the same usage is only relabelled; the Cursor recount proof already
+/// covers the union.
+fn with_grok_bot_folded(payload: &TsTokenContributionData) -> TsTokenContributionData {
+    let mut folded = payload.clone();
+    if let Some(scope) = &mut folded.scan_scope {
+        if scope.parser_versions.remove("grok-bot").is_some() {
+            scope
+                .parser_versions
+                .insert("cursor".to_string(), CURSOR_SUBMISSION_PARSER_VERSION);
+        }
+        if let Some(index) = scope
+            .full_history_clients
+            .iter()
+            .position(|client| client == "grok-bot")
+        {
+            scope.full_history_clients.remove(index);
+            if !scope.full_history_clients.iter().any(|c| c == "cursor") {
+                scope
+                    .full_history_clients
+                    .insert(index, "cursor".to_string());
+            }
+        }
+        if let Some(floors) = &mut scope.retention_floors {
+            if let Some(bot) = floors.remove("grok-bot") {
+                floors
+                    .entry("cursor".to_string())
+                    .and_modify(|cursor| {
+                        if bot < *cursor {
+                            *cursor = bot.clone();
+                        }
+                    })
+                    .or_insert(bot);
+            }
+        }
+    }
+    for day in &mut folded.contributions {
+        let mut cells: Vec<TsSourceContribution> = Vec::with_capacity(day.clients.len());
+        for mut cell in std::mem::take(&mut day.clients) {
+            if cell.client == "grok-bot" {
+                cell.client = "cursor".to_string();
+            }
+            let same = cells
+                .iter_mut()
+                .find(|kept| kept.client == cell.client && kept.model_id == cell.model_id);
+            match same {
+                Some(kept) if cell.client == "cursor" => {
+                    let provenance = (kept.cost_provenance.is_some()
+                        || cell.cost_provenance.is_some())
+                    .then(|| retained_provenance([&*kept, &cell]));
+                    kept.tokens.input = kept.tokens.input.saturating_add(cell.tokens.input);
+                    kept.tokens.output = kept.tokens.output.saturating_add(cell.tokens.output);
+                    kept.tokens.cache_read = kept
+                        .tokens
+                        .cache_read
+                        .saturating_add(cell.tokens.cache_read);
+                    kept.tokens.cache_write = kept
+                        .tokens
+                        .cache_write
+                        .saturating_add(cell.tokens.cache_write);
+                    kept.tokens.reasoning =
+                        kept.tokens.reasoning.saturating_add(cell.tokens.reasoning);
+                    kept.cost += cell.cost;
+                    kept.messages = kept.messages.saturating_add(cell.messages);
+                    kept.cost_provenance = provenance;
+                    if kept.provider_id.is_none() {
+                        kept.provider_id = cell.provider_id;
+                    }
+                }
+                _ => cells.push(cell),
+            }
+        }
+        day.clients = cells;
+    }
+    let mut clients = Vec::with_capacity(folded.summary.clients.len());
+    for client in std::mem::take(&mut folded.summary.clients) {
+        let client = if client == "grok-bot" {
+            "cursor".to_string()
+        } else {
+            client
+        };
+        if !clients.contains(&client) {
+            clients.push(client);
+        }
+    }
+    folded.summary.clients = clients;
+    if let Some(sessions) = &mut folded.sessions {
+        for session in sessions {
+            if session.client == "grok-bot" {
+                session.client = "cursor".to_string();
+            }
+        }
+    }
+    folded
 }
 
 /// The payload with every Cursor/Grok Bot row removed and its totals rebuilt
@@ -192,6 +330,12 @@ fn without_family(payload: &TsTokenContributionData) -> Option<TsTokenContributi
             floors.retain(|client, _| !is_family(client));
             if floors.is_empty() {
                 scope.retention_floors = None;
+            }
+        }
+        if let Some(proofs) = &mut scope.recount_proofs {
+            proofs.retain(|client, _| !is_family(client));
+            if proofs.is_empty() {
+                scope.recount_proofs = None;
             }
         }
     }
@@ -331,12 +475,18 @@ mod tests {
         TsSourceContribution, TsTokenBreakdown,
     };
 
-    const LEGACY: ReceiverCapabilities = ReceiverCapabilities {
-        cursor_grok_bot: false,
+    /// A receiver that knows Grok Bot under another generation.
+    const STRIP: ReceiverCapabilities = ReceiverCapabilities {
+        cursor_grok_bot: CursorGrokBot::Strip,
         sessions: false,
     };
     const FAMILY: ReceiverCapabilities = ReceiverCapabilities {
-        cursor_grok_bot: true,
+        cursor_grok_bot: CursorGrokBot::Split,
+        sessions: false,
+    };
+    /// A receiver with no Grok Bot contract (tokscale.ai, older receivers).
+    const FOLD: ReceiverCapabilities = ReceiverCapabilities {
+        cursor_grok_bot: CursorGrokBot::Fold,
         sessions: false,
     };
 
@@ -473,7 +623,7 @@ mod tests {
     fn submit_compat_legacy_removes_family_everywhere_and_rebuilds_totals() {
         let original = payload(&["cursor", "grok-bot", "claude"]);
         let before = serde_json::to_value(&original).unwrap();
-        let filtered = prepare_for_capability(&original, LEGACY).unwrap();
+        let filtered = prepare_for_capability(&original, STRIP).unwrap();
         let json = serde_json::to_value(&*filtered).unwrap();
         let wire = serde_json::to_string(&*filtered).unwrap();
         assert!(!wire.contains("grok-bot"));
@@ -522,7 +672,7 @@ mod tests {
             .map(|(client, date)| (client.to_string(), date.to_string()))
             .collect(),
         );
-        let filtered = prepare_for_capability(&original, LEGACY).unwrap();
+        let filtered = prepare_for_capability(&original, STRIP).unwrap();
         let json = serde_json::to_value(&*filtered).unwrap();
         assert_eq!(
             json["scanScope"]["retentionFloors"],
@@ -535,7 +685,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .retention_floors = Some([("grok-bot".to_string(), "2026-10-07".to_string())].into());
-        let filtered = prepare_for_capability(&family_floors_only, LEGACY).unwrap();
+        let filtered = prepare_for_capability(&family_floors_only, STRIP).unwrap();
         let json = serde_json::to_value(&*filtered).unwrap();
         assert!(json["scanScope"].get("retentionFloors").is_none());
     }
@@ -547,7 +697,7 @@ mod tests {
         let bot = original.contributions.pop().unwrap();
         retained.clients.extend(bot.clients);
         original.contributions.push(retained);
-        let filtered = prepare_for_capability(&original, LEGACY).unwrap();
+        let filtered = prepare_for_capability(&original, STRIP).unwrap();
         assert_eq!(filtered.contributions.len(), 1);
         assert_eq!(filtered.contributions[0].totals.tokens, 100);
         assert_eq!(filtered.contributions[0].token_breakdown.reasoning, 1);
@@ -558,22 +708,23 @@ mod tests {
 
     #[test]
     fn submit_compat_legacy_family_only_has_no_post_payload() {
-        assert!(prepare_for_capability(&payload(&["cursor", "grok-bot"]), LEGACY).is_none());
-        assert!(prepare_for_capability(&payload(&["grok-bot"]), LEGACY).is_none());
+        assert!(prepare_for_capability(&payload(&["cursor", "grok-bot"]), STRIP).is_none());
+        assert!(prepare_for_capability(&payload(&["grok-bot"]), STRIP).is_none());
     }
 
     #[test]
     fn submit_compat_capable_and_unrelated_payloads_are_unchanged() {
         for (input, capabilities) in [
             (payload(&["cursor", "grok-bot", "claude"]), FAMILY),
-            (payload(&["claude"]), LEGACY),
+            (payload(&["claude"]), STRIP),
             (
                 with_sessions(payload(&["cursor", "claude"]), &["cursor", "claude"]),
                 ReceiverCapabilities {
-                    cursor_grok_bot: true,
+                    cursor_grok_bot: CursorGrokBot::Split,
                     sessions: true,
                 },
             ),
+            (payload(&["cursor", "claude"]), FOLD),
         ] {
             let output = prepare_for_capability(&input, capabilities).unwrap();
             assert!(matches!(output, Cow::Borrowed(_)));
@@ -588,9 +739,9 @@ mod tests {
     fn submit_compat_empty_family_scan_keys_are_removed_without_losing_unrelated_time() {
         let mut input = payload(&["claude"]);
         let scope = input.scan_scope.as_mut().unwrap();
-        scope.parser_versions.insert("cursor".into(), 4);
+        scope.parser_versions.insert("cursor".into(), 2);
         scope.parser_versions.insert("grok-bot".into(), 1);
-        let filtered = prepare_for_capability(&input, LEGACY).unwrap();
+        let filtered = prepare_for_capability(&input, STRIP).unwrap();
         let json = serde_json::to_value(&*filtered).unwrap();
         assert_eq!(
             json["scanScope"]["parserVersions"],
@@ -601,27 +752,47 @@ mod tests {
     }
 
     #[test]
-    fn submit_compat_capability_requires_exact_atomic_pair() {
+    fn submit_compat_capability_selects_split_fold_or_strip() {
         let capabilities = |body: serde_json::Value| {
             parse_capabilities(StatusCode::OK, &serde_json::to_vec(&body).unwrap()).unwrap()
         };
-        let supported = serde_json::json!({"capabilities":{"cursorGrokBot":{"parserVersions":{"cursor":4,"grok-bot":1}}}});
-        assert_eq!(capabilities(supported), FAMILY);
-        for body in [
-            serde_json::json!({}),
-            serde_json::json!({"capabilities":{"cursorGrokBot":{"parserVersions":{"cursor":4}}}}),
-            serde_json::json!({"capabilities":{"cursorGrokBot":{"parserVersions":{"cursor":5,"grok-bot":1}}}}),
+        let family = |versions: serde_json::Value| {
+            capabilities(
+                serde_json::json!({"capabilities":{"cursorGrokBot":{"parserVersions":versions}}}),
+            )
+            .cursor_grok_bot
+        };
+        assert_eq!(
+            family(serde_json::json!({"cursor":2,"grok-bot":1})),
+            CursorGrokBot::Split
+        );
+        // A receiver that knows Grok Bot under any other pair already holds a
+        // split this CLI cannot continue, so the family is withheld.
+        for versions in [
+            serde_json::json!({"cursor":4,"grok-bot":1}),
+            serde_json::json!({"cursor":2}),
+            serde_json::json!({"cursor":3,"grok-bot":1}),
+            serde_json::json!({"cursor":2,"grok-bot":2}),
+            serde_json::json!({"cursor":"2","grok-bot":1}),
+            serde_json::json!(null),
         ] {
-            assert!(!capabilities(body).cursor_grok_bot);
+            assert_eq!(family(versions.clone()), CursorGrokBot::Strip, "{versions}");
         }
         assert_eq!(
-            parse_capabilities(StatusCode::NOT_FOUND, b"").unwrap(),
-            LEGACY
+            capabilities(serde_json::json!({"capabilities":{"cursorGrokBot":true}}))
+                .cursor_grok_bot,
+            CursorGrokBot::Strip
         );
-        assert_eq!(
-            parse_capabilities(StatusCode::METHOD_NOT_ALLOWED, b"").unwrap(),
-            LEGACY
-        );
+        // No Grok Bot contract at all: an upstream or pre-split receiver.
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"capabilities":{"sessions":{"version":1}}}),
+        ] {
+            assert_eq!(capabilities(body).cursor_grok_bot, CursorGrokBot::Fold);
+        }
+        for status in [StatusCode::NOT_FOUND, StatusCode::METHOD_NOT_ALLOWED] {
+            assert_eq!(parse_capabilities(status, b"").unwrap(), FOLD);
+        }
         for status in [
             StatusCode::UNAUTHORIZED,
             StatusCode::FORBIDDEN,
@@ -634,6 +805,90 @@ mod tests {
     }
 
     #[test]
+    fn submit_compat_fold_sends_the_unsplit_cursor_ledger() {
+        let mut original = payload(&["cursor", "grok-bot", "claude"]);
+        // Same model on the same day as the Cursor row: the cells must merge.
+        let bot = original.contributions.remove(1);
+        original.contributions[0]
+            .clients
+            .push(TsSourceContribution {
+                model_id: "cursor-model".into(),
+                ..bot.clients[0].clone()
+            });
+        let scope = original.scan_scope.as_mut().unwrap();
+        scope.retention_floors = Some(
+            [("cursor", "2026-10-08"), ("grok-bot", "2026-10-07")]
+                .into_iter()
+                .map(|(client, date)| (client.to_string(), date.to_string()))
+                .collect(),
+        );
+        let original = with_sessions(original, &["grok-bot", "claude"]);
+        let before = serde_json::to_value(&original).unwrap();
+        let capabilities = ReceiverCapabilities {
+            cursor_grok_bot: CursorGrokBot::Fold,
+            sessions: true,
+        };
+        let folded = prepare_for_capability(&original, capabilities).unwrap();
+        assert!(matches!(folded, Cow::Owned(_)));
+        let json = serde_json::to_value(&*folded).unwrap();
+        // No client key or declaration names Grok Bot (model ids may).
+        assert!(!serde_json::to_string(&json)
+            .unwrap()
+            .contains("\"grok-bot\""));
+        assert_eq!(
+            json["scanScope"]["parserVersions"],
+            serde_json::json!({"claude": 1, "cursor": 2})
+        );
+        assert_eq!(
+            json["scanScope"]["fullHistoryClients"],
+            serde_json::json!(["cursor", "claude"])
+        );
+        assert_eq!(
+            json["scanScope"]["retentionFloors"],
+            serde_json::json!({"cursor": "2026-10-07"})
+        );
+        let cursor_day = &json["contributions"][0]["clients"];
+        assert_eq!(cursor_day.as_array().unwrap().len(), 1);
+        assert_eq!(cursor_day[0]["client"], "cursor");
+        assert_eq!(cursor_day[0]["tokens"]["input"], 140);
+        assert_eq!(cursor_day[0]["messages"], 2);
+        assert_eq!(cursor_day[0]["cost"], 2.0);
+        assert_eq!(session_clients(&json), ["cursor", "claude"]);
+        assert_eq!(
+            json["summary"]["clients"],
+            serde_json::json!(["cursor", "claude"])
+        );
+        // Nothing is dropped: only labels move.
+        assert_eq!(json["years"], before["years"]);
+        assert_eq!(json["timeMetrics"], before["timeMetrics"]);
+        assert_eq!(
+            json["summary"]["totalTokens"],
+            before["summary"]["totalTokens"]
+        );
+        assert_eq!(
+            json["contributions"][0]["totals"],
+            before["contributions"][0]["totals"]
+        );
+        assert_eq!(serde_json::to_value(&original).unwrap(), before);
+    }
+
+    #[test]
+    fn submit_compat_fold_declares_cursor_for_a_bot_only_scan() {
+        let input = payload(&["grok-bot"]);
+        let folded = prepare_for_capability(&input, FOLD).unwrap();
+        let json = serde_json::to_value(&*folded).unwrap();
+        assert_eq!(
+            json["scanScope"]["parserVersions"],
+            serde_json::json!({"cursor": 2})
+        );
+        assert_eq!(
+            json["scanScope"]["fullHistoryClients"],
+            serde_json::json!(["cursor"])
+        );
+        assert_eq!(json["contributions"][0]["clients"][0]["client"], "cursor");
+    }
+
+    #[test]
     fn submit_compat_sessions_capability_requires_the_exact_version() {
         let capabilities = |body: serde_json::Value| {
             parse_capabilities(StatusCode::OK, &serde_json::to_vec(&body).unwrap()).unwrap()
@@ -641,17 +896,17 @@ mod tests {
         assert_eq!(
             capabilities(serde_json::json!({"capabilities":{"sessions":{"version":1}}})),
             ReceiverCapabilities {
-                cursor_grok_bot: false,
+                cursor_grok_bot: CursorGrokBot::Fold,
                 sessions: true,
             }
         );
         assert_eq!(
             capabilities(serde_json::json!({"capabilities":{
-                "cursorGrokBot":{"parserVersions":{"cursor":4,"grok-bot":1}},
+                "cursorGrokBot":{"parserVersions":{"cursor":2,"grok-bot":1}},
                 "sessions":{"version":1}
             }})),
             ReceiverCapabilities {
-                cursor_grok_bot: true,
+                cursor_grok_bot: CursorGrokBot::Split,
                 sessions: true,
             }
         );
@@ -667,7 +922,7 @@ mod tests {
     #[test]
     fn submit_compat_sessions_are_stripped_unless_supported() {
         let input = with_sessions(payload(&["claude", "codex"]), &["claude", "codex"]);
-        for capabilities in [LEGACY, FAMILY] {
+        for capabilities in [STRIP, FAMILY, FOLD] {
             let output = prepare_for_capability(&input, capabilities).unwrap();
             let json = serde_json::to_value(&*output).unwrap();
             assert!(json.get("sessions").is_none(), "{capabilities:?}");
@@ -677,7 +932,7 @@ mod tests {
         }
 
         let supported = ReceiverCapabilities {
-            cursor_grok_bot: false,
+            cursor_grok_bot: CursorGrokBot::Strip,
             sessions: true,
         };
         let output = prepare_for_capability(&input, supported).unwrap();
@@ -691,7 +946,7 @@ mod tests {
     #[test]
     fn submit_compat_unsupported_family_drops_family_sessions() {
         let sessions_only = ReceiverCapabilities {
-            cursor_grok_bot: false,
+            cursor_grok_bot: CursorGrokBot::Strip,
             sessions: true,
         };
         let input = with_sessions(
@@ -781,7 +1036,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_compat_family_only_legacy_returns_error_not_autosubmit_success() {
+    fn submit_compat_family_only_strip_returns_error_not_autosubmit_success() {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -793,7 +1048,15 @@ mod tests {
             let mut request = [0u8; 4096];
             let count = socket.read(&mut request).unwrap();
             assert!(String::from_utf8_lossy(&request[..count]).starts_with("GET /api/submit "));
-            socket.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            // The earlier fork contract: a split this CLI cannot continue.
+            let body = br#"{"capabilities":{"cursorGrokBot":{"parserVersions":{"cursor":4,"grok-bot":1}}}}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            socket.write_all(body).unwrap();
         });
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let input = payload(&["cursor", "grok-bot"]);

@@ -121,6 +121,7 @@ fn build_output(
     let metrics = build_metrics(&cache.usage);
 
     let output = UsageOutput {
+        freshness: None,
         provider: PROVIDER.to_string(),
         account: None,
         credential_source: None,

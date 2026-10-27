@@ -760,6 +760,8 @@ When you log out, Tokscale moves cached usage to `cursor-cache/archive/` so it i
 
 `tokscale cursor sync` downloads each saved account's usage history page by page and gives each account one overall time budget. By default the budget starts at 120 seconds and grows with the number of usage events Cursor reports for the account, up to 1800 seconds (30 minutes). To use a fixed budget instead, pass `--timeout <SECONDS>` for one run, or save `cursor.syncTimeoutSeconds` in `settings.json` (by default `~/.config/tokscale/settings.json`; see [Configuration](#configuration) for Windows, `XDG_CONFIG_HOME` and `TOKSCALE_CONFIG_DIR`). Both take a whole number of seconds from 1 to 86400. If the setting holds any other value, `tokscale cursor sync` run without `--timeout` prints a warning and uses the default budget. The flag takes precedence over the setting, and the setting takes precedence over the default budget.
 
+`tokscale submit` also syncs Cursor usage before uploading. It defaults to a 15-second budget, honors `cursor.syncTimeoutSeconds` from `settings.json` when configured, and accepts `--timeout <SECONDS>` (or `--cursor-timeout <SECONDS>`) to override the budget for that submission.
+
 ```json
 {
   "cursor": {
@@ -896,7 +898,7 @@ tokscale report --workspace my-project --client opencode
 | `codex` | `codex --quiet` | Requires Codex CLI installed and authenticated. |
 | `gemini` | `gemini -p` | Requires Gemini CLI installed and authenticated. |
 | `kiro` | `kiro --non-interactive` | Requires Kiro CLI installed and authenticated. |
-| `minimax` | (HTTP API) | OpenAI-compatible chat-completions API, so no CLI is needed. Set `MINIMAX_API_KEY` or `MINIMAX_API_TOKEN`. Defaults to `MiniMax-M3` on the global endpoint (`https://api.minimax.io/v1`); set `MINIMAX_API_REGION=cn` to use `https://api.minimaxi.com/v1`, and `MINIMAX_MODEL` to select another model (for example `MiniMax-M2.7`). |
+| `minimax` | (HTTP API) | OpenAI-compatible chat-completions API, so no CLI is needed. Set `MINIMAX_API_KEY` or `MINIMAX_API_TOKEN`. Defaults to `MiniMax-M3.1-Flash` on the global endpoint (`https://api.minimax.io/v1`); set `MINIMAX_API_REGION=cn` to use `https://api.minimaxi.com/v1`, and `MINIMAX_MODEL` to select another model (for example `MiniMax-M3`). |
 
 **How it works:**
 
@@ -1068,7 +1070,7 @@ Tokscale stores settings in `settings.json` in its config directory. By default 
 | `light.writeCache` | boolean | `false` | When true, `tokscale --light` overwrites the TUI cache atomically after rendering. CLI flags `--write-cache` / `--no-write-cache` override per-invocation. |
 | `minutelyTabEnabled` | boolean | `false` | Show the per-minute Minutely tab in the TUI and aggregate per-minute usage during data loading. Default-off because minute-granularity is a niche/diagnostic view for most users and the per-minute bucketing has a non-trivial cost on large datasets. |
 | `autosubmit` | object | disabled | Saved `tokscale autosubmit` state: interval, client/date filters, scheduler backend, last run time, and last error. Prefer `tokscale autosubmit enable/status/disable` over editing this object by hand. |
-| `cursor.syncTimeoutSeconds` | number | unset | Overall time budget, in seconds (1-86400), for each account's usage download in `tokscale cursor sync`. When unset, the budget starts at 120 s and grows with the number of usage events Cursor reports, up to 1800 s. `tokscale cursor sync --timeout <SECONDS>` overrides it for one run. See [Cursor IDE Commands](#cursor-ide-commands). |
+| `cursor.syncTimeoutSeconds` | number | unset | Overall time budget, in seconds (1-86400), for each account's usage download in `tokscale cursor sync` and pre-report sync in `tokscale submit`. When unset, the budget starts at 120 s and grows with the number of usage events Cursor reports (15 s default during submit). `tokscale cursor sync --timeout <SECONDS>` and `tokscale submit --timeout <SECONDS>` override it for one run. See [Cursor IDE Commands](#cursor-ide-commands). |
 | `scanner.extraScanPaths` | object | `{}` | Additional per-client scan roots for sessions outside Tokscale's default home-root locations |
 | `scanner.machineLabels` | object | `{}` | Machine label for each folder, as `{ "<folder>": "<label>" }`. Session files under a folder count toward its label in `--group-by machine,model`; the longest matching folder wins. See [Per-machine usage](#per-machine-usage). |
 | `scanner.localMachineLabel` | string | `"local"` | Machine label for session files under no `scanner.machineLabels` folder |
@@ -2012,13 +2014,18 @@ Hindsight writes no local session logs of its own. Running `tokscale hindsight s
 
 Location: `~/.pi/agent/sessions/<encoded-cwd>/*.jsonl`. [Oh My Pi](https://github.com/can1357/oh-my-pi) writes the same session format under `~/.omp/agent/sessions/` and is tracked as its own `omp` client.
 
-JSONL format with session header and message entries:
+JSONL format with session, message, and usage entries:
 ```json
 {"type":"session","id":"pi_ses_001","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}
 {"type":"message","id":"msg_001","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","model":"claude-3-5-sonnet","provider":"anthropic","usage":{"input":100,"output":50,"cacheRead":10,"cacheWrite":5,"totalTokens":165}}}
+{"type":"usage","id":"usage_001","parentId":"msg_001","timestamp":"2026-01-01T00:00:02.000Z","kind":"cache_warm","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":0,"output":0,"cacheRead":100,"cacheWrite":0,"totalTokens":100}}
 ```
 
 Pi also bills work that is not an assistant reply: `/compact` writes a `compaction` record, branch summarization a `branch_summary` record, and standalone accounting (e.g. cache warming) a `usage` record, while a `toolResult` message can carry usage for the call behind it. Tokscale counts each of those as its own request and preserves its reported cost when present. A current-format standalone `usage` record names its billed provider and model explicitly, while an older model-less one inherits the session's current selection (the last `model_change` or reply). Model-less tool results, compactions, and branch summaries stay in Pi's separate `tools/summaries` bucket instead of being charged to the preceding conversation model. A record without usage bills nothing.
+
+Tokscale accepts any `kind` in native standalone [UsageEntry](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/session-format.md#usageentry) records. Standalone usage also counts for Prime Agent without entering assistant completion matching.
+
+Copied usage records retain their deduplication identity without colliding with assistant messages. Kimchi keeps session-scoped identities. After an upgrade, Tokscale invalidates the parser cache and reads the sessions again.
 
 ### Senpi (OmO Native)
 

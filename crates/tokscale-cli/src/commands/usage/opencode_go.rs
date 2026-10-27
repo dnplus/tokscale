@@ -293,6 +293,7 @@ fn fetch_blocking_with_cap(
         }
 
         Ok(vec![UsageOutput {
+            freshness: None,
             provider: "OpenCode Go".into(),
             account: None,
             credential_source: None,

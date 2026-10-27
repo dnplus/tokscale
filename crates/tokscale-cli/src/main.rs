@@ -338,6 +338,14 @@ enum Commands {
             help = "Disable automatic quota upload after a successful submit"
         )]
         no_quota: bool,
+        #[arg(
+            long,
+            alias = "cursor-timeout",
+            value_name = "SECONDS",
+            value_parser = clap::value_parser!(u64).range(1..=cursor::CURSOR_MAX_SYNC_TIMEOUT_SECS),
+            help = "Cursor sync timeout in seconds, 1-86400 (overrides cursor.syncTimeoutSeconds in settings.json)"
+        )]
+        timeout: Option<u64>,
         #[command(flatten)]
         extra_targets: extra_targets::ExtraTargetFlags,
     },
@@ -994,6 +1002,7 @@ fn main() -> Result<()> {
             date,
             dry_run,
             no_quota,
+            timeout,
             extra_targets,
         }) => {
             reject_unsupported_home_override(&cli.home, "submit")?;
@@ -1005,6 +1014,7 @@ fn main() -> Result<()> {
             // defaultClients view filter (which may exclude clients they still want
             // to upload). Pass an explicit empty defaults slice.
             let clients = build_client_filter_with_defaults(clients, &[]);
+            let cursor_timeout = timeout.map(std::time::Duration::from_secs);
             run_submit_command(
                 clients,
                 since,
@@ -1014,6 +1024,7 @@ fn main() -> Result<()> {
                 no_quota,
                 &extra_targets,
                 SubmitMode::Interactive,
+                cursor_timeout,
             )
         }
         Some(Commands::Target { subcommand }) => {
@@ -2054,7 +2065,8 @@ fn emit_client_diagnostics(diagnostics: &[client_diagnostics::ClientDiagnostic])
     for diagnostic in diagnostics {
         eprintln!(
             "{}",
-            format!("  {}: {}", diagnostic.severity, diagnostic.message).yellow()
+            format!("  {}: {}", diagnostic.severity, diagnostic.message)
+                .color(client_diagnostics::severity_color(diagnostic.severity))
         );
         eprintln!("{}", format!("  {}", diagnostic.help).bright_black());
     }
@@ -5155,7 +5167,8 @@ fn run_clients_command(json: bool, home_dir: Option<String>) -> Result<()> {
             for diagnostic in &row.diagnostics {
                 println!(
                     "  {}",
-                    format!("{}: {}", diagnostic.severity, diagnostic.message).yellow()
+                    format!("{}: {}", diagnostic.severity, diagnostic.message)
+                        .color(client_diagnostics::severity_color(diagnostic.severity))
                 );
                 println!("  {}", diagnostic.help.bright_black());
             }
@@ -5341,8 +5354,15 @@ struct TsTimeMetrics {
 }
 
 const SUBMISSION_PARSER_VERSION: u32 = 1;
-// Atomic Cursor/Grok Bot family reclassification; synchronized with the server.
-const CURSOR_SUBMISSION_PARSER_VERSION: u32 = 4;
+// The Cursor parser collapses repeated `usageEventId` snapshots (and the
+// matching legacy id-less row) once per cache file. The raw rows remain in the
+// parser cache so the scan can ship the same per-day recount proof used for
+// Devin CLI.
+const CURSOR_SUBMISSION_PARSER_VERSION: u32 = 2;
+// Grok Bot is a partition of the Cursor ledger, not a ledger of its own: the
+// receiver credits Cursor + Grok Bot as Cursor generation 2 and splits the
+// written cells. Sent only to receivers that advertise this exact pair; see
+// `submit_compat`.
 const GROK_BOT_SUBMISSION_PARSER_VERSION: u32 = 1;
 const COPILOT_SUBMISSION_PARSER_VERSION: u32 = 2;
 // Amp v2 moves existing exported messages from synthesized creation-time dates
@@ -5415,9 +5435,10 @@ struct TsScanScope {
     retention_floors: Option<std::collections::BTreeMap<String, String>>,
     /// Per-day correction evidence for clients whose declared generation
     /// counts the same history LOWER than the one the receiver may have
-    /// stored (Devin CLI's request_id dedup). A generation number alone only
-    /// proves identity; this proves, per cell, how much the older generation
-    /// over-counted from exactly the rows this snapshot was built from, so
+    /// stored (Devin CLI request dedup and Cursor event-snapshot collapse). A
+    /// generation number alone only proves identity. This proves how much the
+    /// older generation over-counted each cell from the exact rows that built
+    /// this snapshot, so
     /// the receiver subtracts that difference instead of replacing the cell.
     /// Only sent for clients carrying full-history authority.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5457,29 +5478,28 @@ fn incompletely_read_clients(
         .collect()
 }
 
-/// True when the corrected side of every model on a proof day is empty: the
-/// previous generation counted rows there that this generation drops
-/// entirely, so the submission has no contribution to date for the day.
-fn recount_proof_day_is_all_duplicates(
-    models: &std::collections::BTreeMap<String, tokscale_core::RecountProofEntry>,
-) -> bool {
-    models.values().all(|entry| {
-        let tokens = &entry.corrected.tokens;
-        tokens.input == 0
-            && tokens.output == 0
-            && tokens.cache_read == 0
-            && tokens.cache_write == 0
-            && tokens.cache_write_1h == 0
-            && tokens.reasoning == 0
-            && entry.corrected.messages == 0
-    })
+/// True when the corrected side of one proof cell is empty: the previous
+/// generation counted rows that this generation drops entirely, so the
+/// submission has no contribution for this (day, model) cell.
+fn recount_proof_cell_is_all_duplicates(entry: &tokscale_core::RecountProofEntry) -> bool {
+    let tokens = &entry.corrected.tokens;
+    tokens.input == 0
+        && tokens.output == 0
+        && tokens.cache_read == 0
+        && tokens.cache_write == 0
+        && tokens.cache_write_1h == 0
+        && tokens.reasoning == 0
+        && entry.corrected.cost == 0.0
+        && entry.corrected.messages == 0
 }
 
 /// Recount proofs for the clients that carry full-history authority in
-/// `scope`, limited to the days the submission actually dates for them plus
-/// the days whose every row the corrected generation drops: those have no
-/// contribution to date, yet their stored over-count is exactly what the
-/// proof exists to heal.
+/// `scope`, limited to the (day, model) cells the submission actually carries
+/// plus cells whose every row the corrected generation drops. The latter have
+/// no contribution to submit, yet their stored over-count is exactly what the
+/// proof exists to heal. Filtering at model granularity also removes a
+/// tokenless-cost row that submission excluded from a day where another model
+/// still has usage.
 fn submission_recount_proofs(
     graph: &tokscale_core::GraphResultV2,
     scope: &TsScanScope,
@@ -5489,21 +5509,30 @@ fn submission_recount_proofs(
         if !scope.full_history && !scope.full_history_clients.iter().any(|c| c == client) {
             continue;
         }
-        let submitted_dates: std::collections::BTreeSet<&str> = graph
+        let submitted_cells: std::collections::BTreeSet<(&str, &str)> = graph
             .contributions
             .iter()
-            .filter(|day| day.clients.iter().any(|s| &s.client == client))
-            .map(|day| day.date.as_str())
+            .flat_map(|day| {
+                day.clients
+                    .iter()
+                    // The Cursor proof describes the Cursor ledger, whose
+                    // cells are the Cursor + Grok Bot union.
+                    .filter(|submission| {
+                        &submission.client == client
+                            || (client == "cursor" && submission.client == "grok-bot")
+                    })
+                    .map(|submission| (day.date.as_str(), submission.model_id.as_str()))
+            })
             .collect();
         let days: std::collections::BTreeMap<_, _> = proof
             .iter()
-            .filter(|(date, models)| {
-                submitted_dates.contains(date.as_str())
-                    || recount_proof_day_is_all_duplicates(models)
-            })
-            .map(|(date, models)| {
-                let models = models
+            .filter_map(|(date, models)| {
+                let models: std::collections::BTreeMap<_, _> = models
                     .iter()
+                    .filter(|(model_id, entry)| {
+                        submitted_cells.contains(&(date.as_str(), model_id.as_str()))
+                            || recount_proof_cell_is_all_duplicates(entry)
+                    })
                     .map(|(model_id, entry)| {
                         (
                             model_id.clone(),
@@ -5514,7 +5543,7 @@ fn submission_recount_proofs(
                         )
                     })
                     .collect();
-                (date.clone(), models)
+                (!models.is_empty()).then_some((date.clone(), models))
             })
             .collect();
         if !days.is_empty() {
@@ -7329,6 +7358,7 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
                 no_quota || settings.no_quota,
                 &extra_targets,
                 SubmitMode::Autosubmit,
+                None,
             ) {
                 Ok(()) => {
                     commands::autosubmit::record_run_success(
@@ -7356,6 +7386,7 @@ fn run_submit_command(
     no_quota: bool,
     extra_target_flags: &extra_targets::ExtraTargetFlags,
     mode: SubmitMode,
+    cursor_timeout: Option<std::time::Duration>,
 ) -> Result<()> {
     use colored::Colorize;
     use std::io::IsTerminal;
@@ -7409,7 +7440,8 @@ fn run_submit_command(
     if include_cursor && cursor::ensure_cursor_session_for_sync() {
         println!("{}", "  Syncing Cursor usage data...".bright_black());
         let rt_sync = Runtime::new()?;
-        let sync_result = rt_sync.block_on(async { cursor::sync_cursor_cache(false).await });
+        let sync_result =
+            rt_sync.block_on(async { cursor::sync_cursor_cache_for_submit(cursor_timeout).await });
         if sync_result.synced {
             println!(
                 "{}",
@@ -11090,7 +11122,7 @@ mod tests {
         let clients = vec!["cursor".to_string(), "grok-bot".to_string()];
         for full_history in [true, false] {
             let scope = submit_scan_scope(Some(&clients), full_history, true).unwrap();
-            assert_eq!(scope.parser_versions.get("cursor"), Some(&4));
+            assert_eq!(scope.parser_versions.get("cursor"), Some(&2));
             assert_eq!(scope.parser_versions.get("grok-bot"), Some(&1));
             assert_eq!(scope.full_history, full_history);
             assert_eq!(scope.parser_versions.len(), 2);
@@ -11204,17 +11236,28 @@ mod tests {
         assert_eq!(together.full_history_clients, family);
     }
 
-    /// The exemption list mirrors the receiver's snapshot-integrity set, which
-    /// registers devin-cli at generation 2: a bounded submit that filtered it
-    /// would freeze on the receiver and discard the window's usage, and its
-    /// recount proof only rides on a declared-complete snapshot.
+    /// The exemption list mirrors the receiver's snapshot-integrity set. A
+    /// bounded submit that filtered a recounting client would freeze on the
+    /// receiver and discard the window's usage, and its proof only rides on a
+    /// declared-complete snapshot.
     #[test]
-    fn submit_scan_scope_names_devin_cli_complete_on_a_partial_scan() {
-        let clients = vec!["codex".to_string(), "devin-cli".to_string()];
+    fn submit_scan_scope_names_recount_clients_complete_on_a_partial_scan() {
+        let clients = vec![
+            "codex".to_string(),
+            "cursor".to_string(),
+            "devin-cli".to_string(),
+        ];
         let scope = submit_scan_scope(Some(&clients), false, true).expect("scope");
 
         assert!(!scope.full_history);
-        assert_eq!(scope.full_history_clients, vec!["devin-cli".to_string()]);
+        assert_eq!(
+            scope.full_history_clients,
+            vec!["cursor".to_string(), "devin-cli".to_string()]
+        );
+        assert_eq!(
+            scope.parser_versions.get("cursor"),
+            Some(&CURSOR_SUBMISSION_PARSER_VERSION)
+        );
         assert_eq!(scope.parser_versions.get("devin-cli"), Some(&2));
     }
 
@@ -11227,18 +11270,23 @@ mod tests {
     fn bounded_scan_withholds_declaration_from_partially_read_exempt_clients() {
         let clients = vec![
             "codex".to_string(),
+            "cursor".to_string(),
             "devin-cli".to_string(),
             "droid".to_string(),
         ];
         let mut scope = submit_scan_scope(Some(&clients), false, true).expect("scope");
         assert_eq!(
             scope.full_history_clients,
-            vec!["devin-cli".to_string(), "droid".to_string()]
+            vec![
+                "cursor".to_string(),
+                "devin-cli".to_string(),
+                "droid".to_string(),
+            ]
         );
 
         let mut reads = std::collections::BTreeMap::new();
         reads.insert(
-            "devin-cli".to_string(),
+            "cursor".to_string(),
             tokscale_core::SourceReadSummary {
                 discovered: 2,
                 unreadable: 1,
@@ -11247,24 +11295,30 @@ mod tests {
         withhold_full_history_for_clients(&mut scope, &incompletely_read_clients(&reads));
 
         assert!(!scope.full_history);
-        assert_eq!(scope.full_history_clients, vec!["droid".to_string()]);
-        // Identity stays declared; only the completeness authority is gone.
-        assert_eq!(scope.parser_versions.get("devin-cli"), Some(&2));
+        assert_eq!(
+            scope.full_history_clients,
+            vec!["devin-cli".to_string(), "droid".to_string()]
+        );
+        // Identity stays declared; only Cursor's completeness authority is gone.
+        assert_eq!(
+            scope.parser_versions.get("cursor"),
+            Some(&CURSOR_SUBMISSION_PARSER_VERSION)
+        );
     }
 
-    /// Devin CLI generation 2 deduplicates `message_nodes` rows by request_id,
-    /// which lowers the counted total — a recount, not a re-attribution. The
-    /// server accepts the generation via `SUPPORTED_VERSIONED_PARSERS` and
-    /// heals stored cells from the per-day recount proof this CLI ships
-    /// (`RECOUNT_PROOF_CLIENTS`, both in
-    /// packages/frontend/src/lib/db/parserHighWater.ts). Generation 1
-    /// (pre-request_id dedup) freezes once a device transitions, so only a CLI
-    /// declaring this version can heal the inflated rows.
+    /// Generation 2 lowers both recounting clients: Devin CLI collapses
+    /// request_id copies and Cursor collapses usageEventId snapshots. The
+    /// receiver registers the same submission generation and freezes generation
+    /// 1 only after a device transitions.
     #[test]
-    fn submit_scan_scope_declares_the_devin_cli_generation_the_server_registers() {
-        let clients = vec!["devin-cli".to_string()];
-        let scope = submit_scan_scope(Some(&clients), true, true).expect("devin-cli scope");
+    fn submit_scan_scope_declares_the_recount_generations_the_server_registers() {
+        let clients = vec!["cursor".to_string(), "devin-cli".to_string()];
+        let scope = submit_scan_scope(Some(&clients), true, true).expect("recount scope");
 
+        assert_eq!(
+            scope.parser_versions.get("cursor"),
+            Some(&CURSOR_SUBMISSION_PARSER_VERSION)
+        );
         assert_eq!(scope.parser_versions.get("devin-cli"), Some(&2));
         // The desktop surface parses an unrelated ACP stream and is unaffected
         // by the CLI request_id dedup; it keeps the default generation.
@@ -11392,6 +11446,102 @@ mod tests {
         assert!(!scope.full_history);
         assert!(scope.full_history_clients.is_empty());
         assert!(scope.recount_proofs.is_none());
+    }
+
+    #[test]
+    fn cursor_payload_ships_only_snapshot_matching_proof_cells_with_authority() {
+        let mut graph = graph_result_with_contributions(vec![day_with_clients(
+            "2026-10-08",
+            350,
+            vec![client_contribution(
+                "cursor",
+                "gemini-4-argon-medium",
+                "cursor",
+                350,
+                3.5,
+                1,
+            )],
+        )]);
+        let mut proof = tokscale_core::ClientRecountProof::new();
+        proof.entry("2026-10-08".to_string()).or_default().insert(
+            "gemini-4-argon-medium".to_string(),
+            tokscale_core::RecountProofEntry {
+                previous: recount_cell(900, 9.0, 3),
+                corrected: recount_cell(350, 3.5, 1),
+            },
+        );
+        // Submission strips tokenless cost rows after the core proof is built.
+        // Model-granular filtering must not let this absent cell invalidate the
+        // otherwise matching Cursor proof for the day.
+        proof.entry("2026-10-08".to_string()).or_default().insert(
+            "tokenless-model".to_string(),
+            tokscale_core::RecountProofEntry {
+                previous: recount_cell(0, 2.0, 2),
+                corrected: recount_cell(0, 1.0, 1),
+            },
+        );
+        // A genuinely all-duplicate cell has no submitted contribution and is
+        // still required to heal the stored day.
+        proof.entry("2026-10-07".to_string()).or_default().insert(
+            "gemini-4-argon-medium".to_string(),
+            tokscale_core::RecountProofEntry {
+                previous: recount_cell(25, 0.25, 1),
+                corrected: recount_cell(0, 0.0, 0),
+            },
+        );
+        graph.recount_proofs.insert("cursor".to_string(), proof);
+        let clients = vec!["cursor".to_string()];
+
+        let full = to_ts_token_contribution_data(
+            &graph,
+            None,
+            submit_scan_scope(Some(&clients), true, true),
+        );
+        let proofs = full
+            .scan_scope
+            .as_ref()
+            .and_then(|scope| scope.recount_proofs.as_ref())
+            .expect("Cursor proof ships with authority");
+        let cursor = &proofs["cursor"];
+        assert_eq!(
+            cursor["2026-10-08"]["gemini-4-argon-medium"]
+                .previous
+                .tokens
+                .input,
+            900
+        );
+        assert!(!cursor["2026-10-08"].contains_key("tokenless-model"));
+        assert_eq!(
+            cursor["2026-10-07"]["gemini-4-argon-medium"]
+                .corrected
+                .messages,
+            0
+        );
+
+        // A bounded CLI request still carries full-history authority for Cursor:
+        // its rows are exempt from the date filter, so the proof is safe.
+        let bounded = to_ts_token_contribution_data(
+            &graph,
+            None,
+            submit_scan_scope(Some(&clients), false, true),
+        );
+        assert!(bounded
+            .scan_scope
+            .as_ref()
+            .and_then(|scope| scope.recount_proofs.as_ref())
+            .is_some_and(|proofs| proofs.contains_key("cursor")));
+
+        let mut withheld = submit_scan_scope(Some(&clients), true, true).unwrap();
+        withhold_full_history_for_clients(
+            &mut withheld,
+            &["cursor".to_string()].into_iter().collect(),
+        );
+        let withheld = to_ts_token_contribution_data(&graph, None, Some(withheld));
+        assert!(withheld
+            .scan_scope
+            .as_ref()
+            .and_then(|scope| scope.recount_proofs.as_ref())
+            .is_none());
     }
 
     /// `fullHistory` only ever meant "no date filter". A Devin database that
@@ -11648,6 +11798,16 @@ mod tests {
             "18446744073709551615"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn clap_accepts_submit_timeout_options() {
+        assert!(Cli::try_parse_from(["tokscale", "submit"]).is_ok());
+        assert!(Cli::try_parse_from(["tokscale", "submit", "--timeout", "300"]).is_ok());
+        assert!(Cli::try_parse_from(["tokscale", "submit", "--cursor-timeout", "300"]).is_ok());
+        assert!(Cli::try_parse_from(["tokscale", "submit", "--timeout", "0"]).is_err());
+        assert!(Cli::try_parse_from(["tokscale", "submit", "--timeout", "86400"]).is_ok());
+        assert!(Cli::try_parse_from(["tokscale", "submit", "--timeout", "86401"]).is_err());
     }
 
     #[test]
