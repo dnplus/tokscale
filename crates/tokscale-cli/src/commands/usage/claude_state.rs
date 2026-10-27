@@ -12,6 +12,10 @@ use std::{
 
 const FRESH_SAMPLE_SECS: u64 = 60;
 const MAX_STALE_SECS: u64 = 3600;
+/// How long an expired login's last observation stays displayable. Claude Code
+/// refreshes its own login on its next run; until then this is the newest
+/// reading of the same token's account.
+const EXPIRED_LOGIN_STALE_SECS: u64 = 7 * 24 * 3600;
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub(super) struct State {
@@ -135,6 +139,31 @@ impl State {
         output.freshness = Some(UsageFreshness {
             fetched_at: fetched,
             stale,
+        });
+        Some(output)
+    }
+    /// The sample as last known while its login is expired: windows past their
+    /// reset no longer describe the account, so they are dropped, and nothing
+    /// is returned once none remain.
+    pub fn last_known(&self, now: u64) -> Option<UsageOutput> {
+        let mut output = self.sample.clone()?;
+        let fetched = output.freshness.as_ref()?.fetched_at;
+        if fetched > now || now - fetched > EXPIRED_LOGIN_STALE_SECS {
+            return None;
+        }
+        output.metrics.retain(|metric| {
+            metric
+                .resets_at
+                .as_deref()
+                .and_then(|reset| chrono::DateTime::parse_from_rfc3339(reset).ok())
+                .is_some_and(|reset| reset.timestamp() > now as i64)
+        });
+        if output.metrics.is_empty() {
+            return None;
+        }
+        output.freshness = Some(UsageFreshness {
+            fetched_at: fetched,
+            stale: true,
         });
         Some(output)
     }
