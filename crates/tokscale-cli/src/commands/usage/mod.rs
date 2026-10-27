@@ -487,7 +487,7 @@ fn usage_providers(codex_fetch: Fetch) -> Vec<UsageProvider> {
             "warp",
             "Warp/Oz",
             warp::has_credentials,
-            Fetch::Single(warp::fetch),
+            Fetch::Report(warp::fetch_report),
         ),
         (
             "sakana",
