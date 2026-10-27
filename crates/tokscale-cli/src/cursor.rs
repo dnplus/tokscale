@@ -119,8 +119,24 @@ fn old_cursor_credentials_path(home_dir: &Path) -> PathBuf {
     home_dir.join(".tokscale/cursor-credentials.json")
 }
 
+/// Resolved through the scanner's own `ClientId::Cursor` root so the writer and
+/// the reader cannot disagree. `TOKSCALE_CONFIG_DIR` relocates the cache only
+/// for the user's own home; any other home (a test's scratch home) stays
+/// hermetic, as the scanner ignores env roots for an explicit `--home`.
 fn cursor_cache_dir(home_dir: &Path) -> PathBuf {
-    home_dir.join(".config/tokscale/cursor-cache")
+    let use_env_roots = crate::paths::home_dir().as_deref() == Some(home_dir);
+    PathBuf::from(
+        tokscale_core::ClientId::Cursor
+            .data()
+            .resolve_path_with_env_strategy(&home_dir.to_string_lossy(), use_env_roots),
+    )
+}
+
+/// Whether the cache lives outside the home's default root, in which case the
+/// legacy `~/.tokscale/cursor-cache` belongs to the host profile rather than
+/// this one and must be neither migrated in nor purged.
+fn cursor_cache_is_isolated(home_dir: &Path) -> bool {
+    cursor_cache_dir(home_dir) != home_dir.join(".config/tokscale/cursor-cache")
 }
 
 fn cursor_desktop_auto_import_disabled_path(home_dir: &Path) -> PathBuf {
@@ -263,6 +279,10 @@ pub struct SyncCursorResult {
 }
 
 fn migrate_cache_dir_from_old_path_in_home(home_dir: &Path) {
+    // The migration deletes the legacy dir; never pull it into an isolated root.
+    if cursor_cache_is_isolated(home_dir) {
+        return;
+    }
     let old_dir = old_cursor_cache_dir(home_dir);
     let new_dir = cursor_cache_dir(home_dir);
     if !new_dir.exists()
@@ -1425,8 +1445,10 @@ fn remove_all_accounts_in_home(home: &Path, purge_cache: bool) -> Result<()> {
     if purge_cache {
         // `--all --purge-cache` is an explicit deletion request. Remove both
         // application-owned cache locations, including legacy files and earlier
-        // archives whose ownership can no longer be proved.
-        for dir in [cache_dir.clone(), old_cursor_cache_dir(home)] {
+        // archives whose ownership can no longer be proved. An isolated root
+        // owns only its own cache, so the host's legacy dir is left alone.
+        let legacy_dir = (!cursor_cache_is_isolated(home)).then(|| old_cursor_cache_dir(home));
+        for dir in std::iter::once(cache_dir.clone()).chain(legacy_dir) {
             if dir.exists() {
                 fs::remove_dir_all(dir)?;
             }
@@ -3104,6 +3126,14 @@ mod tests {
             }
             Self { name, original }
         }
+
+        fn remove(name: &'static str) -> Self {
+            let original = std::env::var_os(name);
+            unsafe {
+                std::env::remove_var(name);
+            }
+            Self { name, original }
+        }
     }
 
     impl Drop for EnvVarGuard {
@@ -3117,6 +3147,116 @@ mod tests {
                 },
             }
         }
+    }
+
+    /// Points `HOME` at a scratch dir and sets or clears the config override
+    /// and XDG, returning the guards in drop order.
+    fn cursor_cache_env(
+        home: &Path,
+        config_override: Option<&Path>,
+        xdg: Option<&Path>,
+    ) -> [EnvVarGuard; 3] {
+        let set_or_remove = |name, value: Option<&Path>| match value {
+            Some(value) => EnvVarGuard::set(name, value.to_str().unwrap()),
+            None => EnvVarGuard::remove(name),
+        };
+        [
+            set_or_remove("XDG_CONFIG_HOME", xdg),
+            set_or_remove("TOKSCALE_CONFIG_DIR", config_override),
+            EnvVarGuard::set("HOME", home.to_str().unwrap()),
+        ]
+    }
+
+    #[test]
+    #[serial]
+    fn test_cursor_cache_dir_matches_scanner_across_override_and_xdg() {
+        let home = TempDir::new().unwrap();
+        let config = TempDir::new().unwrap();
+        let xdg = TempDir::new().unwrap();
+        let scratch_home = TempDir::new().unwrap();
+        let home_default = home.path().join(".config/tokscale/cursor-cache");
+        for config_override in [None, Some(config.path())] {
+            for xdg_value in [None, Some(xdg.path())] {
+                let _env = cursor_cache_env(home.path(), config_override, xdg_value);
+                let own_home = home_dir().unwrap();
+                assert_eq!(own_home, home.path());
+                let label = format!("override={config_override:?} xdg={xdg_value:?}");
+
+                let expected = match config_override {
+                    Some(config) => config.join("cursor-cache"),
+                    None => home_default.clone(),
+                };
+                assert_eq!(cursor_cache_dir(&own_home), expected, "{label}");
+                let scanned = PathBuf::from(
+                    tokscale_core::ClientId::Cursor
+                        .data()
+                        .resolve_path(own_home.to_str().unwrap()),
+                );
+                assert_eq!(cursor_cache_dir(&own_home), scanned, "{label}");
+
+                // Negative control: a home other than the user's own never
+                // follows the override, matching the scanner's explicit-home
+                // behavior.
+                assert_eq!(
+                    cursor_cache_dir(scratch_home.path()),
+                    scratch_home.path().join(".config/tokscale/cursor-cache"),
+                    "{label}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_legacy_cache_migrates_only_into_the_default_root() {
+        for override_set in [false, true] {
+            let home = TempDir::new().unwrap();
+            let config = TempDir::new().unwrap();
+            let _env = cursor_cache_env(home.path(), override_set.then(|| config.path()), None);
+            let legacy_dir = old_cursor_cache_dir(home.path());
+            fs::create_dir_all(&legacy_dir).unwrap();
+            fs::write(legacy_dir.join("usage.json"), b"host legacy history").unwrap();
+
+            migrate_cache_dir_from_old_path_in_home(&home_dir().unwrap());
+
+            let migrated = cursor_cache_dir(&home_dir().unwrap()).join("usage.json");
+            if override_set {
+                assert!(!migrated.exists(), "an isolated root must not adopt it");
+                assert_eq!(
+                    fs::read(legacy_dir.join("usage.json")).unwrap(),
+                    b"host legacy history"
+                );
+            } else {
+                assert_eq!(fs::read(migrated).unwrap(), b"host legacy history");
+                assert!(!legacy_dir.exists());
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_purge_all_removes_legacy_cache_only_without_override() -> Result<()> {
+        for override_set in [false, true] {
+            let home = TempDir::new()?;
+            let config = TempDir::new()?;
+            let _env = cursor_cache_env(home.path(), override_set.then(|| config.path()), None);
+            let cache_dir = cursor_cache_dir(&home_dir()?);
+            fs::create_dir_all(&cache_dir)?;
+            fs::write(cache_dir.join("usage.json"), b"own history")?;
+            let legacy_dir = old_cursor_cache_dir(home.path());
+            fs::create_dir_all(&legacy_dir)?;
+            fs::write(legacy_dir.join("usage.json"), b"host legacy history")?;
+
+            remove_all_accounts_in_home(&home_dir()?, true)?;
+
+            assert!(!cache_dir.exists(), "purge must clear the active cache");
+            assert_eq!(
+                legacy_dir.exists(),
+                override_set,
+                "override set: {override_set}"
+            );
+        }
+        Ok(())
     }
 
     /// #1250: cursor.com serves a bot-protection challenge instead of the API
