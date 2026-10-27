@@ -20,6 +20,9 @@ struct QuotaPool {
     account_label: Option<String>,
     email_masked: Option<String>,
     plan: Option<String>,
+    /// When this pool's values were observed: earlier than the report's
+    /// `observedAt` for a cached (`stale`) reading.
+    observed_at: String,
     status: &'static str,
     error: Option<&'static str>,
     windows: Vec<QuotaWindow>,
@@ -35,12 +38,25 @@ struct QuotaWindow {
     resets_at: Option<String>,
 }
 
-fn identity(provider: &str, account: Option<&str>, email: Option<&str>) -> Option<String> {
+/// A provider that names no account (Claude, Colab, Z.ai, ...) has one pool per
+/// machine, so the submitting device stands in for its account.
+fn identity(
+    provider: &str,
+    account: Option<&str>,
+    email: Option<&str>,
+    device: Option<&str>,
+) -> Option<String> {
     let email = email.map(|value| value.trim().to_lowercase());
+    let device = device.map(|device| format!("device:{device}"));
     let id = account
         .filter(|value| !value.trim().is_empty())
-        .or(email.as_deref().filter(|value| !value.is_empty()))?;
+        .or(email.as_deref().filter(|value| !value.is_empty()))
+        .or(device.as_deref())?;
     Some(format!("{:x}", Sha256::digest(format!("{provider}|{id}")))[..24].to_owned())
+}
+
+fn observed_time(seconds: u64) -> Option<String> {
+    chrono::DateTime::from_timestamp(i64::try_from(seconds).ok()?, 0).map(|time| time.to_rfc3339())
 }
 
 fn text(value: Option<&str>, limit: usize) -> Option<String> {
@@ -61,7 +77,7 @@ fn masked_email(email: Option<&str>) -> Option<String> {
     ))
 }
 
-fn from_report(report: &UsageFetchReport, observed_at: &str) -> QuotaReport {
+fn from_report(report: &UsageFetchReport, observed_at: &str, device: Option<&str>) -> QuotaReport {
     let mut pools: Vec<QuotaPool> = Vec::new();
     for output in &report.outputs {
         let provider: String = output.provider.trim().chars().take(60).collect();
@@ -72,6 +88,7 @@ fn from_report(report: &UsageFetchReport, observed_at: &str) -> QuotaReport {
             &provider,
             output.account.as_ref().map(|account| account.id.as_str()),
             output.email.as_deref(),
+            device,
         ) else {
             continue;
         };
@@ -128,7 +145,18 @@ fn from_report(report: &UsageFetchReport, observed_at: &str) -> QuotaReport {
             ),
             email_masked: masked_email(output.email.as_deref()),
             plan: text(output.plan.as_deref(), 40),
-            status: "ok",
+            observed_at: output
+                .freshness
+                .as_ref()
+                .and_then(|freshness| observed_time(freshness.fetched_at))
+                .unwrap_or_else(|| observed_at.into()),
+            status: if output.freshness.as_ref().is_some_and(|f| f.stale) {
+                "stale"
+            } else if windows.is_empty() {
+                "unknown"
+            } else {
+                "ok"
+            },
             error: None,
             windows,
         });
@@ -148,6 +176,7 @@ fn from_report(report: &UsageFetchReport, observed_at: &str) -> QuotaReport {
                 .as_ref()
                 .map(|account| account.id.as_str()),
             None,
+            device,
         ) else {
             continue;
         };
@@ -167,8 +196,13 @@ fn from_report(report: &UsageFetchReport, observed_at: &str) -> QuotaReport {
             "unavailable"
         };
         if let Some(pool) = pools.iter_mut().find(|pool| pool.account_id == account_id) {
-            pool.status = "error";
             pool.error = Some(error);
+            // A cached reading is the last known value: keep it, labelled
+            // stale with its own time, and say why it is not fresh.
+            if pool.status == "stale" {
+                continue;
+            }
+            pool.status = "error";
             for window in &mut pool.windows {
                 window.used_percent = None;
                 window.remaining_percent = None;
@@ -187,6 +221,7 @@ fn from_report(report: &UsageFetchReport, observed_at: &str) -> QuotaReport {
                 ),
                 email_masked: None,
                 plan: None,
+                observed_at: observed_at.into(),
                 status: "error",
                 error: Some(error),
                 windows: Vec::new(),
@@ -211,7 +246,14 @@ fn current() -> &'static Upload {
         let report =
             crate::commands::usage::fetch_all_report_with_intent(UsageFetchIntent::CliReadOnly);
         Upload {
-            report: from_report(&report, &chrono::Utc::now().to_rfc3339()),
+            report: from_report(
+                &report,
+                &chrono::Utc::now().to_rfc3339(),
+                crate::device::resolve_submit_device()
+                    .ok()
+                    .map(|device| device.id)
+                    .as_deref(),
+            ),
             legacy: serde_json::to_string(&report.outputs).unwrap_or_else(|_| "[]".into()),
         }
     })
@@ -346,7 +388,8 @@ mod tests {
 
     #[test]
     fn embedded_quota_serializes_the_cafe_versioned_contract_without_raw_identity() {
-        let value = serde_json::to_value(from_report(&report(), "2026-10-26T09:00:00Z")).unwrap();
+        let value =
+            serde_json::to_value(from_report(&report(), "2026-10-26T09:00:00Z", None)).unwrap();
         assert_eq!(value["version"], 1);
         assert_eq!(value["observedAt"], "2026-10-26T09:00:00Z");
         assert_eq!(value["pools"][0]["windows"][0]["remainingPercent"], 60.0);
@@ -370,7 +413,8 @@ mod tests {
         input
             .diagnostics
             .push(UsageFetchDiagnostic::new("Claude", None, "HTTP 401"));
-        let value = serde_json::to_value(from_report(&input, "2026-10-26T09:00:00Z")).unwrap();
+        let value =
+            serde_json::to_value(from_report(&input, "2026-10-26T09:00:00Z", None)).unwrap();
         assert_eq!(value["pools"].as_array().unwrap().len(), 1);
         assert_eq!(value["pools"][0]["status"], "error");
         assert_eq!(value["pools"][0]["error"], "auth");
@@ -379,14 +423,85 @@ mod tests {
     }
 
     #[test]
+    fn cached_reading_reaches_the_cafe_as_stale_with_its_own_time() {
+        let mut input = report();
+        let mut claude = input.outputs[0].clone();
+        claude.provider = "Claude".into();
+        claude.account = None;
+        claude.email = None;
+        claude.freshness = Some(crate::commands::usage::UsageFreshness {
+            fetched_at: 1_785_751_200,
+            stale: true,
+        });
+        input.outputs.push(claude);
+        input
+            .diagnostics
+            .push(UsageFetchDiagnostic::new("Claude", None, "HTTP 401"));
+        let value = serde_json::to_value(from_report(
+            &input,
+            "2026-10-26T09:00:00Z",
+            Some("dev_fixture"),
+        ))
+        .unwrap();
+        let pools = value["pools"].as_array().unwrap();
+        assert_eq!(pools.len(), 2);
+        // The live pool keeps the report time and its values.
+        assert_eq!(pools[0]["status"], "ok");
+        assert_eq!(pools[0]["observedAt"], "2026-10-26T09:00:00Z");
+        // The cached pool keeps its values, labelled with when and why.
+        assert_eq!(pools[1]["provider"], "Claude");
+        assert_eq!(pools[1]["status"], "stale");
+        assert_eq!(pools[1]["error"], "auth");
+        assert_eq!(pools[1]["observedAt"], "2026-08-03T10:00:00+00:00");
+        assert_eq!(pools[1]["windows"][0]["remainingPercent"], 60.0);
+        assert!(!value.to_string().contains("dev_fixture"));
+    }
+
+    #[test]
+    fn account_less_pools_are_scoped_to_the_device_and_dropped_without_one() {
+        let mut input = report();
+        input.outputs[0].account = None;
+        input.outputs[0].email = None;
+        fn pool(input: &UsageFetchReport, device: Option<&str>) -> serde_json::Value {
+            serde_json::to_value(from_report(input, "2026-10-26T09:00:00Z", device)).unwrap()
+                ["pools"]
+                .clone()
+        }
+        assert_eq!(pool(&input, None).as_array().unwrap().len(), 0);
+        let one = pool(&input, Some("dev_one"));
+        let two = pool(&input, Some("dev_two"));
+        assert_eq!(one[0]["status"], "ok");
+        assert_ne!(one[0]["accountId"], two[0]["accountId"]);
+        assert_eq!(
+            one[0]["accountId"],
+            pool(&input, Some("dev_one"))[0]["accountId"]
+        );
+        // A device never re-keys a pool that names its account.
+        input.outputs[0].email = Some("fixture@example.com".into());
+        assert_eq!(
+            pool(&input, Some("dev_one"))[0]["accountId"],
+            pool(&input, None)[0]["accountId"]
+        );
+    }
+
+    #[test]
+    fn plan_without_windows_is_unknown_not_ok() {
+        let mut input = report();
+        input.outputs[0].metrics.clear();
+        let value =
+            serde_json::to_value(from_report(&input, "2026-10-26T09:00:00Z", None)).unwrap();
+        assert_eq!(value["pools"][0]["status"], "unknown");
+    }
+
+    #[test]
     fn embedded_quota_normalizes_email_identity_and_bounds_reports() {
         let mut input = report();
         input.outputs[0].account = None;
         input.outputs[0].email = Some(" Fixture@Example.com ".into());
         input.outputs[0].metrics[0].remaining_percent = 200.0;
-        let one = serde_json::to_value(from_report(&input, "2026-10-26T09:00:00Z")).unwrap();
+        let one = serde_json::to_value(from_report(&input, "2026-10-26T09:00:00Z", None)).unwrap();
         input.outputs[0].email = Some("fixture@example.com".into());
-        let two = serde_json::to_value(from_report(&input, "2026-10-26T09:00:00Z")).unwrap();
+        let two = serde_json::to_value(from_report(&input, "2026-10-26T09:00:00Z", None)).unwrap();
         assert_eq!(one["pools"][0]["accountId"], two["pools"][0]["accountId"]);
         assert!(one["pools"][0]["windows"][0]["remainingPercent"].is_null());
         input.outputs[0].account = Some(crate::commands::usage::UsageAccount {
@@ -408,7 +523,8 @@ mod tests {
                 output
             })
             .collect();
-        let value = serde_json::to_value(from_report(&input, "2026-10-26T09:00:00Z")).unwrap();
+        let value =
+            serde_json::to_value(from_report(&input, "2026-10-26T09:00:00Z", None)).unwrap();
         assert_eq!(value["pools"].as_array().unwrap().len(), 50);
         assert_eq!(value["pools"][0]["windows"].as_array().unwrap().len(), 8);
     }
@@ -528,7 +644,10 @@ mod tests {
         ] {
             let (address, thread) = server(vec![(200, body)]);
             let mut input = payload();
-            attach(&mut input, from_report(&report(), "2026-10-26T09:00:00Z"));
+            attach(
+                &mut input,
+                from_report(&report(), "2026-10-26T09:00:00Z", None),
+            );
             let rt = tokio::runtime::Runtime::new().unwrap();
             let client = tokscale_core::http::client_builder()
                 .no_proxy()
@@ -560,7 +679,10 @@ mod tests {
                 (200, "{}"),
             ]);
             let mut input = payload();
-            attach(&mut input, from_report(&report(), "2026-10-26T09:00:00Z"));
+            attach(
+                &mut input,
+                from_report(&report(), "2026-10-26T09:00:00Z", None),
+            );
             let rt = tokio::runtime::Runtime::new().unwrap();
             let client = tokscale_core::http::client_builder()
                 .no_proxy()
@@ -589,7 +711,10 @@ mod tests {
             let (address, thread) =
                 server(vec![(status, r#"{"error":"quota upload unavailable"}"#)]);
             let mut input = payload();
-            attach(&mut input, from_report(&report(), "2026-10-26T09:00:00Z"));
+            attach(
+                &mut input,
+                from_report(&report(), "2026-10-26T09:00:00Z", None),
+            );
             let rt = tokio::runtime::Runtime::new().unwrap();
             let client = tokscale_core::http::client_builder()
                 .no_proxy()
@@ -613,7 +738,10 @@ mod tests {
     fn embedded_quota_is_omitted_for_official_receivers_and_no_quota_uploads() {
         let (address, thread) = server(vec![(200, "{}")]);
         let mut input = payload();
-        attach(&mut input, from_report(&report(), "2026-10-26T09:00:00Z"));
+        attach(
+            &mut input,
+            from_report(&report(), "2026-10-26T09:00:00Z", None),
+        );
         let rt = tokio::runtime::Runtime::new().unwrap();
         let client = tokscale_core::http::client_builder()
             .no_proxy()
@@ -656,7 +784,10 @@ mod tests {
             let (address, thread) = server(responses);
             let url = format!("http://{address}");
             let mut input = payload();
-            attach(&mut input, from_report(&report(), "2026-10-26T09:00:00Z"));
+            attach(
+                &mut input,
+                from_report(&report(), "2026-10-26T09:00:00Z", None),
+            );
             let rt = tokio::runtime::Runtime::new().unwrap();
             let reply = rt
                 .block_on(send(
