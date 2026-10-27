@@ -400,10 +400,11 @@ fn push_limit_metric(
     limit: Option<f64>,
     reset: Option<String>,
 ) {
-    let Some(limit) = limit.filter(|limit| *limit > 0.0) else {
+    // A limit without its usage is an unknown quota, not an unused one.
+    let (Some(limit), Some(used)) = (limit.filter(|limit| *limit > 0.0), used) else {
         return;
     };
-    let used = used.unwrap_or(0.0).clamp(0.0, limit);
+    let used = used.clamp(0.0, limit);
     let used_percent = (used / limit * 100.0).clamp(0.0, 100.0);
     let remaining_label = format!("{:.0}/{:.0} left", limit - used, limit);
     if metrics.iter().any(|metric| {
@@ -1307,6 +1308,20 @@ mod tests {
         assert_eq!(metrics[0].used_percent, 30.0);
         assert_eq!(metrics[1].label, "Occasional");
         assert_eq!(metrics[1].used_percent, 20.0);
+    }
+
+    #[test]
+    fn task_limit_without_usage_is_omitted_rather_than_unused() {
+        let value = serde_json::json!({
+            "frequentLimit": 10,
+            "occasionalUsage": 0,
+            "occasionalLimit": 5
+        });
+        let mut metrics = Vec::new();
+        collect_task_usage_metrics(&value, &mut metrics);
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].label, "Occasional");
+        assert_eq!(metrics[0].used_percent, 0.0);
     }
 
     #[test]
