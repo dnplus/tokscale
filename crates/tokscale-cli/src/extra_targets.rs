@@ -323,6 +323,12 @@ impl Plan {
         Ok(Self { targets })
     }
 
+    pub fn has_quota_target(&self) -> bool {
+        self.targets
+            .iter()
+            .any(|target| !crate::commands::autosubmit::is_official_api_url(&target.api_url))
+    }
+
     pub fn print_dry_run(&self) {
         for target in &self.targets {
             println!(
@@ -407,26 +413,23 @@ fn error_message(body: &[u8], fallback: &str, status: reqwest::StatusCode) -> St
     format!("{message} ({status})")
 }
 
-async fn post_submission(target: &Target, payload: &TsTokenContributionData) -> Result<()> {
+async fn post_submission(target: &Target, payload: &TsTokenContributionData) -> Result<bool> {
     let payload = crate::submit_compat::prepare_submission(&target.api_url, payload).await?;
-    let response = http_client(SUBMIT_TIMEOUT)?
-        .post(format!("{}/api/submit", target.api_url))
-        .header("Authorization", format!("Bearer {}", target.token))
-        .json(&*payload)
-        .send()
-        .await
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "Failed to connect to server: {}",
-                tokscale_core::pricing::describe_error(&error)
-            )
-        })?;
-    let status = response.status();
-    if status.is_success() {
-        return Ok(());
+    let response = crate::embedded_quota::send(
+        &http_client(SUBMIT_TIMEOUT)?,
+        &target.api_url,
+        &target.token,
+        &payload,
+    )
+    .await?;
+    if response.status.is_success() {
+        return Ok(response.quota_stored);
     }
-    let body = read_bounded(response).await;
-    bail!(error_message(&body, "Submission failed", status))
+    bail!(error_message(
+        &response.body,
+        "Submission failed",
+        response.status
+    ))
 }
 
 fn submit_one(
@@ -443,15 +446,18 @@ fn submit_one(
         last_run_at_ms: Some(chrono::Utc::now().timestamp_millis()),
         ..TargetState::default()
     };
-    if let Err(error) = rt.block_on(post_submission(target, payload)) {
-        let error = redact(&format!("{error:#}"), &target.token);
-        eprintln!(
-            "  Warning: extra target {} upload failed: {error}",
-            target.name
-        );
-        state.last_error = Some(error);
-        return state;
-    }
+    let quota_stored = match rt.block_on(post_submission(target, payload)) {
+        Ok(stored) => stored,
+        Err(error) => {
+            let error = redact(&format!("{error:#}"), &target.token);
+            eprintln!(
+                "  Warning: extra target {} upload failed: {error}",
+                target.name
+            );
+            state.last_error = Some(error);
+            return state;
+        }
+    };
     println!("  Submitted to extra target {}.", target.name);
     state.last_success_at_ms = state.last_run_at_ms;
 
@@ -465,7 +471,14 @@ fn submit_one(
     if let Some(result) = crate::commands::autosubmit::after_submit_quota(
         no_quota,
         &target.api_url,
-        || crate::commands::autosubmit::upload_quota(&auth, &target.api_url),
+        quota_stored,
+        || {
+            crate::commands::autosubmit::upload_quota(
+                &auth,
+                &target.api_url,
+                &crate::embedded_quota::legacy_body(),
+            )
+        },
         |warning| {
             eprintln!(
                 "  {} (extra target {})",

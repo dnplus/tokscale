@@ -3799,23 +3799,6 @@ fn test_submit_tip_recommends_only_the_client_filter() {
 /// `client_scope_tip_is_interactive_only` in main.rs is the test that flips
 /// only the mode.
 ///
-/// The home is deliberately empty of session data, and that is load-bearing.
-/// `autosubmit run` is the one submit path in this file that is not a dry run
-/// (`run_submit_command(.., dry_run = false, ..)` at the `AutosubmitRunDecision`
-/// call site), so any usage at all carries it past the `total_tokens == 0`
-/// short-circuit and into a real `POST {api}/api/submit` with
-/// `Authorization: Bearer test-token`. With `create_temp_fixture_dir` here the
-/// run reached "Submitting to server..." and issued that POST against
-/// `https://tokscale.ai`; the loopback proxies were all that kept the packet on
-/// the machine. `cmd_with_home` now also pins `TOKSCALE_API_URL` to a dead
-/// loopback port, so no test resolves the production endpoint any more — but
-/// an empty home is still what keeps *this* test off the submit path entirely.
-/// It ends the run at "No usage data found to submit." instead, which is what
-/// the last assertion pins, and the scope line and the tip gate are observable
-/// either way.
-///
-/// `prime_pricing_cache` is still needed: the pricing load runs before the
-/// usage check and ignores `TOKSCALE_PRICING_CACHE_ONLY`.
 #[test]
 fn test_autosubmit_run_omits_the_scan_scope_tip() {
     let tmp = TempDir::new().expect("failed to create temp dir");
@@ -3824,7 +3807,7 @@ fn test_autosubmit_run_omits_the_scan_scope_tip() {
 
     cmd_with_home(tmp.path())
         .env("TOKSCALE_API_TOKEN", "test-token")
-        .args(["--no-spinner", "autosubmit", "run", "--force"])
+        .args(["--no-spinner", "autosubmit", "run", "--force", "--no-quota"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Scanning local session data ("))

@@ -573,6 +573,7 @@ mod tests {
             mcp_servers: Some(vec!["kept".into()]),
             provenance: None,
             sessions: None,
+            quota: None,
         };
         for (index, client) in clients.iter().enumerate() {
             graph.contributions.push(TsDailyContribution {

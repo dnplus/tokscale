@@ -38,7 +38,7 @@ tokscale autosubmit status
 ```
 
 - `--device-name` 可省略；未指定時若有設定 `TOKSCALE_DEVICE_NAME` 會沿用其值，並寫入 `~/.config/tokscale/device.json` 供排程使用。
-- `submit` 與 autosubmit 成功後預設會把 `tokscale usage --json` 上傳至同一伺服器的 `/api/quota`；可用 `--no-quota` 關閉，官方 tokscale.ai（含子網域）會自動略過，額度上傳失敗只會警告。
+- `submit` 與 autosubmit 預設在 `/api/submit` 內嵌版本 1 的 `quota`（包含有穩定帳號身分的錯誤讀數）；主站與 extra target 各自確認回應的 `quota.pools`。舊伺服器沒有確認時，成功的用量上傳後才 fallback 到 `/api/quota`；明確拒絕 quota 欄位時先以原用量、移除 quota 重送一次。`--no-quota` 關閉兩種額度上傳，官方 tokscale.ai（含子網域）不送額度。只有額度、沒有 token 用量時仍可更新；fallback 失敗只警告，不改判成功的用量上傳。
 - 伺服器 URL 的解析順序為 `TOKSCALE_API_URL` → 登入時儲存的 URL → `https://tokscale.ai`。URL 必須是 `https`（`localhost`／`127.0.0.1` 可用 `http`）。
 - 儲存的 token 只會送往登入時的 origin：若 `TOKSCALE_API_URL` 指向其他主機，tokscale 會直接拒絕而不送出 token。要換伺服器請重新執行 `tokscale login --token … --api-url <url>`。
 - 舊版存下、沒有 URL 的憑證視為屬於 `https://tokscale.ai`；若當初是用 `TOKSCALE_API_URL` 登入 PA Cafe，請以上面的指令重新登入。
@@ -927,7 +927,7 @@ tokscale report --workspace my-project --client opencode
 
 Tokscale can fetch and display your real-time subscription quota across AI providers. This shows how much of your plan you've used and when limits reset.
 
-`--json-report` returns `{ "outputs": [...], "diagnostics": [...] }`. A failed Grok Bot account appears in diagnostics even when another account succeeds. Providers without detected credentials are skipped. `--json` and automatic quota uploads keep their existing array format.
+`--json-report` returns `{ "outputs": [...], "diagnostics": [...] }`. A failed Grok Bot account appears in diagnostics even when another account succeeds. Providers without detected credentials are skipped. `--json` keeps its existing array format. Automatic quota uploads use the versioned `quota` in `/api/submit`, with the existing array format retained for the `/api/quota` fallback.
 
 ```bash
 # Show subscription usage for all detected providers
