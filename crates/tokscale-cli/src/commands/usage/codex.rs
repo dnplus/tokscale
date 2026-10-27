@@ -1515,6 +1515,7 @@ async fn fetch_with_auth_async(
     }
 
     Ok(UsageOutput {
+        freshness: None,
         provider: provider_name,
         account,
         credential_source: None,
@@ -2329,6 +2330,7 @@ mod tests {
     #[test]
     fn plan_only_codex_cards_carry_an_unknown_quota_warning() {
         let plan_only = UsageOutput {
+            freshness: None,
             provider: "Codex".into(),
             account: None,
             credential_source: None,

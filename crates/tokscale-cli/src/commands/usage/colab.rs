@@ -142,6 +142,7 @@ async fn fetch_with(doc: &Value, base: &str) -> Result<UsageOutput> {
     }
     let metrics = build_metrics(&parse_usage(&response.text().await?)?)?;
     Ok(UsageOutput {
+        freshness: None,
         provider: "Colab".to_string(),
         account: None,
         credential_source: None,

@@ -194,6 +194,12 @@ fn without_family(payload: &TsTokenContributionData) -> Option<TsTokenContributi
                 scope.retention_floors = None;
             }
         }
+        if let Some(proofs) = &mut scope.recount_proofs {
+            proofs.retain(|client, _| !is_family(client));
+            if proofs.is_empty() {
+                scope.recount_proofs = None;
+            }
+        }
     }
     let mut removed_usage = false;
     for day in &mut filtered.contributions {
