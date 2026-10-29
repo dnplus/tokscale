@@ -4,20 +4,17 @@ use serde::Deserialize;
 use super::helpers::capitalize;
 use super::{UsageMetric, UsageOutput};
 
-const CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
+const USAGE_URL: &str = "https://api.kimi.com/coding/v1/usages";
 
+// The credential file belongs to the Kimi CLI. This module is a quota viewer:
+// it reads the access token and never refreshes or rewrites it. Refreshing
+// would rotate the refresh token the CLI holds, and rewriting the document
+// from the few fields modeled here dropped everything else in it (the #1001
+// failure mode Claude had). An expired token is the CLI's to refresh on its
+// next run.
 #[derive(Debug, Deserialize)]
 struct Credentials {
     access_token: Option<String>,
-    refresh_token: Option<String>,
-    expires_at: Option<f64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RefreshResponse {
-    access_token: Option<String>,
-    refresh_token: Option<String>,
-    expires_in: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,70 +86,19 @@ fn credentials_paths() -> Vec<std::path::PathBuf> {
     paths
 }
 
-fn read_credentials() -> Result<(Credentials, std::path::PathBuf)> {
+fn read_credentials() -> Result<Credentials> {
     for path in credentials_paths() {
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
-            return Ok((serde_json::from_str(&content)?, path));
+            return Ok(serde_json::from_str(&content)?);
         }
     }
     anyhow::bail!("No Kimi credentials found. Run 'kimi' to log in.")
 }
 
-fn save_credentials(
-    path: &std::path::Path,
-    access_token: &str,
-    refresh_token: &str,
-    expires_in: i64,
-) {
-    let expires_at = chrono::Utc::now().timestamp() as f64 + expires_in as f64;
-    let json = serde_json::json!({
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "expires_at": expires_at,
-        "scope": "kimi-code",
-        "token_type": "Bearer"
-    });
-    let content = match serde_json::to_string_pretty(&json) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("warning: failed to serialize Kimi credentials: {e}");
-            return;
-        }
-    };
-    if let Err(e) = super::helpers::atomic_write_secret(path, content.as_bytes()) {
-        eprintln!("warning: failed to save Kimi credentials: {e}");
-    }
-}
-
-fn needs_refresh(expires_at: Option<f64>) -> bool {
-    if let Some(expires_at) = expires_at {
-        let now = chrono::Utc::now().timestamp() as f64;
-        now + 300.0 > expires_at // 5 min buffer
-    } else {
-        false
-    }
-}
-
-async fn refresh_token(client: &reqwest::Client, rt: &str) -> Result<RefreshResponse> {
+async fn fetch_usage(client: &reqwest::Client, url: &str, token: &str) -> Result<UsageResponse> {
     let resp = client
-        .post("https://auth.kimi.com/api/oauth/token")
-        .form(&[
-            ("client_id", CLIENT_ID),
-            ("grant_type", "refresh_token"),
-            ("refresh_token", rt),
-        ])
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("Kimi token refresh failed (HTTP {})", resp.status());
-    }
-    Ok(resp.json().await?)
-}
-
-async fn fetch_usage(client: &reqwest::Client, token: &str) -> Result<UsageResponse> {
-    let resp = client
-        .get("https://api.kimi.com/coding/v1/usages")
+        .get(url)
         .header("Authorization", format!("Bearer {token}"))
         .header("Accept", "application/json")
         .header("User-Agent", "OpenUsage")
@@ -160,7 +106,10 @@ async fn fetch_usage(client: &reqwest::Client, token: &str) -> Result<UsageRespo
         .await?;
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        anyhow::bail!("NEEDS_AUTH");
+        anyhow::bail!(
+            "Kimi rejected the stored login (HTTP {}). Run 'kimi' once so it can refresh its own login, then retry.",
+            status.as_u16()
+        );
     }
     if !status.is_success() {
         anyhow::bail!("Kimi usage request failed (HTTP {status})");
@@ -190,57 +139,19 @@ pub fn has_credentials() -> bool {
 }
 
 pub fn fetch() -> Result<UsageOutput> {
-    let (creds, creds_path) = read_credentials()?;
-    let mut access_token = creds
+    let access_token = read_credentials()?
         .access_token
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("No Kimi access token."))?;
-    let mut stored_refresh_token = creds.refresh_token.clone();
-    let expires_at = creds.expires_at;
+        .ok_or_else(|| anyhow::anyhow!("No Kimi access token. Run 'kimi' to log in."))?;
+    fetch_with(USAGE_URL, &access_token)
+}
 
+fn fetch_with(url: &str, access_token: &str) -> Result<UsageOutput> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     rt.block_on(async {
         let client = super::helpers::http_client()?;
-
-        // Proactive refresh if token is about to expire
-        if needs_refresh(expires_at) {
-            if let Some(ref rt_str) = stored_refresh_token {
-                if let Ok(refreshed) = refresh_token(&client, rt_str).await {
-                    if let Some(new_token) = refreshed.access_token.clone() {
-                        access_token = new_token;
-                        if let (Some(new_rt), Some(expires_in)) =
-                            (&refreshed.refresh_token, refreshed.expires_in)
-                        {
-                            stored_refresh_token = Some(new_rt.clone());
-                            save_credentials(&creds_path, &access_token, new_rt, expires_in);
-                        }
-                    }
-                }
-            }
-        }
-
-        let resp = match fetch_usage(&client, &access_token).await {
-            Ok(r) => r,
-            Err(e) if e.to_string().contains("NEEDS_AUTH") => {
-                let rt_str = stored_refresh_token
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("No refresh token."))?;
-                let refreshed = refresh_token(&client, rt_str).await?;
-                let new = refreshed
-                    .access_token
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("Refresh returned no token."))?;
-                if let (Some(new_rt), Some(expires_in)) =
-                    (&refreshed.refresh_token, refreshed.expires_in)
-                {
-                    save_credentials(&creds_path, &new, new_rt, expires_in);
-                }
-                fetch_usage(&client, &new).await?
-            }
-            Err(e) => return Err(e),
-        };
+        let resp = fetch_usage(&client, url, access_token).await?;
 
         let plan = resp
             .user
@@ -311,6 +222,49 @@ pub fn fetch() -> Result<UsageOutput> {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    const USAGE_BODY: &str =
+        r#"{"usage":{"limit":"100","remaining":"40","resetTime":"2026-08-10T00:00:00Z"}}"#;
+
+    /// The Kimi CLI's document, expired, with a refresh token tokscale must
+    /// not spend.
+    const EXPIRED_LOGIN: &str = r#"{"access_token":"expired-access","refresh_token":"kimi-cli-owned","expires_at":1.0,"scope":"kimi-code","token_type":"Bearer","extra":{"keep":true}}"#;
+
+    #[test]
+    fn credentials_do_not_carry_a_refresh_token() {
+        let parsed: Credentials = serde_json::from_str(EXPIRED_LOGIN).unwrap();
+        assert_eq!(parsed.access_token.as_deref(), Some("expired-access"));
+        assert!(!format!("{parsed:?}").contains("kimi-cli-owned"));
+    }
+
+    #[test]
+    fn expired_login_is_read_once_and_never_refreshed() {
+        use crate::commands::usage::test_server::{spawn_server, Seen};
+        // Expired by its own clock but still accepted: one GET, no refresh.
+        let (url, log) = spawn_server(|_, _| (200, USAGE_BODY.into()));
+        let output = fetch_with(&url, "expired-access").unwrap();
+        assert_eq!(output.metrics[0].used_percent, 60.0);
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![Seen {
+                request: "GET /".into(),
+                bearer: Some("expired-access".into()),
+            }]
+        );
+        // Rejected: still one request, and the message names the CLI that
+        // owns the login rather than an internal sentinel.
+        for status in [401, 403] {
+            let (url, log) = spawn_server(move |_, _| (status, "{}".into()));
+            let error = fetch_with(&url, "expired-access").unwrap_err().to_string();
+            assert!(error.contains("Run 'kimi' once"), "{error}");
+            assert!(!error.contains("NEEDS_AUTH"), "{error}");
+            assert_eq!(log.lock().unwrap().len(), 1);
+        }
+        // A rate limit is not an authentication problem.
+        let (url, _) = spawn_server(|_, _| (429, "{}".into()));
+        let error = fetch_with(&url, "expired-access").unwrap_err().to_string();
+        assert!(!error.contains("Run 'kimi'"), "{error}");
+    }
 
     /// Restores KIMI_CODE_HOME even if the test unwinds, so one failure cannot
     /// leak an override into the rest of the suite.
