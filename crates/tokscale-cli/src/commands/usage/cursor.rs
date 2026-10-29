@@ -5,8 +5,14 @@
 //! saved Tokscale Cursor session cookie. The IDE plan window is
 //! `GetCurrentPeriodUsage` on `api2.cursor.sh`. Grok Bot weekly usage is a
 //! separate Cursor-metered pool from `GetSandUsageStatus` (not the SuperGrok
-//! `cli-chat-proxy` credits used by the Grok card). Refreshed
-//! access tokens stay in memory and are never written back.
+//! `cli-chat-proxy` credits used by the Grok card).
+//!
+//! On macOS, Grok Bot.app may store multiple Cursor accounts under
+//! `~/Library/Application Support/Grok Bot/sand-secrets.json` (`cursor-accounts`),
+//! encrypted with Electron safeStorage. Those tokens are decrypted via the
+//! Keychain item `Grok Bot Safe Storage` / `Grok Bot Key` so each signed-in
+//! account can get its own Grok Bot card. Refreshed access tokens stay in
+//! memory and are never written back.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -16,7 +22,7 @@ use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::{UsageMetric, UsageOutput};
+use super::{UsageAccount, UsageFetchDiagnostic, UsageFetchReport, UsageMetric, UsageOutput};
 
 const USAGE_URL: &str = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage";
 const PLAN_URL: &str = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo";
@@ -32,6 +38,11 @@ const ACCESS_SERVICE: &str = "cursor-access-token";
 const REFRESH_SERVICE: &str = "cursor-refresh-token";
 const PROVIDER: &str = "Cursor";
 const GROK_BOT_PROVIDER: &str = "Grok Bot";
+/// Chromium / Electron safeStorage KDF salt and iteration count.
+#[cfg(any(target_os = "macos", test))]
+const SAFE_STORAGE_SALT: &[u8] = b"saltysalt";
+#[cfg(any(target_os = "macos", test))]
+const SAFE_STORAGE_ITERATIONS: u32 = 1003;
 
 #[derive(Debug, Clone, PartialEq)]
 struct ParsedPlanWindow {
@@ -63,6 +74,7 @@ struct LocalCursorAuth {
     access_token: String,
     refresh_token: Option<String>,
     email: Option<String>,
+    credential_source: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -79,9 +91,9 @@ pub fn has_credentials() -> bool {
     resolve_local_auth().is_ok()
 }
 
-/// Grok Bot is metered on the Cursor account, so the same desktop auth works.
+/// Grok Bot.app multi-account store, or Cursor desktop auth as a fallback.
 pub fn has_grok_bot_credentials() -> bool {
-    has_credentials()
+    grok_bot_secrets_path().is_some_and(|path| path.is_file()) || has_credentials()
 }
 
 pub fn fetch() -> Result<UsageOutput> {
@@ -134,7 +146,7 @@ pub fn fetch() -> Result<UsageOutput> {
             freshness: None,
             provider: PROVIDER.to_string(),
             account: None,
-            credential_source: Some("desktop".into()),
+            credential_source: Some(auth.credential_source.into()),
             plan: plan_name,
             email: auth.email,
             metrics,
@@ -145,9 +157,106 @@ pub fn fetch() -> Result<UsageOutput> {
     })
 }
 
-/// Grok Bot weekly included usage for legacy accounts whose Sand pool remains
-/// distinct. Unified or weekly Cursor plans render that pool on the Cursor card.
-pub fn fetch_grok_bot() -> Result<Vec<UsageOutput>> {
+/// One Grok Bot card per signed-in Cursor account in Grok Bot.app when that
+/// store decrypts; otherwise a single card from Cursor desktop auth. A pool
+/// the Cursor card already shows is omitted, so one pool renders one card.
+pub fn fetch_grok_bot_report() -> Result<UsageFetchReport> {
+    match load_grok_bot_app_accounts() {
+        Ok(accounts) if !accounts.is_empty() => {
+            // The Cursor card renders the pool of the locally signed-in account.
+            let cursor_access = resolve_local_auth().ok().map(|auth| auth.access_token);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(async {
+                let client = plan_http_client()?;
+                let mut results = Vec::new();
+                for account in accounts {
+                    let mut result = fetch_sand_for_token(&client, &account.access_token).await;
+                    if let (Ok(Some(parsed)), Some(cursor)) = (&result, cursor_access.as_deref()) {
+                        let plan = if parsed.is_unified
+                            || !same_cursor_principal(cursor, &account.access_token)
+                        {
+                            None
+                        } else {
+                            connect_post(&client, PLAN_URL, &account.access_token, "GetPlanInfo")
+                                .await
+                                .ok()
+                        };
+                        if pool_on_cursor_card(
+                            Some(cursor),
+                            &account.access_token,
+                            &parse_plan_info(plan.as_ref()),
+                            parsed,
+                        ) {
+                            result = Ok(None);
+                        }
+                    }
+                    results.push((account, result));
+                }
+                Ok(grok_bot_account_report(results))
+            })
+        }
+        Ok(_) | Err(_) => fetch_grok_bot_desktop()
+            .map(|output| UsageFetchReport::from_outputs(output.into_iter().collect())),
+    }
+}
+
+fn grok_bot_account_report(
+    results: impl IntoIterator<Item = (GrokBotAppAccount, Result<Option<ParsedSandUsage>>)>,
+) -> UsageFetchReport {
+    let mut report = UsageFetchReport::default();
+    for (account, result) in results {
+        let identity = UsageAccount {
+            id: account.id,
+            label: account.name.or_else(|| account.email.clone()),
+            is_active: account.is_active,
+        };
+        match result {
+            // No personal allowance is a successful empty result, not a failure.
+            Ok(None) => {}
+            Ok(Some(parsed)) => report.outputs.push(UsageOutput {
+                freshness: None,
+                provider: GROK_BOT_PROVIDER.to_string(),
+                account: Some(identity),
+                credential_source: Some("grok-bot-app".into()),
+                plan: parsed.plan,
+                email: account.email,
+                metrics: vec![parsed.metric],
+                reset_credits: None,
+                credit_status: None,
+                spend_control: None,
+            }),
+            Err(error) => report.diagnostics.push(UsageFetchDiagnostic::new(
+                GROK_BOT_PROVIDER,
+                Some(identity),
+                error.to_string(),
+            )),
+        }
+    }
+    report.outputs.sort_by_key(|output| {
+        !output
+            .account
+            .as_ref()
+            .is_some_and(|account| account.is_active)
+    });
+    report
+}
+
+/// True when the Cursor card already renders this account's Grok Bot pool:
+/// the account is the Cursor card's own (proved by token or JWT subject) and
+/// the pool replaces its Auto/API tracks. An unprovable account keeps its card.
+fn pool_on_cursor_card(
+    cursor_access: Option<&str>,
+    account_access: &str,
+    plan: &ParsedPlanInfo,
+    sand: &ParsedSandUsage,
+) -> bool {
+    cursor_access.is_some_and(|cursor| same_cursor_principal(cursor, account_access))
+        && sand_replaces_cursor_tracks(plan, sand)
+}
+
+fn fetch_grok_bot_desktop() -> Result<Option<UsageOutput>> {
     let auth = resolve_local_auth()?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -168,24 +277,189 @@ pub fn fetch_grok_bot() -> Result<Vec<UsageOutput>> {
         )
         .await?;
         let Some(parsed) = parse_sand_usage(&sand)? else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
-        if sand_replaces_cursor_tracks(&parse_plan_info(plan.as_ref()), &parsed) {
-            return Ok(Vec::new());
+        // Desktop auth is the Cursor card's own account.
+        if pool_on_cursor_card(
+            Some(&access),
+            &access,
+            &parse_plan_info(plan.as_ref()),
+            &parsed,
+        ) {
+            return Ok(None);
         }
-        Ok(vec![UsageOutput {
+        Ok(Some(UsageOutput {
             freshness: None,
             provider: GROK_BOT_PROVIDER.to_string(),
             account: None,
-            credential_source: Some("desktop".into()),
+            credential_source: Some(auth.credential_source.into()),
             plan: parsed.plan,
             email: auth.email,
             metrics: vec![parsed.metric],
             reset_credits: None,
             credit_status: None,
             spend_control: None,
-        }])
+        }))
     })
+}
+
+async fn fetch_sand_for_token(
+    client: &reqwest::Client,
+    access: &str,
+) -> Result<Option<ParsedSandUsage>> {
+    let sand = connect_post(client, SAND_USAGE_URL, access, "GetSandUsageStatus").await?;
+    parse_sand_usage(&sand)
+}
+
+#[derive(Debug, Clone)]
+struct GrokBotAppAccount {
+    id: String,
+    access_token: String,
+    email: Option<String>,
+    name: Option<String>,
+    is_active: bool,
+}
+
+fn grok_bot_secrets_path() -> Option<std::path::PathBuf> {
+    crate::paths::home_dir()
+        .map(|home| home.join("Library/Application Support/Grok Bot/sand-secrets.json"))
+}
+
+/// Decrypt every Cursor account stored by Grok Bot.app (macOS Electron
+/// safeStorage). Non-macOS builds return an empty list so the desktop fallback
+/// stays in charge.
+fn load_grok_bot_app_accounts() -> Result<Vec<GrokBotAppAccount>> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(Vec::new())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let path = grok_bot_secrets_path()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let secrets: Value =
+            serde_json::from_str(&raw).context("Grok Bot sand-secrets.json was not JSON")?;
+        let accounts_blob = secrets
+            .get("cursor-accounts")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Grok Bot sand-secrets.json had no cursor-accounts"))?;
+        let doc: Value =
+            serde_json::from_str(accounts_blob).context("Grok Bot cursor-accounts was not JSON")?;
+        let active = doc
+            .get("active")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let accounts = doc
+            .get("accounts")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("Grok Bot cursor-accounts had no accounts object"))?;
+        let password = read_grok_bot_safe_storage_key()?;
+        let mut out = Vec::new();
+        for (id, entry) in accounts {
+            let Some(entry) = entry.as_object() else {
+                continue;
+            };
+            let Some(cipher) = entry
+                .get("cursor-access-token")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+            else {
+                continue;
+            };
+            let access_token = match decrypt_electron_safe_storage(cipher, password.as_bytes()) {
+                Ok(token) if access_token_usable(&token) => token,
+                _ => continue,
+            };
+            let profile = entry
+                .get("cursor-account-profile")
+                .and_then(Value::as_str)
+                .and_then(|cipher| decrypt_electron_safe_storage(cipher, password.as_bytes()).ok())
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+            let email = profile
+                .as_ref()
+                .and_then(|value| value.get("email"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|email| !email.is_empty())
+                .map(str::to_string);
+            let name = profile
+                .as_ref()
+                .and_then(|value| value.get("name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string);
+            out.push(GrokBotAppAccount {
+                id: id.clone(),
+                access_token,
+                email,
+                name,
+                is_active: id == &active,
+            });
+        }
+        if out.is_empty() {
+            anyhow::bail!("Grok Bot sand-secrets.json had no decryptable access tokens");
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_grok_bot_safe_storage_key() -> Result<String> {
+    let out = std::process::Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            "Grok Bot Safe Storage",
+            "-a",
+            "Grok Bot Key",
+            "-w",
+        ])
+        .output()
+        .context("Failed to invoke macOS security for Grok Bot Safe Storage")?;
+    if !out.status.success() {
+        anyhow::bail!("Grok Bot Safe Storage Keychain item was not readable");
+    }
+    Ok(String::from_utf8(out.stdout)
+        .context("Grok Bot Safe Storage key was not UTF-8")?
+        .trim_end()
+        .to_string())
+}
+
+/// Decrypt a Chromium / Electron `v10` safeStorage blob (base64).
+#[cfg(any(target_os = "macos", test))]
+fn decrypt_electron_safe_storage(cipher_b64: &str, password: &[u8]) -> Result<String> {
+    use aes::Aes128;
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+    use pbkdf2::pbkdf2_hmac;
+    use sha1::Sha1;
+
+    let raw = B64
+        .decode(cipher_b64.trim())
+        .context("Grok Bot safeStorage blob was not base64")?;
+    let payload = raw
+        .strip_prefix(b"v10")
+        .ok_or_else(|| anyhow::anyhow!("Grok Bot safeStorage blob was not a v10 envelope"))?;
+    let mut key = [0u8; 16];
+    pbkdf2_hmac::<Sha1>(
+        password,
+        SAFE_STORAGE_SALT,
+        SAFE_STORAGE_ITERATIONS,
+        &mut key,
+    );
+    let iv = [b' '; 16];
+    type Aes128CbcDec = cbc::Decryptor<Aes128>;
+    let mut buffer = payload.to_vec();
+    let plaintext = Aes128CbcDec::new(&key.into(), &iv.into())
+        .decrypt_padded_mut::<Pkcs7>(&mut buffer)
+        .map_err(|_| anyhow::anyhow!("Grok Bot safeStorage decrypt failed"))?;
+    String::from_utf8(plaintext.to_vec()).context("Grok Bot safeStorage plaintext was not UTF-8")
 }
 
 #[derive(Debug, Clone)]
@@ -460,99 +734,123 @@ fn resolve_local_auth() -> Result<LocalCursorAuth> {
         (None, None, None)
     };
 
-    let db_access = db_access.unwrap_or_default();
-    let db_email = account_label(db_email.as_deref());
-    #[cfg(target_os = "macos")]
-    let keychain = {
-        let access_token = super::helpers::read_keychain(ACCESS_SERVICE).unwrap_or_default();
-        let email = (!db_access.is_empty()
-            && !access_token.is_empty()
-            && same_cursor_principal(&db_access, &access_token))
-        .then(|| db_email.clone())
-        .flatten();
-        LocalCursorAuth {
-            access_token,
-            refresh_token: super::helpers::read_keychain(REFRESH_SERVICE)
-                .ok()
-                .and_then(|token| nonempty(Some(&token))),
-            email,
-        }
-    };
-    #[cfg(not(target_os = "macos"))]
-    let keychain = LocalCursorAuth::default();
+    select_local_auth(
+        db_access.as_deref(),
+        db_refresh.as_deref(),
+        db_email.as_deref(),
+        || {
+            #[cfg(target_os = "macos")]
+            {
+                (
+                    super::helpers::read_keychain(ACCESS_SERVICE).ok(),
+                    super::helpers::read_keychain(REFRESH_SERVICE).ok(),
+                )
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                (None, None)
+            }
+        },
+        crate::cursor::load_active_credentials,
+        Utc::now().timestamp(),
+    )
+}
 
-    let db = LocalCursorAuth {
-        access_token: db_access.clone(),
-        refresh_token: nonempty(db_refresh.as_deref()),
-        email: db_email.clone(),
+/// True when `record` (an access JWT or a refresh JWT) proves the same Cursor
+/// principal as `access_token`.
+fn record_matches_access(access_token: &str, record: &[Option<String>]) -> bool {
+    record
+        .iter()
+        .flatten()
+        .any(|candidate| same_cursor_principal(access_token, candidate))
+}
+
+/// Prefer the desktop JWT, then Keychain, then a saved session. Each source
+/// keeps its own identity; a token that is expired without a refresh grant
+/// falls through to the next source. Cursor can split one account's access and
+/// refresh JWTs between state.vscdb and Keychain, so a missing refresh token
+/// is transferred only when a JWT subject proves both records belong to the
+/// same account. The desktop email labels a fallback token under the same
+/// rule. Keychain is read only when the desktop record cannot stand alone.
+fn select_local_auth(
+    db_access: Option<&str>,
+    db_refresh: Option<&str>,
+    db_email: Option<&str>,
+    keychain: impl FnOnce() -> (Option<String>, Option<String>),
+    stored: impl FnOnce() -> Option<crate::cursor::CursorCredentials>,
+    now_unix: i64,
+) -> Result<LocalCursorAuth> {
+    let db_access = db_access
+        .map(str::trim)
+        .filter(|token| access_token_usable(token));
+    let mut db_refresh = nonempty(db_refresh);
+    // The desktop email names another source's token only when a JWT subject
+    // proves both belong to the same account.
+    let desktop_email_for = |access: &str| {
+        db_access
+            .is_some_and(|desktop| same_cursor_principal(desktop, access))
+            .then(|| account_label(db_email))
+            .flatten()
     };
-    let now_unix = Utc::now().timestamp();
-    if let Some(auth) = select_local_auth(db.clone(), keychain.clone(), None, now_unix) {
-        return Ok(auth);
+    let desktop = |access: &str, refresh_token: Option<String>| LocalCursorAuth {
+        access_token: access.to_string(),
+        refresh_token,
+        email: account_label(db_email),
+        credential_source: "desktop",
+    };
+    if let (Some(access), Some(_)) = (db_access, db_refresh.as_ref()) {
+        return Ok(desktop(access, db_refresh));
     }
-    let session = crate::cursor::load_active_credentials().and_then(|creds| {
-        jwt_from_session_token(&creds.session_token).map(|access| {
-            let email = (!db_access.is_empty() && same_cursor_principal(&db_access, &access))
-                .then(|| db_email.clone())
-                .flatten();
-            LocalCursorAuth {
+
+    let (keychain_access, keychain_refresh) = keychain();
+    let keychain_access = nonempty(keychain_access.as_deref());
+    let mut keychain_refresh = nonempty(keychain_refresh.as_deref());
+    if let Some(access) = db_access {
+        if record_matches_access(access, &[keychain_access.clone(), keychain_refresh.clone()]) {
+            db_refresh = keychain_refresh.clone();
+        }
+        if !needs_refresh(access, now_unix) || db_refresh.is_some() {
+            return Ok(desktop(access, db_refresh));
+        }
+    }
+
+    if let Some(access) = keychain_access
+        .as_deref()
+        .filter(|token| access_token_usable(token))
+    {
+        if keychain_refresh.is_none()
+            && record_matches_access(access, &[db_access.map(str::to_string), db_refresh.clone()])
+        {
+            keychain_refresh = db_refresh.clone();
+        }
+        if !needs_refresh(access, now_unix) || keychain_refresh.is_some() {
+            return Ok(LocalCursorAuth {
+                access_token: access.to_string(),
+                email: desktop_email_for(access),
+                refresh_token: keychain_refresh,
+                credential_source: "keychain",
+            });
+        }
+    }
+
+    if let Some(creds) = stored() {
+        if let Some(access) = jwt_from_session_token(&creds.session_token)
+            .filter(|access| !needs_refresh(access, now_unix))
+        {
+            let email =
+                account_label(creds.email.as_deref()).or_else(|| desktop_email_for(&access));
+            return Ok(LocalCursorAuth {
                 access_token: access,
                 refresh_token: None,
                 email,
-            }
-        })
-    });
-    if let Some(auth) = select_local_auth(db, keychain, session, now_unix) {
-        return Ok(auth);
+                credential_source: "stored",
+            });
+        }
     }
 
     anyhow::bail!(
         "Cursor plan credentials not found. Sign in to the Cursor desktop app, or run 'tokscale cursor login'."
     )
-}
-
-fn auth_record_matches_access(access_token: &str, other: &LocalCursorAuth) -> bool {
-    let access_token = access_token.trim();
-    if access_token.is_empty() {
-        return false;
-    }
-    nonempty(Some(&other.access_token))
-        .into_iter()
-        .chain(other.refresh_token.clone())
-        .any(|candidate| same_cursor_principal(access_token, &candidate))
-}
-
-fn select_local_auth(
-    mut db: LocalCursorAuth,
-    mut keychain: LocalCursorAuth,
-    session: Option<LocalCursorAuth>,
-    now_unix: i64,
-) -> Option<LocalCursorAuth> {
-    // Cursor can split one account's access and refresh JWTs between
-    // state.vscdb and Keychain. Transfer a missing refresh token only when an
-    // access/refresh subject proves both records belong to the same account.
-    // An unprovable or different principal must stay isolated.
-    if db.refresh_token.is_none() && auth_record_matches_access(&db.access_token, &keychain) {
-        db.refresh_token = keychain.refresh_token.clone();
-    }
-    if keychain.refresh_token.is_none() && auth_record_matches_access(&keychain.access_token, &db) {
-        keychain.refresh_token = db.refresh_token.clone();
-    }
-    if !db.access_token.trim().is_empty()
-        && !keychain.access_token.trim().is_empty()
-        && !same_cursor_principal(db.access_token.trim(), keychain.access_token.trim())
-    {
-        keychain.email = None;
-    }
-    [Some(db), Some(keychain), session]
-        .into_iter()
-        .flatten()
-        .find_map(|mut auth| {
-            auth.access_token = auth.access_token.trim().to_string();
-            (access_token_usable(&auth.access_token)
-                && (!needs_refresh(&auth.access_token, now_unix) || auth.refresh_token.is_some()))
-            .then_some(auth)
-        })
 }
 
 fn nonempty(value: Option<&str>) -> Option<String> {
@@ -923,6 +1221,323 @@ mod tests {
     use crate::commands::usage::test_server::spawn_server;
     use serde_json::json;
 
+    fn future_jwt(subject: &str) -> String {
+        auth_with_subject(Some(5_000_000_000), subject, None, None).access_token
+    }
+
+    fn bot_account(id: &str, active: bool) -> GrokBotAppAccount {
+        GrokBotAppAccount {
+            id: id.into(),
+            access_token: "fixture-token".into(),
+            email: Some(format!("{id}@test.invalid")),
+            name: Some(id.into()),
+            is_active: active,
+        }
+    }
+
+    fn sand_fixture() -> Result<Option<ParsedSandUsage>> {
+        parse_sand_usage(&json!({"hasNonZeroIncludedLimit": true, "usagePercent": 25}))
+    }
+
+    #[test]
+    fn grok_bot_pool_is_omitted_only_when_the_cursor_card_shows_it() {
+        let account = future_jwt("auth0|account-a");
+        let same_subject = future_jwt("auth0|account-a").replace("signature", "other-signature");
+        let other_subject = future_jwt("auth0|account-b");
+        let sand = |unified: bool| {
+            parse_sand_usage(&json!({
+                "hasNonZeroIncludedLimit": true,
+                "usagePercent": 25,
+                "isUnified": unified
+            }))
+            .unwrap()
+            .unwrap()
+        };
+        let plan = |period: Option<&str>| {
+            parse_plan_info(
+                period
+                    .map(|period| json!({"planInfo": {"includedUsagePeriod": period}}))
+                    .as_ref(),
+            )
+        };
+        // (Cursor card token, unified, plan period, omitted)
+        let cases = [
+            (Some(account.as_str()), true, None, true),
+            (Some(same_subject.as_str()), true, None, true),
+            (
+                Some(same_subject.as_str()),
+                false,
+                Some("INCLUDED_USAGE_PERIOD_WEEKLY"),
+                true,
+            ),
+            (
+                Some(same_subject.as_str()),
+                false,
+                Some("INCLUDED_USAGE_PERIOD_MONTHLY"),
+                false,
+            ),
+            (Some(same_subject.as_str()), false, None, false),
+            (Some(other_subject.as_str()), true, None, false),
+            (
+                Some(other_subject.as_str()),
+                false,
+                Some("INCLUDED_USAGE_PERIOD_WEEKLY"),
+                false,
+            ),
+            (Some("opaque-cursor-token"), true, None, false),
+            (None, true, Some("INCLUDED_USAGE_PERIOD_WEEKLY"), false),
+        ];
+        for (cursor, unified, period, omitted) in cases {
+            assert_eq!(
+                pool_on_cursor_card(cursor, &account, &plan(period), &sand(unified)),
+                omitted,
+                "cursor={cursor:?} unified={unified} period={period:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn grok_bot_account_without_personal_quota_is_hidden_not_reported() {
+        let no_personal = [
+            json!({"usesPooledEnterpriseAllowance": true, "usagePercent": 10.0}),
+            json!({"hasNonZeroIncludedLimit": false, "usagePercent": 10.0}),
+            json!({"includedLimitZero": true, "usagePercent": 0.0}),
+        ];
+        for response in no_personal {
+            let report = grok_bot_account_report([
+                (bot_account("pooled", false), parse_sand_usage(&response)),
+                (bot_account("personal", true), sand_fixture()),
+            ]);
+            assert_eq!(report.outputs.len(), 1, "{response}");
+            assert_eq!(report.outputs[0].account.as_ref().unwrap().id, "personal");
+            assert!(report.diagnostics.is_empty(), "{response}");
+        }
+
+        // Negative control: an allowance that promises a share but omits its
+        // percentage is a failure, and it stays visible as a diagnostic.
+        let report = grok_bot_account_report([(
+            bot_account("broken", false),
+            parse_sand_usage(&json!({"hasNonZeroIncludedLimit": true})),
+        )]);
+        assert!(report.outputs.is_empty());
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].account.as_ref().unwrap().id, "broken");
+    }
+
+    #[test]
+    fn grok_bot_partial_failure_preserves_account_diagnostic_and_active_order() {
+        let report = grok_bot_account_report([
+            (bot_account("other", false), sand_fixture()),
+            (
+                bot_account("expired", false),
+                Err(anyhow::anyhow!("HTTP 401")),
+            ),
+            (bot_account("active", true), sand_fixture()),
+        ]);
+        assert_eq!(report.outputs.len(), 2);
+        assert_eq!(report.outputs[0].account.as_ref().unwrap().id, "active");
+        assert_eq!(report.diagnostics.len(), 1);
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(diagnostic.provider, "Grok Bot");
+        assert_eq!(diagnostic.account.as_ref().unwrap().id, "expired");
+        assert_eq!(diagnostic.message, "HTTP 401");
+    }
+
+    #[test]
+    fn grok_bot_all_failed_keeps_each_account() {
+        let report = grok_bot_account_report(
+            ["one", "two"].map(|id| (bot_account(id, false), Err(anyhow::anyhow!("HTTP 401")))),
+        );
+        assert!(report.outputs.is_empty());
+        assert_eq!(report.diagnostics.len(), 2);
+        assert_eq!(report.diagnostics[1].account.as_ref().unwrap().id, "two");
+    }
+
+    #[test]
+    fn grok_bot_success_has_no_diagnostics() {
+        let report = grok_bot_account_report([(bot_account("one", true), sand_fixture())]);
+        assert_eq!(report.outputs.len(), 1);
+        assert!(report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn stored_auth_keeps_its_identity_when_desktop_has_another_account() {
+        let stored = serde_json::from_value(json!({
+            "sessionToken": format!("user-b::{}", future_jwt("auth0|account-b")),
+            "createdAt": "2026-10-17T00:00:00Z",
+            "email": "b@example.com"
+        }))
+        .unwrap();
+        let auth = select_local_auth(
+            Some("invalid-desktop-token"),
+            Some("desktop-a-refresh"),
+            Some("a@example.com"),
+            || (None, None),
+            || Some(stored),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(auth.access_token, future_jwt("auth0|account-b"));
+        assert_eq!(auth.email.as_deref(), Some("b@example.com"));
+        assert_eq!(auth.credential_source, "stored");
+        assert!(auth.refresh_token.is_none());
+    }
+
+    #[test]
+    fn stored_auth_without_email_does_not_borrow_desktop_identity() {
+        let stored = serde_json::from_value(json!({
+            "sessionToken": format!("user-b::{}", future_jwt("auth0|account-b")),
+            "createdAt": "2026-10-17T00:00:00Z"
+        }))
+        .unwrap();
+        let auth = select_local_auth(
+            None,
+            None,
+            Some("a@example.com"),
+            || (None, None),
+            || Some(stored),
+            1000,
+        )
+        .unwrap();
+        assert!(auth.email.is_none());
+        assert_eq!(auth.credential_source, "stored");
+    }
+
+    /// The desktop email follows the JWT subject, never the source order.
+    #[test]
+    fn fallback_sources_borrow_desktop_email_only_for_the_same_subject() {
+        // An expired desktop JWT without a refresh token forces the fallback.
+        let desktop = auth_with_subject(Some(900), "auth0|account-a", None, None).access_token;
+        let same = future_jwt("auth0|account-a");
+        let other = future_jwt("auth0|account-b");
+        // (desktop access, fallback access, expected email)
+        let cases = [
+            (Some(desktop.as_str()), same.as_str(), Some("a@example.com")),
+            (Some(desktop.as_str()), other.as_str(), None),
+            (Some("opaque-desktop-token"), same.as_str(), None),
+            (None, same.as_str(), None),
+        ];
+        for (db_access, access, email) in cases {
+            let keychain = select_local_auth(
+                db_access,
+                None,
+                Some("a@example.com"),
+                || (Some(access.to_string()), None),
+                || panic!("a fresh Keychain token should not read stored credentials"),
+                1000,
+            )
+            .unwrap();
+            assert_eq!(keychain.credential_source, "keychain");
+            assert_eq!(keychain.email.as_deref(), email, "keychain {db_access:?}");
+
+            let stored = select_local_auth(
+                db_access,
+                None,
+                Some("a@example.com"),
+                || (None, None),
+                || {
+                    Some(
+                        serde_json::from_value(json!({
+                            "sessionToken": format!("user::{access}"),
+                            "createdAt": "2026-10-17T00:00:00Z"
+                        }))
+                        .unwrap(),
+                    )
+                },
+                1000,
+            )
+            .unwrap();
+            assert_eq!(stored.credential_source, "stored");
+            assert_eq!(stored.email.as_deref(), email, "stored {db_access:?}");
+        }
+    }
+
+    #[test]
+    fn stored_email_wins_over_a_matching_desktop_email() {
+        let stored = serde_json::from_value(json!({
+            "sessionToken": format!("user::{}", future_jwt("auth0|account-a")),
+            "createdAt": "2026-10-17T00:00:00Z",
+            "email": "saved@example.com"
+        }))
+        .unwrap();
+        let auth = select_local_auth(
+            Some(&auth_with_subject(Some(900), "auth0|account-a", None, None).access_token),
+            None,
+            Some("desktop@example.com"),
+            || (None, None),
+            || Some(stored),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(auth.email.as_deref(), Some("saved@example.com"));
+    }
+
+    /// `needs_refresh` treats a token within 60s of expiry as expired, so a
+    /// Keychain token without a refresh grant is usable only past that edge.
+    #[test]
+    fn keychain_expiry_boundary_without_refresh() {
+        for (exp, selected) in [(1060, false), (1061, true)] {
+            let access = auth_with_subject(Some(exp), "auth0|account-a", None, None).access_token;
+            let result = select_local_auth(
+                None,
+                None,
+                None,
+                || (Some(access.clone()), None),
+                || None,
+                1000,
+            );
+            assert_eq!(result.is_ok(), selected, "exp {exp}");
+        }
+    }
+
+    #[test]
+    fn desktop_auth_keeps_matching_identity_and_skips_fallbacks() {
+        let auth = select_local_auth(
+            Some(" desktop.payload.signature "),
+            Some(" desktop-refresh "),
+            Some(" a@example.com "),
+            || panic!("desktop auth should not read Keychain"),
+            || panic!("desktop auth should not read stored credentials"),
+            1000,
+        )
+        .unwrap();
+        assert_eq!(auth.access_token, "desktop.payload.signature");
+        assert_eq!(auth.email.as_deref(), Some("a@example.com"));
+        assert_eq!(auth.refresh_token.as_deref(), Some("desktop-refresh"));
+        assert_eq!(auth.credential_source, "desktop");
+    }
+
+    #[test]
+    fn keychain_auth_does_not_borrow_desktop_email_or_refresh_token() {
+        for refresh in [None, Some(" keychain-refresh ".to_string())] {
+            let auth = select_local_auth(
+                None,
+                Some("desktop-a-refresh"),
+                Some("a@example.com"),
+                || (Some(future_jwt("auth0|keychain")), refresh.clone()),
+                || panic!("Keychain auth should not read stored credentials"),
+                1000,
+            )
+            .unwrap();
+            assert_eq!(auth.access_token, future_jwt("auth0|keychain"));
+            assert!(auth.email.is_none());
+            assert_eq!(auth.refresh_token, nonempty(refresh.as_deref()));
+            assert_eq!(auth.credential_source, "keychain");
+        }
+    }
+
+    #[test]
+    fn test_plan_http_client_applies_thirty_second_timeout() {
+        let client = plan_http_client().expect("plan client builds");
+        // reqwest has no public timeout getter. Its Debug output exposes the
+        // built client's total timeout, verifying the shared 15s was overridden.
+        let rendered = format!("{client:?}");
+        assert!(
+            rendered.contains("TotalTimeout: 30s"),
+            "the plan client must retain its 30s timeout, got: {rendered}"
+        );
+    }
+
     #[test]
     fn parse_plan_window_from_total_percent_used() {
         let usage = json!({
@@ -1105,6 +1720,39 @@ mod tests {
     }
 
     #[test]
+    fn decrypt_electron_safe_storage_round_trip() {
+        use aes::Aes128;
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+        use pbkdf2::pbkdf2_hmac;
+        use sha1::Sha1;
+
+        let password = b"unit-test-password";
+        let mut key = [0u8; 16];
+        pbkdf2_hmac::<Sha1>(
+            password,
+            SAFE_STORAGE_SALT,
+            SAFE_STORAGE_ITERATIONS,
+            &mut key,
+        );
+        let iv = [b' '; 16];
+        let plaintext = b"{\"email\":\"dnplus@example.com\"}";
+        let mut buffer = vec![0u8; plaintext.len() + 16];
+        buffer[..plaintext.len()].copy_from_slice(plaintext);
+        type Aes128CbcEnc = cbc::Encryptor<Aes128>;
+        let encrypted_len = Aes128CbcEnc::new(&key.into(), &iv.into())
+            .encrypt_padded_mut::<Pkcs7>(&mut buffer, plaintext.len())
+            .expect("encrypt")
+            .len();
+        let mut envelope = Vec::with_capacity(3 + encrypted_len);
+        envelope.extend_from_slice(b"v10");
+        envelope.extend_from_slice(&buffer[..encrypted_len]);
+        let cipher_b64 = B64.encode(envelope);
+        let decrypted = decrypt_electron_safe_storage(&cipher_b64, password).unwrap();
+        assert_eq!(decrypted, "{\"email\":\"dnplus@example.com\"}");
+    }
+
+    #[test]
     fn invalid_grok_bot_percent_is_still_reported() {
         for percent in [json!(-1), json!("unrecognized")] {
             assert!(parse_sand_usage(
@@ -1180,6 +1828,7 @@ mod tests {
             access_token: format!("header.{payload}.signature"),
             refresh_token: refresh.map(str::to_string),
             email: None,
+            ..Default::default()
         }
     }
 
@@ -1200,7 +1849,41 @@ mod tests {
             access_token: format!("header.{payload}.signature"),
             refresh_token: refresh.map(str::to_string),
             email: email.map(str::to_string),
+            ..Default::default()
         }
+    }
+
+    /// Runs the source-ordered selector over whole records, with `session`
+    /// standing in for a saved `tokscale cursor login` session.
+    fn select_records(
+        db: LocalCursorAuth,
+        keychain: LocalCursorAuth,
+        session: Option<LocalCursorAuth>,
+        now_unix: i64,
+    ) -> Option<LocalCursorAuth> {
+        let db_access = nonempty(Some(&db.access_token));
+        select_local_auth(
+            db_access.as_deref(),
+            db.refresh_token.as_deref(),
+            db.email.as_deref(),
+            || {
+                (
+                    nonempty(Some(&keychain.access_token)),
+                    keychain.refresh_token.clone(),
+                )
+            },
+            || {
+                session.map(|session| {
+                    serde_json::from_value(json!({
+                        "sessionToken": format!("user::{}", session.access_token),
+                        "createdAt": "2026-10-17T00:00:00Z"
+                    }))
+                    .unwrap()
+                })
+            },
+            now_unix,
+        )
+        .ok()
     }
 
     #[test]
@@ -1209,7 +1892,7 @@ mod tests {
             let db = auth_with_subject(Some(expiry), "auth0|account-a", None, None);
             let keychain_refresh =
                 auth_with_subject(Some(2000), "auth0|account-a", None, None).access_token;
-            let selected = select_local_auth(
+            let selected = select_records(
                 db.clone(),
                 LocalCursorAuth {
                     refresh_token: Some(keychain_refresh.clone()),
@@ -1231,7 +1914,7 @@ mod tests {
     fn expired_db_without_refresh_falls_through_to_keychain() {
         let keychain = auth_with_expiry(2000, None);
         let selected =
-            select_local_auth(auth_with_expiry(900, None), keychain.clone(), None, 1000).unwrap();
+            select_records(auth_with_expiry(900, None), keychain.clone(), None, 1000).unwrap();
         assert_eq!(selected.access_token, keychain.access_token);
     }
 
@@ -1244,7 +1927,7 @@ mod tests {
             Some("account-b-refresh"),
             Some("a@example.com"),
         );
-        let selected = select_local_auth(db.clone(), keychain, None, 1000).unwrap();
+        let selected = select_records(db.clone(), keychain, None, 1000).unwrap();
         assert_eq!(selected.access_token, db.access_token);
         assert!(selected.refresh_token.is_none());
     }
@@ -1254,7 +1937,7 @@ mod tests {
         let db = auth_with_subject(Some(900), "auth0|account-a", None, None);
         let different_refresh =
             auth_with_subject(Some(2000), "auth0|account-b", None, None).access_token;
-        let selected = select_local_auth(
+        let selected = select_records(
             db,
             LocalCursorAuth {
                 refresh_token: Some(different_refresh),
@@ -1274,7 +1957,7 @@ mod tests {
             Some("account-b-refresh"),
             Some("a@example.com"),
         );
-        let selected = select_local_auth(
+        let selected = select_records(
             auth_with_subject(Some(900), "auth0|account-a", None, Some("a@example.com")),
             keychain.clone(),
             None,
@@ -1288,7 +1971,7 @@ mod tests {
     #[test]
     fn jwt_without_expiry_needs_refresh_or_falls_through() {
         let keychain = auth_with_subject(Some(2000), "auth0|account-b", None, None);
-        let selected = select_local_auth(
+        let selected = select_records(
             auth_with_subject(None, "auth0|account-a", None, None),
             keychain.clone(),
             None,
@@ -1417,7 +2100,7 @@ mod tests {
     #[test]
     fn expired_desktop_tokens_without_refresh_fall_through_to_saved_session() {
         let session = auth_with_expiry(2000, None);
-        let selected = select_local_auth(
+        let selected = select_records(
             auth_with_expiry(900, None),
             auth_with_expiry(800, None),
             Some(session.clone()),
@@ -1425,7 +2108,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected.access_token, session.access_token);
-        assert!(select_local_auth(
+        assert!(select_records(
             auth_with_expiry(900, None),
             LocalCursorAuth::default(),
             None,

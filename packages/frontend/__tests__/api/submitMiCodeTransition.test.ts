@@ -7,6 +7,8 @@ import * as schema from "../../src/lib/db/schema";
 import type { SubmissionData } from "../../src/lib/validation/submission";
 import type { ClientBreakdownData } from "../../src/lib/db/helpers";
 import { MICODE_FAMILY, MICODE_SUBMISSION_PARSER_VERSION } from "../../src/lib/db/micodeTransition";
+import { CURSOR_GROK_BOT_PARSER_VERSIONS } from "../../src/lib/db/cursorGrokBot";
+import { SUPPORTED_VERSIONED_PARSERS } from "../../src/lib/db/parserHighWater";
 import { LEGACY_DEVICE_KEY } from "../../src/lib/devices/shared";
 import { DEVICE_CLIENT_TOTALS_WRITE_FLAG, type DeviceClientBucketTotal } from "../../src/lib/db/deviceClientTotals";
 
@@ -340,7 +342,7 @@ afterEach(() => {
 });
 
 type Cell = { client: SubmissionData["summary"]["clients"][number]; input: number; messages?: number; model?: string; date?: string; cost?: number; cacheRead?: number };
-function payload(cells: Cell[], options: { versions?: Record<string, number> | null; fullHistory?: boolean; device?: string; incomplete?: boolean; backfill?: boolean } = {}): SubmissionData {
+function payload(cells: Cell[], options: { versions?: Record<string, number> | null; fullHistory?: boolean; device?: string; incomplete?: boolean; backfill?: boolean; proofs?: NonNullable<SubmissionData["scanScope"]>["recountProofs"] } = {}): SubmissionData {
   const contributions: SubmissionData["contributions"] = [];
   for (const cell of cells) {
     const date = cell.date ?? "2026-08-01";
@@ -363,7 +365,7 @@ function payload(cells: Cell[], options: { versions?: Record<string, number> | n
   return {
     device: { id: options.device ?? "one" },
     meta: { generatedAt: "2026-08-02T00:00:00Z", version: "4.14.0", dateRange: { start: dates[0], end: dates.at(-1)! } },
-    ...(options.versions === null ? {} : { scanScope: { parserVersions: options.versions ?? { micode: 2, "micode-desktop": 2 }, fullHistory: options.fullHistory ?? true } }),
+    ...(options.versions === null ? {} : { scanScope: { parserVersions: options.versions ?? { micode: 2, "micode-desktop": 2 }, fullHistory: options.fullHistory ?? true, ...(options.proofs ? { recountProofs: options.proofs } : {}) } }),
     summary: { totalTokens: tokens, totalCost: cost, totalDays: contributions.length, activeDays: contributions.length, averagePerDay: cost / contributions.length, maxCostInSingleDay: Math.max(...contributions.map((d) => d.totals.cost)), clients: [...new Set(cells.map((c) => c.client))], models: [...new Set(cells.map((c) => c.model ?? "mimo-v2.5-pro"))] },
     contributions, years: [], ...(options.backfill ? { provenance: { origin: "backfill" } } : {}),
   };
@@ -699,5 +701,169 @@ describe("submission transaction transport", () => {
     expect(highwater.size).toBe(2);
     expect(totals().tokens).toBe(1500);
     expect(errorLog).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Reuse the strict SQL transport above so this family is tested through the
+// actual route, regression guard, validator and transactional device ledger.
+describe("GET submission capabilities", () => {
+  it("advertises the Cursor ledger generation with the Grok Bot partition, without authentication or writes", async () => {
+    mocks.auth.mockClear();
+    const { GET } = await import("../../src/app/api/submit/route");
+    const response = await GET();
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.json()).toEqual({ capabilities: { cursorGrokBot: { parserVersions: { cursor: 2, "grok-bot": 1 } } } });
+    expect(mocks.auth).not.toHaveBeenCalled();
+    expect(mocks.db.transaction).not.toHaveBeenCalled();
+    expect(mocks.db.execute).not.toHaveBeenCalled();
+  });
+});
+
+// Grok Bot is a partition of the Cursor ledger: totals must always equal what
+// the upstream un-split Cursor generation credits for the union, and only
+// attribution may depend on the split.
+describe("POST Cursor/Grok Bot partition of the Cursor ledger", () => {
+  const versions = CURSOR_GROK_BOT_PARSER_VERSIONS;
+  const botSplit: Cell[] = [
+    { client: "cursor", input: 70, model: "grok-code" },
+    { client: "grok-bot", input: 30, model: "grok-code" },
+  ];
+  const botPayload = (cells = botSplit, options: Parameters<typeof payload>[1] = {}) =>
+    payload(cells, { versions, ...options });
+  const proofCell = (input: number, messages: number) => ({
+    tokens: { input, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 }, cost: input / 1_000_000, messages,
+  });
+  const ledger = () => devices.get("one")!.parserStates.cursor as { version: number; aggregate: { tokens: number } } | undefined;
+
+  it("keeps the CLI and the receiver on upstream's Cursor generation", () => {
+    const sender = readFileSync(resolve(__dirname, "../../../../crates/tokscale-cli/src/main.rs"), "utf8");
+    expect(versions.cursor).toBe(SUPPORTED_VERSIONED_PARSERS.cursor);
+    expect(sender).toContain(`const CURSOR_SUBMISSION_PARSER_VERSION: u32 = ${versions.cursor};`);
+    expect(sender).toContain(`const GROK_BOT_SUBMISSION_PARSER_VERSION: u32 = ${versions["grok-bot"]};`);
+  });
+
+  it("baselines a new device on the union and repeats identically", async () => {
+    hasSubmission = false;
+    await submit(botPayload());
+    expect(cell("cursor")!.tokens).toBe(70);
+    expect(cell("grok-bot")!.tokens).toBe(30);
+    expect(ledger()).toMatchObject({ version: 2, aggregate: { tokens: 100 } });
+    expect(devices.get("one")!.parserVersions.cursor).toBe(2);
+    const snapshot = structuredClone(days);
+    await submit(botPayload());
+    expect(days).toEqual(snapshot);
+  });
+
+  it("moves un-split Cursor history to the partition without adding the bot share again", async () => {
+    await submit(payload([{ client: "cursor", input: 100, messages: 2, model: "grok-code" }], { versions: { cursor: 1 } }));
+    await submit(payload([{ client: "grok", input: 10 }], { versions: null }));
+    await submit(botPayload());
+    // Independent client ledgers would credit 100 + 30 here.
+    expect(totals().tokens).toBe(110);
+    expect(cell("cursor")!.tokens).toBe(70);
+    expect(cell("grok-bot")!.tokens).toBe(30);
+    expect(cell("grok")!.tokens).toBe(10);
+  });
+
+  it("heals inflated un-split history with the union recount proof at the transition", async () => {
+    await submit(payload([{ client: "cursor", input: 200, messages: 4, model: "grok-code" }], { versions: { cursor: 1 } }));
+    const proofs = { cursor: { "2026-08-01": { "grok-code": { previous: proofCell(200, 4), corrected: proofCell(100, 2) } } } };
+    await submit(botPayload(botSplit, { proofs }));
+    expect(totals().tokens).toBe(100);
+    expect(cell("cursor")!.tokens).toBe(70);
+    expect(cell("grok-bot")!.tokens).toBe(30);
+  });
+
+  it("negative control: without the proof the inflated history is defended, and only attribution moves", async () => {
+    await submit(payload([{ client: "cursor", input: 200, messages: 4, model: "grok-code" }], { versions: { cursor: 1 } }));
+    await submit(botPayload());
+    expect(totals().tokens).toBe(200);
+    expect(cell("grok-bot")!.tokens).toBe(30);
+    expect(cell("cursor")!.tokens).toBe(170);
+  });
+
+  it("starts the Cursor ledger for a device that only carries the earlier fork split marker", async () => {
+    await submit(botPayload());
+    const device = devices.get("one")!;
+    device.parserStates = {};
+    device.parserVersions = { cursor: 4, "grok-bot": 1 };
+    const grown = botPayload([...botSplit, { client: "grok-bot", input: 20, date: "2026-08-02", model: "grok-code" }]);
+    await submit(grown);
+    expect(totals().tokens).toBe(120);
+    expect(ledger()).toMatchObject({ version: 2, aggregate: { tokens: 120 } });
+    expect(device.parserVersions.cursor).toBe(2);
+    await submit(grown);
+    expect(totals().tokens).toBe(120);
+  });
+
+  it("negative control: any other marker without a ledger still freezes", async () => {
+    await submit(botPayload());
+    const device = devices.get("one")!;
+    device.parserStates = {};
+    device.parserVersions = { cursor: 3, "grok-bot": 1 };
+    const before = structuredClone(days);
+    await submit(botPayload([...botSplit, { client: "grok-bot", input: 20, date: "2026-08-02", model: "grok-code" }]));
+    expect(days).toEqual(before);
+  });
+
+  it.each([
+    ["an older fork CLI (cursor 4)", { versions: { cursor: 4, "grok-bot": 1 } }],
+    ["a bot-only scan", { versions: { "grok-bot": 1 } }],
+    ["an unknown Cursor generation", { versions: { cursor: 3, "grok-bot": 1 } }],
+    ["bot rows without the partition declared", { versions: { cursor: 2 } }],
+    ["an unversioned payload", { versions: null }],
+    ["a backfill import", { backfill: true }],
+  ] as const)("freezes the family for %s while unrelated usage advances", async (_label, options) => {
+    await submit(botPayload());
+    const before = structuredClone(days);
+    const result = await submit(botPayload([
+      { client: "cursor", input: 170, model: "grok-code" },
+      { client: "grok-bot", input: 30, model: "grok-code" },
+      { client: "claude", input: 40, date: "2026-08-03", model: "claude" },
+    ], options));
+    expect(result.warnings.join(" ")).toContain("Preserved Cursor and Grok Bot together");
+    expect(days.filter((day) => day.date !== "2026-08-03")).toEqual(before);
+    expect(cell("claude", "2026-08-03")!.tokens).toBe(40);
+    expect(devices.get("one")!.parserVersions.cursor).toBe(2);
+  });
+
+  it("does not let a partial pair scan advance or re-attribute", async () => {
+    await submit(botPayload());
+    const before = structuredClone(days);
+    await submit(botPayload([
+      { client: "cursor", input: 20, model: "grok-code" },
+      { client: "grok-bot", input: 180, model: "grok-code" },
+    ], { fullHistory: false }));
+    expect(days).toEqual(before);
+  });
+
+  it("keeps stored attribution for an upstream un-split Cursor submit and credits its growth to Cursor", async () => {
+    await submit(botPayload());
+    await submit(payload([{ client: "cursor", input: 150, messages: 2, model: "grok-code" }], { versions: { cursor: 2 } }));
+    expect(totals().tokens).toBe(150);
+    expect(cell("grok-bot")!.tokens).toBe(30);
+    expect(cell("cursor")!.tokens).toBe(120);
+  });
+
+  it("re-attributes a reclassified row without changing the total", async () => {
+    await submit(botPayload());
+    await submit(botPayload([
+      { client: "cursor", input: 50, model: "grok-code" },
+      { client: "grok-bot", input: 50, model: "grok-code" },
+    ]));
+    expect(totals().tokens).toBe(100);
+    expect(cell("cursor")!.tokens).toBe(50);
+    expect(cell("grok-bot")!.tokens).toBe(50);
+  });
+
+  it("credits a reclassified row once when it also grows", async () => {
+    await submit(botPayload());
+    await submit(botPayload([
+      { client: "cursor", input: 70, model: "grok-code" },
+      { client: "grok-bot", input: 60, model: "grok-code" },
+    ]));
+    expect(totals().tokens).toBe(130);
+    expect(cell("grok-bot")!.tokens).toBe(60);
   });
 });

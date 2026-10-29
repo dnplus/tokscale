@@ -3916,8 +3916,9 @@ mod tests {
     #[test]
     fn non_codex_accounts_never_offer_codex_actions() {
         // Antigravity model groups and MiniMax Token Plan sites ride in the
-        // account slot too; they are not saved Codex identities.
-        for provider in ["Antigravity", "MiniMax Token Plan"] {
+        // account slot too, as do Grok Bot accounts; they are not saved Codex
+        // identities.
+        for provider in ["Antigravity", "MiniMax Token Plan", "Grok Bot"] {
             for is_active in [false, true] {
                 let mut app = make_app();
                 app.subscription_usage = vec![output_with_reset_credits(
@@ -3957,6 +3958,14 @@ mod tests {
             }),
             5.0,
         );
+        let grok = output(
+            "Grok Bot",
+            Some(UsageAccount {
+                id: "grok_account".to_string(),
+                label: None,
+                is_active: false,
+            }),
+        );
         let antigravity = output(
             "Antigravity",
             Some(UsageAccount {
@@ -3966,7 +3975,7 @@ mod tests {
             }),
         );
         let external_codex = output("Codex", None);
-        let mut outputs = vec![active, antigravity, external_codex];
+        let mut outputs = vec![active, antigravity, grok, external_codex];
         assert!(best_fallback_output(&outputs).is_none());
         assert_ne!(
             overall_state_label(TuiLanguage::En, &outputs),
@@ -4017,6 +4026,33 @@ mod tests {
             }),
         );
         let outputs = vec![antigravity, codex];
+        assert_eq!(active_output(&outputs).unwrap().provider, "Codex");
+        assert_eq!(
+            overall_state_label(TuiLanguage::En, &outputs),
+            tr(TuiLanguage::En, MessageKey::StateReadyWithWarnings)
+        );
+    }
+
+    #[test]
+    fn active_grok_account_does_not_drive_codex_switching() {
+        let grok = output_with_remaining(
+            "Grok Bot",
+            Some(UsageAccount {
+                id: "grok_account".to_string(),
+                label: None,
+                is_active: true,
+            }),
+            5.0,
+        );
+        let codex = output(
+            "Codex",
+            Some(UsageAccount {
+                id: "active_codex".to_string(),
+                label: None,
+                is_active: true,
+            }),
+        );
+        let outputs = vec![grok, codex];
         assert_eq!(active_output(&outputs).unwrap().provider, "Codex");
         assert_eq!(
             overall_state_label(TuiLanguage::En, &outputs),

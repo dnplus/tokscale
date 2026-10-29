@@ -93,7 +93,7 @@ jobs:
           name: ${{ inputs.bumped-manifests }}
       - name: Setup Android cross toolchain
         if: ${{ matrix.settings.target == 'aarch64-linux-android' }}
-        uses: taiki-e/setup-cross-toolchain-action@v1
+        uses: taiki-e/setup-cross-toolchain-action@12b7ad4acfa95a1476779d6c06699b96ec1691f8 # v1
         with:
           target: aarch64-linux-android
           runner: qemu-user
@@ -490,7 +490,7 @@ build_text = build_text.replace(
 build_text = build_text.replace(
     """      - name: Setup Android cross toolchain
         if: ${{ matrix.settings.target == 'aarch64-linux-android' }}
-        uses: taiki-e/setup-cross-toolchain-action@v1
+        uses: taiki-e/setup-cross-toolchain-action@12b7ad4acfa95a1476779d6c06699b96ec1691f8 # v1
         with:
           target: aarch64-linux-android
           runner: qemu-user
@@ -794,7 +794,7 @@ path = pathlib.Path(sys.argv[1])
 text = path.read_text()
 runner = """      - name: Setup Android cross toolchain
         if: ${{ matrix.settings.target == 'aarch64-linux-android' }}
-        uses: taiki-e/setup-cross-toolchain-action@v1
+        uses: taiki-e/setup-cross-toolchain-action@12b7ad4acfa95a1476779d6c06699b96ec1691f8 # v1
         with:
           target: aarch64-linux-android
           runner: qemu-user

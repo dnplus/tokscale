@@ -6,6 +6,43 @@
 
 </div>
 
+## Fork 版安裝（dnplus）
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dnplus/tokscale/main/install.sh | sh
+```
+
+預設安裝 dnplus/tokscale 最新 Release 至 `~/.local/bin`，並驗證 SHA256。指定版本與安裝目錄（環境變數需傳給 `sh`）：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dnplus/tokscale/main/install.sh | TOKSCALE_VERSION=v4.18.0-dnplus.1 TOKSCALE_INSTALL_DIR="$HOME/bin" sh
+# 不下載，只顯示平台、URL 與路徑；<latest-tag> 會在實際安裝時解析。
+curl -fsSL https://raw.githubusercontent.com/dnplus/tokscale/main/install.sh | TOKSCALE_DRY_RUN=1 sh
+```
+
+也可至 [dnplus Releases](https://github.com/dnplus/tokscale/releases) 手動下載 `tokscale-<tag>-<target>.tar.gz`（Windows 為 `.zip`）及對應 `.sha256`，在同一目錄執行 `sha256sum -c <archive>.sha256`（macOS 可用 `shasum -a 256 -c <archive>.sha256`），解壓縮後將執行檔放入 PATH。
+
+支援 macOS Apple Silicon／Intel（`aarch64-apple-darwin`、`x86_64-apple-darwin`）、Linux ARM64／x86_64 GNU glibc（`aarch64-unknown-linux-gnu`、`x86_64-unknown-linux-gnu`，建置以 glibc 2.17 為目標）與 Windows x86_64（`x86_64-pc-windows-msvc`，手動下載 ZIP）。Linux musl／Alpine 不適用此安裝腳本。macOS 使用預設功能，不包含可選的 Apple Foundation Models 後端。
+
+推送 `v*-dnplus.*` tag 會建立可由 `releases/latest` 取得的正式 Release；手動執行 **Release prebuilt (dnplus)** 只建置並上傳 Actions artifacts，不發佈 Release。
+
+### 搭配 PA Cafe 自動上傳
+
+安裝後，用 PA Cafe 設定頁產生的 `tt_` token 登入，並以 `--api-url` 指定 PA Cafe 網址（只填 origin，例如 `https://pa-cafe.example.com`）。URL 會和憑證一起存在 `~/.config/tokscale/credentials.json`，排程執行不需要任何環境變數：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dnplus/tokscale/main/install.sh | sh
+tokscale login --token tt_xxx --api-url https://pa-cafe.example.com --device-name "Work laptop"
+tokscale autosubmit enable --interval 1h
+tokscale autosubmit status
+```
+
+- `--device-name` 可省略；未指定時若有設定 `TOKSCALE_DEVICE_NAME` 會沿用其值，並寫入 `~/.config/tokscale/device.json` 供排程使用。
+- `submit` 與 autosubmit 預設在 `/api/submit` 內嵌版本 1 的 `quota`（包含有穩定帳號身分的錯誤讀數）；主站與 extra target 各自確認回應的 `quota.pools`。舊伺服器沒有確認時，成功的用量上傳後才 fallback 到 `/api/quota`；明確拒絕 quota 欄位時先以原用量、移除 quota 重送一次。`--no-quota` 關閉兩種額度上傳，官方 tokscale.ai（含子網域）不送額度。只有額度、沒有 token 用量時仍可更新；fallback 失敗只警告，不改判成功的用量上傳。
+- 伺服器 URL 的解析順序為 `TOKSCALE_API_URL` → 登入時儲存的 URL → `https://tokscale.ai`。URL 必須是 `https`（`localhost`／`127.0.0.1` 可用 `http`）。
+- 儲存的 token 只會送往登入時的 origin：若 `TOKSCALE_API_URL` 指向其他主機，tokscale 會直接拒絕而不送出 token。要換伺服器請重新執行 `tokscale login --token … --api-url <url>`。
+- 舊版存下、沒有 URL 的憑證視為屬於 `https://tokscale.ai`；若當初是用 `TOKSCALE_API_URL` 登入 PA Cafe，請以上面的指令重新登入。
+
 > A high-performance CLI tool and visualization dashboard for tracking token usage and costs across multiple AI coding agents.
 
 > [!TIP]
@@ -660,7 +697,7 @@ Scheduled runs are non-interactive: they never prompt for GitHub auth or star co
 
 ### Cursor IDE Commands
 
-Cursor IDE support uses Cursor's usage-events API. Tokscale caches usage at `~/.config/tokscale/cursor-cache/usage.json` for the active account and `usage.account-<sha256-of-exact-account-id>.json` for each other account, with verified ownership metadata. Unmarked legacy JSON/CSV caches are preserved in `cursor-cache/archive/` before sync or an account change; see the migration details below. Tokscale does not parse local Cursor Agent CLI state under `~/.cursor`, and it does not treat the desktop SQLite DB as a usage ledger.
+Cursor IDE support uses Cursor's usage-events API. Tokscale caches usage at `~/.config/tokscale/cursor-cache/usage.json` (or `${TOKSCALE_CONFIG_DIR}/cursor-cache/` when overridden) for the active account and `usage.account-<sha256-of-exact-account-id>.json` for each other account, with verified ownership metadata. Unmarked legacy JSON/CSV caches are preserved in `cursor-cache/archive/` before sync or an account change; see the migration details below. Tokscale does not parse local Cursor Agent CLI state under `~/.cursor`, and it does not treat the desktop SQLite DB as a usage ledger.
 
 When the Cursor desktop app is installed and signed in, reports, submit, and wrapped can import `cursorAuth/accessToken` from `state.vscdb` when no Cursor login is saved yet. Wrapped only does this when Cursor is included in the requested clients. Reports skip syncing while the usage cache is fresh. Whenever a sync runs, including explicit `tokscale cursor sync`, it refreshes the desktop token when available and can switch the active account to that desktop login. A saved login remains usable when no desktop session is available. Usage rows still come only from Cursor's usage-events API, not from local `~/.cursor` transcripts.
 
@@ -890,12 +927,17 @@ tokscale report --workspace my-project --client opencode
 
 Tokscale can fetch and display your real-time subscription quota across AI providers. This shows how much of your plan you've used and when limits reset.
 
+`--json-report` returns `{ "outputs": [...], "diagnostics": [...] }`. A failed Grok Bot account appears in diagnostics even when another account succeeds. Providers without detected credentials are skipped. `--json` keeps its existing array format. Automatic quota uploads use the versioned `quota` in `/api/submit`, with the existing array format retained for the `/api/quota` fallback.
+
 ```bash
 # Show subscription usage for all detected providers
 tokscale usage
 
 # Output as JSON (for scripting)
 tokscale usage --json
+
+# Include per-account fetch errors alongside successful results
+tokscale usage --json-report
 
 # Lightweight terminal output (no TUI)
 tokscale usage --light
@@ -916,6 +958,8 @@ In the TUI, navigate to the **Usage** tab to see subscription data. Use `[Refres
 | **GitHub Copilot** | GitHub token (keychain or `~/.config/gh/hosts.yml`) | Premium interactions, Chat quotas | Run `gh auth login` |
 | **Cursor** | Desktop `state.vscdb` JWT (or macOS Keychain `cursor-access-token`, or JWT inside a saved `tokscale cursor login` session) | Cursor Models and Other Models plan quotas (one Weekly pool on unified plans) | Sign in to Cursor desktop, or run `tokscale cursor login` |
 | **Grok Bot** | Cursor desktop JWT (with macOS Keychain refresh when available) | Weekly personal quota | Sign in to Cursor desktop; shown when a personal quota is available |
+| **Antigravity** | Running language server (loopback RPC) | Per model-group weekly / 5-hour remaining | Start the Antigravity CLI or IDE and sign in manually |
+| **Colab** | OAuth (`~/.config/colab-cli/token.json`) | Compute-unit balance, hourly burn rate, active runtimes | Log in with `colab-cli`; override with `TOKSCALE_COLAB_TOKEN_PATH` |
 | **Grok** | OAuth (`~/.grok/auth.json`) | Included credits (weekly or monthly), subscription plan | Run `grok login` |
 | **Kimi** | OAuth (`~/.kimi/credentials/kimi-code.json`) | Session, Weekly quotas | Run `kimi` to log in |
 | **MiniMax** | API key (env var) | Prompt quotas per model | Set `MINIMAX_API_KEY` or `MINIMAX_API_TOKEN` |
@@ -924,6 +968,8 @@ In the TUI, navigate to the **Usage** tab to see subscription data. Use `[Refres
 | **Sakana** (Fugu) | Session cookie (env var or file) — billing-console HTML scrape, no public API | 5-hour, Weekly quota windows (plan tier + monthly price as metadata) | Set `SAKANA_SESSION_COOKIE` (see [docs/providers/sakana.md](docs/providers/sakana.md)) |
 
 Providers are auto-detected — only those with valid credentials are shown. If a provider is missing, ensure you've logged in or set the required environment variable.
+
+Colab uses only the OAuth token file from colab-cli, with no browser cookies. Expired tokens are refreshed in memory without modifying the credential file. `TOKSCALE_COLAB_BASE_URL` overrides the Colab API base URL for testing. Compute units have no known cap, so the balance and burn rate use informational full bars.
 
 #### Codex Multi-Account Usage
 
@@ -1020,7 +1066,7 @@ Tokscale stores settings in `settings.json` in its config directory. By default 
 | `autoRefreshMs` | number | `60000` | Auto-refresh interval (30000-3600000ms) |
 | `nativeTimeoutMs` | number | `300000` | Maximum time for native subprocess processing (5000-3600000ms) |
 | `defaultClients` | string[] | `[]` | Client filter applied when no `--client/-c` flag is passed. Accepts the same ids as `--client` (e.g. `["opencode", "claude", "synthetic"]`). Unknown ids are silently dropped. CLI flags always override this list completely — no merging. |
-| `usage.disabledProviders` | string[] | `[]` | Subscription-usage providers to skip before credential discovery or network access. Valid ids (case-insensitive; surrounding whitespace ignored): `claude`, `codex`, `zai`, `amp`, `antigravity`, `copilot`, `cursor`, `grok-bot`, `grok`, `kimi`, `minimax`, `minimax-token-plan`, `warp`, `sakana`, and `opencode-go`. Legacy `grok-build`, `grok_build`, and `Grok Build` aliases also select `grok`. Unknown ids are ignored. Disabled providers are also hidden from cached TUI cards and diagnostics. Changes apply to the next `tokscale usage` run or TUI launch/refresh. |
+| `usage.disabledProviders` | string[] | `[]` | Subscription-usage providers to skip before credential discovery or network access. Valid ids (case-insensitive; surrounding whitespace ignored): `claude`, `codex`, `zai`, `amp`, `antigravity`, `copilot`, `cursor`, `grok-bot`, `grok`, `kimi`, `minimax`, `minimax-token-plan`, `colab`, `warp`, `sakana`, and `opencode-go`. Legacy `grok-build`, `grok_build`, and `Grok Build` aliases also select `grok`. Unknown ids are ignored. Disabled providers are also hidden from cached TUI cards and diagnostics. Changes apply to the next `tokscale usage` run or TUI launch/refresh. |
 | `light.writeCache` | boolean | `false` | When true, `tokscale --light` overwrites the TUI cache atomically after rendering. CLI flags `--write-cache` / `--no-write-cache` override per-invocation. |
 | `minutelyTabEnabled` | boolean | `false` | Show the per-minute Minutely tab in the TUI and aggregate per-minute usage during data loading. Default-off because minute-granularity is a niche/diagnostic view for most users and the per-minute bucketing has a non-trivial cost on large datasets. |
 | `autosubmit` | object | disabled | Saved `tokscale autosubmit` state: interval, client/date filters, scheduler backend, last run time, and last error. Prefer `tokscale autosubmit enable/status/disable` over editing this object by hand. |
@@ -1112,7 +1158,7 @@ Environment variables override config file values. For CI/CD or one-off use:
 | `TOKSCALE_NATIVE_TIMEOUT_MS` | `300000` (5 min) | Overrides `nativeTimeoutMs` config |
 | `TOKSCALE_API_TOKEN` | unset | Tokscale personal API token for non-interactive `submit` and `delete-submitted-data` runs. Create one from Settings > API Tokens or save it locally with `tokscale login --token tt_xxx`. |
 | `TOKSCALE_EXTRA_DIRS` | unset | One-off extra session roots as `client:/abs/path,client:/abs/path` |
-| `TOKSCALE_CONFIG_DIR` | unset | Overrides the config directory root (where `settings.json`, `star-cache.json`, `cache/`, `antigravity-cache/`, and `trae-cache/` live). Absolute path recommended; relative paths resolve against the process CWD. Useful for CI sandboxes or pinning a non-default location. When set, tokscale will not fall back to the legacy macOS `~/Library/Application Support/tokscale/` path. |
+| `TOKSCALE_CONFIG_DIR` | unset | Overrides the config directory root (where `settings.json`, `star-cache.json`, `cache/`, `antigravity-cache/`, `trae-cache/`, and `cursor-cache/` live). Without the override, `cursor-cache/` stays at `~/.config/tokscale/cursor-cache/` on every platform, even where the config directory itself resolves elsewhere. Absolute path recommended; relative paths resolve against the process CWD. Useful for CI sandboxes or pinning a non-default location. When set, tokscale will not fall back to the legacy macOS `~/Library/Application Support/tokscale/` path. |
 | `TOKSCALE_CODEX_MAX_DECODED_BYTES` | `1073741824` (1 GiB) | Sets the decoded-size ceiling, in bytes, for compressed Codex `.jsonl.zst` rollouts. Accepts positive integers below `u64::MAX`; invalid values use the default. Raising it increases the work Tokscale permits for one archive. |
 | `TOKSCALE_FM_DEBUG` | unset | When set, prints Apple Foundation Models diagnostics (macOS version gate, dlopen dylib path, load/symbol errors) to stderr to explain why on-device apple-fm did or didn't engage. |
 | `TOKSCALE_RECOVERY_DISABLE` | unset | When set, disables the local usage recovery ledger (`recovered-usage-v1.json`) even if the file exists. |

@@ -5,9 +5,12 @@ mod client_diagnostics;
 mod commands;
 mod cursor;
 mod device;
+mod embedded_quota;
+mod extra_targets;
 mod hindsight;
 mod paths;
 mod process_liveness;
+mod submit_compat;
 mod trae;
 mod tui;
 mod ui_glyphs;
@@ -246,6 +249,18 @@ enum Commands {
             help = "Save an existing Tokscale API token without browser auth"
         )]
         token: Option<String>,
+        #[arg(
+            long,
+            value_name = "URL",
+            help = "Server to log in to and save with the credentials (default: TOKSCALE_API_URL or https://tokscale.ai)"
+        )]
+        api_url: Option<String>,
+        #[arg(
+            long,
+            value_name = "NAME",
+            help = "Label this machine in submissions (default: TOKSCALE_DEVICE_NAME if set)"
+        )]
+        device_name: Option<String>,
     },
     #[command(about = "Logout from Tokscale")]
     Logout,
@@ -320,12 +335,24 @@ enum Commands {
         dry_run: bool,
         #[arg(
             long,
+            help = "Disable automatic quota upload after a successful submit"
+        )]
+        no_quota: bool,
+        #[arg(
+            long,
             alias = "cursor-timeout",
             value_name = "SECONDS",
             value_parser = clap::value_parser!(u64).range(1..=cursor::CURSOR_MAX_SYNC_TIMEOUT_SECS),
             help = "Cursor sync timeout in seconds, 1-86400 (overrides cursor.syncTimeoutSeconds in settings.json)"
         )]
         timeout: Option<u64>,
+        #[command(flatten)]
+        extra_targets: extra_targets::ExtraTargetFlags,
+    },
+    #[command(about = "Manage extra servers that submit also uploads to")]
+    Target {
+        #[command(subcommand)]
+        subcommand: extra_targets::TargetSubcommand,
     },
     #[command(about = "Manage periodic usage submission")]
     Autosubmit {
@@ -374,6 +401,12 @@ enum Commands {
         json: bool,
         #[arg(long, help = "Light terminal output (no TUI)")]
         light: bool,
+        #[arg(
+            long,
+            conflicts_with = "json",
+            help = "Output usage and per-account fetch diagnostics as JSON"
+        )]
+        json_report: bool,
     },
     #[command(about = "Codex account integration commands")]
     Codex {
@@ -504,10 +537,19 @@ enum AmpSubcommand {
 
 #[derive(Subcommand)]
 enum CursorSubcommand {
-    #[command(about = "Login to Cursor (auto-detect desktop session, or paste browser token)")]
+    #[command(
+        about = "Login to Cursor (shows the detected account and asks before saving; or paste a browser token)"
+    )]
     Login {
         #[arg(long, help = "Label for this Cursor account (e.g., work, personal)")]
         name: Option<String>,
+        #[arg(
+            long,
+            help = "Paste a browser WorkosCursorSessionToken instead of using the desktop login"
+        )]
+        paste: bool,
+        #[arg(long, short = 'y', help = "Do not ask for confirmation")]
+        yes: bool,
     },
     #[command(about = "Logout from a Cursor account")]
     Logout {
@@ -518,15 +560,20 @@ enum CursorSubcommand {
         #[arg(long, help = "Also delete cached Cursor usage")]
         purge_cache: bool,
     },
-    #[command(about = "Check Cursor authentication status")]
+    #[command(about = "Check every saved Cursor account (email, user id, plan, active, expired)")]
     Status {
         #[arg(long, help = "Account label or id")]
         name: Option<String>,
     },
-    #[command(about = "List saved Cursor accounts")]
+    #[command(
+        about = "List saved Cursor accounts with email, plan and session state",
+        visible_alias = "list"
+    )]
     Accounts {
         #[arg(long, help = "Output as JSON")]
         json: bool,
+        #[arg(long, help = "Do not re-check sessions; show the last known state")]
+        offline: bool,
     },
     #[command(about = "Sync Cursor API usage into cursor-cache/usage*.json")]
     Sync {
@@ -884,9 +931,13 @@ fn main() -> Result<()> {
             )
         }
         Some(Commands::Clients { json }) => run_clients_command(json, cli.home.clone()),
-        Some(Commands::Login { token }) => {
+        Some(Commands::Login {
+            token,
+            api_url,
+            device_name,
+        }) => {
             reject_unsupported_home_override(&cli.home, "login")?;
-            run_login_command(token)
+            run_login_command(token, api_url, device_name)
         }
         Some(Commands::Logout) => {
             reject_unsupported_home_override(&cli.home, "logout")?;
@@ -950,7 +1001,9 @@ fn main() -> Result<()> {
             clients,
             date,
             dry_run,
+            no_quota,
             timeout,
+            extra_targets,
         }) => {
             reject_unsupported_home_override(&cli.home, "submit")?;
             let (since, until) = build_date_filter(&date, &cli.home);
@@ -968,9 +1021,15 @@ fn main() -> Result<()> {
                 until,
                 year,
                 dry_run,
+                no_quota,
+                &extra_targets,
                 SubmitMode::Interactive,
                 cursor_timeout,
             )
+        }
+        Some(Commands::Target { subcommand }) => {
+            reject_unsupported_home_override(&cli.home, "target")?;
+            extra_targets::run(subcommand)
         }
         Some(Commands::Autosubmit { subcommand }) => {
             reject_unsupported_home_override(&cli.home, "autosubmit")?;
@@ -1013,9 +1072,13 @@ fn main() -> Result<()> {
             reject_unsupported_home_override(&cli.home, "antigravity")?;
             run_antigravity_command(subcommand)
         }
-        Some(Commands::Usage { json, light }) => {
+        Some(Commands::Usage {
+            json,
+            json_report,
+            light,
+        }) => {
             reject_unsupported_home_override(&cli.home, "usage")?;
-            commands::usage::run(json, light, cli.debug)
+            commands::usage::run(json, json_report, light, cli.debug)
         }
         Some(Commands::Codex { subcommand }) => {
             reject_unsupported_home_override(&cli.home, "codex")?;
@@ -1236,6 +1299,8 @@ pub enum ClientFilter {
     AntigravityExtension,
     Aside,
     Vibe,
+    #[value(name = "grok-bot")]
+    GrokBot,
     Proma,
     Synthetic,
 }
@@ -1275,6 +1340,7 @@ impl ClientFilter {
             Self::Gjc => "gjc",
             Self::NineRouter => "9router",
             Self::Grok => "grok",
+            Self::GrokBot => "grok-bot",
             Self::Jcode => "jcode",
             Self::Commandcode => "commandcode",
             Self::Micode => "micode",
@@ -1347,6 +1413,7 @@ impl ClientFilter {
             Self::Gjc => Some(ClientId::Gjc),
             Self::NineRouter => Some(ClientId::Gjc),
             Self::Grok => Some(ClientId::Grok),
+            Self::GrokBot => Some(ClientId::GrokBot),
             Self::Jcode => Some(ClientId::Jcode),
             Self::Commandcode => Some(ClientId::CommandCode),
             Self::Micode => Some(ClientId::MiMoCode),
@@ -1415,6 +1482,7 @@ impl ClientFilter {
             ClientId::Cline => Self::Cline,
             ClientId::Gjc => Self::Gjc,
             ClientId::Grok => Self::Grok,
+            ClientId::GrokBot => Self::GrokBot,
             ClientId::Jcode => Self::Jcode,
             ClientId::CommandCode => Self::Commandcode,
             ClientId::MiMoCode => Self::Micode,
@@ -1592,9 +1660,11 @@ fn build_client_filter_with_defaults(
 }
 
 fn client_filter_includes_cursor(clients: &Option<Vec<String>>) -> bool {
-    clients
-        .as_ref()
-        .is_none_or(|sources| sources.iter().any(|source| source == "cursor"))
+    clients.as_ref().is_none_or(|sources| {
+        sources
+            .iter()
+            .any(|source| matches!(source.as_str(), "cursor" | "grok-bot"))
+    })
 }
 
 fn client_filter_includes_amp(clients: &Option<Vec<String>>) -> bool {
@@ -1604,9 +1674,11 @@ fn client_filter_includes_amp(clients: &Option<Vec<String>>) -> bool {
 }
 
 fn client_filter_explicitly_requests_cursor(clients: &Option<Vec<String>>) -> bool {
-    clients
-        .as_ref()
-        .is_some_and(|sources| sources.iter().any(|source| source == "cursor"))
+    clients.as_ref().is_some_and(|sources| {
+        sources
+            .iter()
+            .any(|source| matches!(source.as_str(), "cursor" | "grok-bot"))
+    })
 }
 
 fn client_filter_explicitly_requests_warp(clients: &Option<Vec<String>>) -> bool {
@@ -1643,6 +1715,11 @@ fn cursor_setup_state(home_dir: &Option<String>) -> Option<CursorSetupState> {
     let cache_glob = if home_override {
         home_path
             .join(".config/tokscale/cursor-cache/usage*.json")
+            .to_string_lossy()
+            .to_string()
+    } else if crate::paths::is_config_dir_overridden() {
+        crate::paths::get_config_dir()
+            .join("cursor-cache/usage*.json")
             .to_string_lossy()
             .to_string()
     } else {
@@ -1906,26 +1983,36 @@ fn auto_sync_cursor_before_tui(
 fn emit_cursor_sync_warning(
     sync: Option<&cursor::SyncCursorResult>,
     had_cursor_cache: bool,
-    explicit_cursor_filter: bool,
+    _explicit_cursor_filter: bool,
 ) {
-    let Some(sync) = sync else {
-        return;
-    };
-    let Some(error) = sync.error.as_ref() else {
-        return;
-    };
-    if sync.synced || had_cursor_cache || explicit_cursor_filter {
+    if let Some(warning) = cursor_sync_warning(sync, had_cursor_cache) {
         use colored::Colorize;
-        let prefix = if sync.synced {
-            "Cursor sync warning"
-        } else if had_cursor_cache {
-            "Cursor sync failed; using cached data"
-        } else {
-            "Cursor sync failed"
-        };
-        eprintln!("{}", format!("  {}: {}", prefix, error).yellow());
+        eprintln!("{}", format!("  {}", warning).yellow());
     }
 }
+
+/// Without a cache, a failed implicit sync leaves Cursor out of the report
+/// entirely, so it is always surfaced with a pointer to the explicit sync,
+/// whose time budget scales with the account's history.
+fn cursor_sync_warning(
+    sync: Option<&cursor::SyncCursorResult>,
+    had_cursor_cache: bool,
+) -> Option<String> {
+    let sync = sync?;
+    let error = sync.error.as_ref()?;
+    Some(if sync.synced {
+        format!("Cursor sync warning: {}", error)
+    } else if had_cursor_cache {
+        format!("Cursor sync failed; using cached data: {}", error)
+    } else {
+        format!(
+            "Cursor sync failed: {}; {}",
+            error, CURSOR_EXPLICIT_SYNC_HINT
+        )
+    })
+}
+
+const CURSOR_EXPLICIT_SYNC_HINT: &str = "run `tokscale cursor sync` to retry with a longer timeout";
 
 fn default_submit_clients() -> Vec<String> {
     let mut clients: Vec<String> = tokscale_core::ClientId::iter()
@@ -5159,7 +5246,7 @@ impl From<tokscale_core::TokenBreakdown> for ModelTokenBreakdownJson {
     }
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsTokenBreakdown {
     input: i64,
@@ -5169,7 +5256,7 @@ struct TsTokenBreakdown {
     reasoning: i64,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsSourceContribution {
     client: String,
@@ -5183,7 +5270,7 @@ struct TsSourceContribution {
     cost_provenance: Option<tokscale_core::CostProvenance>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsDailyTotals {
     tokens: i64,
@@ -5197,7 +5284,7 @@ struct TsDailyTotals {
     cost_provenance: Option<tokscale_core::CostProvenance>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsDailyContribution {
     date: String,
@@ -5209,13 +5296,13 @@ struct TsDailyContribution {
     active_time_ms: Option<i64>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 struct DateRange {
     start: String,
     end: String,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsYearSummary {
     year: String,
@@ -5226,7 +5313,7 @@ struct TsYearSummary {
     cost_provenance: Option<tokscale_core::CostProvenance>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsDataSummary {
     total_tokens: i64,
@@ -5241,7 +5328,7 @@ struct TsDataSummary {
     cost_provenance: Option<tokscale_core::CostProvenance>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsExportMeta {
     generated_at: String,
@@ -5249,7 +5336,7 @@ struct TsExportMeta {
     date_range: DateRange,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsSubmitDevice {
     id: String,
@@ -5257,7 +5344,7 @@ struct TsSubmitDevice {
     name: Option<String>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsTimeMetrics {
     total_active_time_ms: i64,
@@ -5267,6 +5354,16 @@ struct TsTimeMetrics {
 }
 
 const SUBMISSION_PARSER_VERSION: u32 = 1;
+// The Cursor parser collapses repeated `usageEventId` snapshots (and the
+// matching legacy id-less row) once per cache file. The raw rows remain in the
+// parser cache so the scan can ship the same per-day recount proof used for
+// Devin CLI.
+const CURSOR_SUBMISSION_PARSER_VERSION: u32 = 2;
+// Grok Bot is a partition of the Cursor ledger, not a ledger of its own: the
+// receiver credits Cursor + Grok Bot as Cursor generation 2 and splits the
+// written cells. Sent only to receivers that advertise this exact pair; see
+// `submit_compat`.
+const GROK_BOT_SUBMISSION_PARSER_VERSION: u32 = 1;
 const COPILOT_SUBMISSION_PARSER_VERSION: u32 = 2;
 // Amp v2 moves existing exported messages from synthesized creation-time dates
 // to the server-provided usage timestamp. The receiver replaces the complete
@@ -5276,6 +5373,9 @@ const AMP_SUBMISSION_PARSER_VERSION: u32 = 2;
 // selected surfaces declare this generation and cover the credited history.
 // This is a submission contract, independent of the on-disk parser cache version.
 const MICODE_SUBMISSION_PARSER_VERSION: u32 = 2;
+// Per-session metadata shape; sent only to receivers that advertise this exact
+// version, since older receivers may reject an unknown top-level key.
+const SESSIONS_SUBMISSION_VERSION: u32 = 1;
 // Devin CLI generation 2 deduplicates `message_nodes` rows by request_id
 // instead of row_id (ea4dd97e, parser cache v3->v4). That generation counts
 // the same history strictly LOWER, which no monotonic receiver ledger can
@@ -5285,13 +5385,8 @@ const MICODE_SUBMISSION_PARSER_VERSION: u32 = 2;
 // accepts generation 1 only until a device starts this transition, then
 // freezes every older submit.
 const DEVIN_CLI_SUBMISSION_PARSER_VERSION: u32 = 2;
-/// Cursor generation 2 collapses repeated `usageEventId` snapshots (and the
-/// matching legacy id-less row) once per cache file. The raw rows remain in the
-/// parser cache so the scan can ship the same per-day recount proof used for
-/// Devin CLI; generation 1 stays accepted only until a device transitions.
-const CURSOR_SUBMISSION_PARSER_VERSION: u32 = 2;
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsRecountProofCell {
     tokens: TsTokenBreakdown,
@@ -5317,7 +5412,7 @@ impl From<&tokscale_core::RecountProofCell> for TsRecountProofCell {
 
 /// What the previous and the declared parser generation count for one
 /// (day, model) cell from the same local rows. See `recount_proofs` below.
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsRecountProofEntry {
     previous: TsRecountProofCell,
@@ -5330,7 +5425,7 @@ type TsRecountProofs = std::collections::BTreeMap<
     std::collections::BTreeMap<String, std::collections::BTreeMap<String, TsRecountProofEntry>>,
 >;
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsScanScope {
     parser_versions: std::collections::BTreeMap<String, u32>,
@@ -5420,7 +5515,12 @@ fn submission_recount_proofs(
             .flat_map(|day| {
                 day.clients
                     .iter()
-                    .filter(|submission| &submission.client == client)
+                    // The Cursor proof describes the Cursor ledger, whose
+                    // cells are the Cursor + Grok Bot union.
+                    .filter(|submission| {
+                        &submission.client == client
+                            || (client == "cursor" && submission.client == "grok-bot")
+                    })
                     .map(|submission| (day.date.as_str(), submission.model_id.as_str()))
             })
             .collect();
@@ -5457,14 +5557,14 @@ fn submission_recount_proofs(
 /// export rather than scanned from local session files. The server stamps it
 /// on every client row it writes and flags the profile as including imported
 /// history.
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsSubmissionProvenance {
     origin: &'static str,
     importer: String,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TsTokenContributionData {
     meta: TsExportMeta,
@@ -5481,6 +5581,129 @@ struct TsTokenContributionData {
     mcp_servers: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<TsSubmissionProvenance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sessions: Option<Vec<TsSessionContribution>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quota: Option<embedded_quota::QuotaReport>,
+}
+
+/// One agent session's usage and where it ran. This is the whole set of
+/// fields the receiver gets for a session: nothing from the conversation
+/// itself (titles, prompts, message text) and no local path (the working
+/// directory) is ever sent.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TsSessionContribution {
+    session_id: String,
+    client: String,
+    models: Vec<TsSessionModel>,
+    /// Unix milliseconds.
+    first_seen: i64,
+    /// Unix milliseconds.
+    last_seen: i64,
+    tokens: TsTokenBreakdown,
+    messages: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_url: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TsSessionModel {
+    model_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_id: Option<String>,
+}
+
+/// The receiver keeps this many sessions per principal; sending more is waste.
+const MAX_SUBMIT_SESSIONS: usize = 2_000;
+/// Upper bound on the serialized `sessions` array, so it cannot blow up a
+/// submission whose daily totals are small.
+const MAX_SUBMIT_SESSIONS_BYTES: usize = 2 * 1024 * 1024;
+
+fn to_ts_session_contributions(
+    sessions: &[tokscale_core::SessionContributionV2],
+) -> Option<Vec<TsSessionContribution>> {
+    bound_ts_sessions(
+        collect_ts_sessions(sessions),
+        MAX_SUBMIT_SESSIONS,
+        MAX_SUBMIT_SESSIONS_BYTES,
+    )
+}
+
+/// Keep the most recent `max_count` sessions, then drop the oldest until the
+/// serialized array fits `max_bytes`. `None` when nothing fits, so the daily
+/// totals still submit without `sessions`.
+fn bound_ts_sessions(
+    mut sessions: Vec<TsSessionContribution>,
+    max_count: usize,
+    max_bytes: usize,
+) -> Option<Vec<TsSessionContribution>> {
+    sessions.sort_by(|a, b| {
+        b.last_seen
+            .cmp(&a.last_seen)
+            .then_with(|| a.client.cmp(&b.client))
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    sessions.truncate(max_count);
+
+    // Brackets plus one comma between elements.
+    let mut bytes = 2usize;
+    let mut keep = 0;
+    for session in &sessions {
+        let size = serde_json::to_vec(session).ok()?.len();
+        let next = bytes + size + usize::from(keep > 0);
+        if next > max_bytes {
+            break;
+        }
+        bytes = next;
+        keep += 1;
+    }
+    sessions.truncate(keep);
+    (!sessions.is_empty()).then_some(sessions)
+}
+
+fn collect_ts_sessions(
+    sessions: &[tokscale_core::SessionContributionV2],
+) -> Vec<TsSessionContribution> {
+    sessions
+        .iter()
+        .filter(|session| {
+            !session.session_id.is_empty()
+                && session.totals.tokens > 0
+                // No usable timestamp: the receiver cannot place the session.
+                && session.first_seen > 0
+                && session.last_seen > 0
+        })
+        .map(|session| TsSessionContribution {
+            session_id: session.session_id.clone(),
+            client: session.client.clone(),
+            models: session
+                .clients
+                .iter()
+                .map(|cell| TsSessionModel {
+                    model_id: cell.model_id.clone(),
+                    provider_id: (!cell.provider_id.is_empty()).then(|| cell.provider_id.clone()),
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            first_seen: session.first_seen.saturating_mul(1000),
+            last_seen: session.last_seen.saturating_mul(1000),
+            tokens: TsTokenBreakdown {
+                input: session.token_breakdown.input,
+                output: session.token_breakdown.output,
+                cache_read: session.token_breakdown.cache_read,
+                cache_write: session.token_breakdown.cache_write,
+                reasoning: session.token_breakdown.reasoning,
+            },
+            messages: session.totals.messages,
+            git_branch: session.git_branch.clone(),
+            repo_url: session.repo_url.clone(),
+        })
+        .collect()
 }
 
 fn to_ts_token_contribution_data(
@@ -5618,6 +5841,8 @@ fn to_ts_token_contribution_data(
             }
         },
         provenance: None,
+        sessions: to_ts_session_contributions(&graph.sessions),
+        quota: None,
     }
 }
 
@@ -5677,9 +5902,10 @@ fn submit_scan_scope(
         .iter()
         .map(|client| {
             let version = match client.as_str() {
+                "cursor" => CURSOR_SUBMISSION_PARSER_VERSION,
+                "grok-bot" => GROK_BOT_SUBMISSION_PARSER_VERSION,
                 "amp" => AMP_SUBMISSION_PARSER_VERSION,
                 "copilot" => COPILOT_SUBMISSION_PARSER_VERSION,
-                "cursor" => CURSOR_SUBMISSION_PARSER_VERSION,
                 "devin-cli" => DEVIN_CLI_SUBMISSION_PARSER_VERSION,
                 "micode" | "micode-desktop" => MICODE_SUBMISSION_PARSER_VERSION,
                 _ => SUBMISSION_PARSER_VERSION,
@@ -5729,14 +5955,25 @@ fn should_suggest_client_scope_tip(
     mode == SubmitMode::Interactive && !explicit_client_filter && full_history_scan
 }
 
-fn run_login_command(token: Option<String>) -> Result<()> {
+fn run_login_command(
+    token: Option<String>,
+    api_url: Option<String>,
+    device_name: Option<String>,
+) -> Result<()> {
     use tokio::runtime::Runtime;
 
+    let device_name = device_name.or_else(|| {
+        std::env::var("TOKSCALE_DEVICE_NAME")
+            .ok()
+            .filter(|name| !name.trim().is_empty())
+    });
     let rt = Runtime::new()?;
     rt.block_on(async {
         match token {
-            Some(token) => auth::login_with_token(&token).await,
-            None => auth::login().await,
+            Some(token) => {
+                auth::login_with_token(&token, api_url.as_deref(), device_name.as_deref()).await
+            }
+            None => auth::login(api_url.as_deref(), device_name.as_deref()).await,
         }
     })
 }
@@ -5808,7 +6045,7 @@ fn run_delete_data_command() -> Result<()> {
 
     println!("\n{}", "  Deleting submitted data...".bright_black());
 
-    let api_url = auth::get_api_base_url();
+    let api_url = auth::api_url_for(&auth_token)?;
     let rt = Runtime::new()?;
 
     let response = rt.block_on(async {
@@ -6571,7 +6808,7 @@ fn submit_imported_graph(payload: &TsTokenContributionData) -> Result<()> {
     })?;
     eprintln!("{}", "\n  Submitting as imported history...".bright_black());
     let rt = tokio::runtime::Runtime::new()?;
-    post_submission(&rt, &auth_token, payload, SubmitMode::Interactive)
+    post_submission(&rt, &auth_token, payload, SubmitMode::Interactive).map(|_| ())
 }
 
 /// Drop the (date, client) rows of an imported graph that this machine's own
@@ -7084,7 +7321,11 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
         AutosubmitSubcommand::Enable(args) => commands::autosubmit::enable(args),
         AutosubmitSubcommand::Status { json } => commands::autosubmit::status(json),
         AutosubmitSubcommand::Disable => commands::autosubmit::disable(),
-        AutosubmitSubcommand::Run { force } => {
+        AutosubmitSubcommand::Run {
+            force,
+            no_quota,
+            extra_targets,
+        } => {
             let now_ms = chrono::Utc::now().timestamp_millis();
             let (settings, decision) = commands::autosubmit::load_run_config(force, now_ms)?;
             match decision {
@@ -7114,6 +7355,8 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
                 until,
                 year,
                 false,
+                no_quota || settings.no_quota,
+                &extra_targets,
                 SubmitMode::Autosubmit,
                 None,
             ) {
@@ -7133,12 +7376,15 @@ fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_submit_command(
     clients: Option<Vec<String>>,
     since: Option<String>,
     until: Option<String>,
     year: Option<String>,
     dry_run: bool,
+    no_quota: bool,
+    extra_target_flags: &extra_targets::ExtraTargetFlags,
     mode: SubmitMode,
     cursor_timeout: Option<std::time::Duration>,
 ) -> Result<()> {
@@ -7163,6 +7409,9 @@ fn run_submit_command(
             std::process::exit(1);
         }
     };
+    // Fail before scanning when the saved token belongs to another server.
+    let primary_url = auth::api_url_for(&auth_token)?;
+    let extra_plan = extra_targets::Plan::resolve(extra_target_flags, &primary_url)?;
 
     if mode == SubmitMode::Interactive
         && auth_token.source == auth::ApiTokenSource::StoredCredentials
@@ -7198,13 +7447,8 @@ fn run_submit_command(
                 "{}",
                 format!("  Cursor: {} usage events synced", sync_result.rows).bright_black()
             );
-        } else if let Some(err) = sync_result.error {
-            if has_cursor_cache {
-                println!(
-                    "{}",
-                    format!("  Cursor sync failed; using cached data: {}", err).yellow()
-                );
-            }
+        } else if let Some(warning) = cursor_sync_warning(Some(&sync_result), has_cursor_cache) {
+            println!("{}", format!("  {}", warning).yellow());
         }
     }
 
@@ -7440,12 +7684,16 @@ fn run_submit_command(
     );
     println!();
 
-    if graph_result.summary.total_tokens == 0 {
+    let with_quota = !no_quota
+        && (!commands::autosubmit::is_official_api_url(&primary_url)
+            || extra_plan.has_quota_target());
+    if graph_result.summary.total_tokens == 0 && !with_quota {
         println!("{}", "  No usage data found to submit.\n".yellow());
         return Ok(());
     }
 
     if dry_run {
+        extra_plan.print_dry_run();
         println!("{}", "  Dry run - not submitting data.\n".yellow());
         return Ok(());
     }
@@ -7453,9 +7701,47 @@ fn run_submit_command(
     println!("{}", "  Submitting to server...".bright_black());
 
     let submit_device = device::resolve_submit_device()?;
-    let submit_payload =
+    let mut submit_payload =
         to_ts_token_contribution_data(&graph_result, Some(&submit_device), scan_scope);
-    post_submission(&rt, &auth_token, &submit_payload, mode)?;
+    if with_quota {
+        embedded_quota::attach(&mut submit_payload, embedded_quota::report());
+    }
+    // Before the primary upload, which exits the process when it fails.
+    extra_plan.submit_all(&rt, &submit_payload, no_quota);
+    let quota_stored = if graph_result.summary.total_tokens == 0
+        && commands::autosubmit::is_official_api_url(&primary_url)
+    {
+        false
+    } else {
+        post_submission(&rt, &auth_token, &submit_payload, mode)?
+    };
+    let api_url = auth::api_url_for(&auth_token)?;
+    if let Some(result) = commands::autosubmit::after_submit_quota(
+        no_quota,
+        &api_url,
+        quota_stored,
+        || {
+            commands::autosubmit::upload_quota(
+                &auth_token,
+                &api_url,
+                &embedded_quota::legacy_body(),
+            )
+        },
+        |warning| eprintln!("  {}", warning.replace(&auth_token.token, "[REDACTED]")),
+    ) {
+        if result.is_ok() {
+            println!("  Quota reading uploaded.");
+        }
+        if mode == SubmitMode::Autosubmit {
+            let result = result.map_err(|error| {
+                anyhow::anyhow!(error.to_string().replace(&auth_token.token, "[REDACTED]"))
+            });
+            let _ = commands::autosubmit::record_quota_result(
+                chrono::Utc::now().timestamp_millis(),
+                &result,
+            );
+        }
+    }
 
     // Warm the TUI cache so the next `tokscale` launch is instant.
     // Detached subprocess so submit returns to the shell immediately on large
@@ -7474,42 +7760,43 @@ fn post_submission(
     auth_token: &auth::ApiTokenAuth,
     submit_payload: &TsTokenContributionData,
     mode: SubmitMode,
-) -> Result<()> {
+) -> Result<bool> {
     use colored::Colorize;
 
-    let api_url = auth::get_api_base_url();
+    let api_url = auth::api_url_for(auth_token)?;
+    // Negotiate before serializing/uploading any family data. A receiver can
+    // reject an unknown generation key even when there are no Bot rows.
+    let submit_payload =
+        rt.block_on(submit_compat::prepare_submission(&api_url, submit_payload))?;
 
-    let response = rt.block_on(async {
-        tokscale_core::http::client()
-            .post(format!("{}/api/submit", api_url))
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", auth_token.token))
-            .json(submit_payload)
-            .send()
-            .await
-    });
+    let response = rt.block_on(embedded_quota::send(
+        &tokscale_core::http::client(),
+        &api_url,
+        &auth_token.token,
+        &submit_payload,
+    ));
 
     match response {
         Ok(resp) => {
-            let status = resp.status();
+            let status = resp.status;
+            let quota_stored = resp.quota_stored;
             let body: SubmitResponse =
-                rt.block_on(async { resp.json().await })
-                    .unwrap_or_else(|err| SubmitResponse {
-                        submission_id: None,
-                        username: None,
-                        metrics: None,
-                        warnings: None,
-                        // Same reason as the transport arm below: reqwest's
-                        // Display for a decode failure is the bare "error
-                        // decoding response body", and the serde cause naming
-                        // the offending field is only reachable via `source()`.
-                        error: Some(format!(
-                            "Server returned {} with unparseable response: {}",
-                            status,
-                            tokscale_core::pricing::describe_error(&err)
-                        )),
-                        details: None,
-                    });
+                serde_json::from_slice(&resp.body).unwrap_or_else(|err| SubmitResponse {
+                    submission_id: None,
+                    username: None,
+                    metrics: None,
+                    warnings: None,
+                    // Same reason as the transport arm below: reqwest's
+                    // Display for a decode failure is the bare "error
+                    // decoding response body", and the serde cause naming
+                    // the offending field is only reachable via `source()`.
+                    error: Some(format!(
+                        "Server returned {} with unparseable response: {}",
+                        status,
+                        tokscale_core::pricing::describe_error(&err)
+                    )),
+                    details: None,
+                });
 
             if !status.is_success() {
                 let error = body
@@ -7579,6 +7866,7 @@ fn post_submission(
                     println!();
                 }
             }
+            Ok(quota_stored)
         }
         Err(err) => {
             // `err` alone renders every transport failure as the same
@@ -7596,8 +7884,6 @@ fn post_submission(
             std::process::exit(1);
         }
     }
-
-    Ok(())
 }
 
 fn spawn_warm_tui_cache_detached() {
@@ -7775,14 +8061,14 @@ fn run_warm_tui_cache() -> Result<()> {
 
 fn run_cursor_command(subcommand: CursorSubcommand) -> Result<()> {
     match subcommand {
-        CursorSubcommand::Login { name } => cursor::run_cursor_login(name),
+        CursorSubcommand::Login { name, paste, yes } => cursor::run_cursor_login(name, paste, yes),
         CursorSubcommand::Logout {
             name,
             all,
             purge_cache,
         } => cursor::run_cursor_logout(name, all, purge_cache),
         CursorSubcommand::Status { name } => cursor::run_cursor_status(name),
-        CursorSubcommand::Accounts { json } => cursor::run_cursor_accounts(json),
+        CursorSubcommand::Accounts { json, offline } => cursor::run_cursor_accounts(json, offline),
         CursorSubcommand::Sync { json, timeout } => cursor::run_cursor_sync(json, timeout),
         CursorSubcommand::Switch { name } => cursor::run_cursor_switch(&name),
     }
@@ -8278,6 +8564,30 @@ fn prepare_headless_args(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn usage_json_report_is_explicit_and_exclusive() {
+        use clap::Parser;
+        let cli =
+            super::Cli::try_parse_from(["tokscale", "--no-spinner", "usage", "--json-report"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(super::Commands::Usage {
+                json_report: true,
+                json: false,
+                ..
+            })
+        ));
+        assert!(super::Cli::try_parse_from([
+            "tokscale",
+            "--no-spinner",
+            "usage",
+            "--json-report",
+            "--json"
+        ])
+        .is_err());
+    }
+
     use super::*;
     use clap::Parser;
     use reqwest::StatusCode;
@@ -8619,6 +8929,7 @@ mod tests {
             time_metrics: None,
             unpriced_submission_usage: Vec::new(),
             incomplete_cost_dates: std::collections::BTreeSet::new(),
+            sessions: Vec::new(),
             recount_proofs: std::collections::BTreeMap::new(),
             source_reads: std::collections::BTreeMap::new(),
         }
@@ -9223,6 +9534,26 @@ mod tests {
     }
 
     #[test]
+    fn test_submit_quota_flags() {
+        for (args, expected) in [
+            (vec!["tokscale", "submit"], false),
+            (vec!["tokscale", "submit", "--no-quota"], true),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(
+                matches!(cli.command, Some(Commands::Submit { no_quota, .. }) if no_quota == expected)
+            );
+        }
+        for args in [
+            vec!["tokscale", "submit", "--with-quota"],
+            vec!["tokscale", "autosubmit", "run", "--with-quota"],
+            vec!["tokscale", "autosubmit", "enable", "--with-quota"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
     fn test_autosubmit_commands_parse() {
         let cli = Cli::try_parse_from([
             "tokscale",
@@ -9254,7 +9585,23 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Autosubmit {
-                subcommand: commands::autosubmit::AutosubmitSubcommand::Run { force: true }
+                subcommand: commands::autosubmit::AutosubmitSubcommand::Run {
+                    force: true,
+                    no_quota: false,
+                    ..
+                }
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["tokscale", "autosubmit", "run", "--no-quota"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Autosubmit {
+                subcommand: commands::autosubmit::AutosubmitSubcommand::Run {
+                    force: false,
+                    no_quota: true,
+                    ..
+                }
             })
         ));
 
@@ -9273,8 +9620,35 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Commands::Login {
-                token: Some(token)
+                token: Some(token),
+                api_url: None,
+                device_name: None,
             }) if token == "tt_ci_token"
+        ));
+    }
+
+    #[test]
+    fn test_login_api_url_and_device_name_options_parse() {
+        let cli = Cli::try_parse_from([
+            "tokscale",
+            "login",
+            "--token",
+            "tt_ci_token",
+            "--api-url",
+            "https://pa.example.com",
+            "--device-name",
+            "Work laptop",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Login {
+                token: Some(token),
+                api_url: Some(api_url),
+                device_name: Some(device_name),
+            }) if token == "tt_ci_token"
+                && api_url == "https://pa.example.com"
+                && device_name == "Work laptop"
         ));
     }
 
@@ -10129,6 +10503,289 @@ mod tests {
         );
     }
 
+    fn session_message(
+        session_id: &str,
+        model: &str,
+        provider: &str,
+        timestamp_ms: i64,
+        input: i64,
+    ) -> tokscale_core::UnifiedMessage {
+        let mut message = tokscale_core::UnifiedMessage::new(
+            "claude",
+            model,
+            provider,
+            session_id,
+            timestamp_ms,
+            TokenBreakdown {
+                input,
+                output: 2,
+                cache_read: 3,
+                cache_write: 4,
+                cache_write_1h: 0,
+                reasoning: 5,
+            },
+            0.1,
+        );
+        message.session_title = Some("Refactor the payment token flow".to_string());
+        message.session_context = tokscale_core::sessions::SessionContext::recorded(
+            Some("/Users/dev/work/app"),
+            Some("feature/sessions"),
+            Some("https://github.com/acme/app.git"),
+        );
+        message
+    }
+
+    fn graph_with_sessions(messages: Vec<tokscale_core::UnifiedMessage>) -> GraphResultV2 {
+        let mut graph = graph_result_with_contributions(vec![daily_contribution(
+            "2026-05-28",
+            100,
+            1.0,
+            "claude",
+            "claude-sonnet-4-5",
+        )]);
+        graph.sessions = tokscale_core::aggregate_by_session_v2(messages);
+        graph
+    }
+
+    #[test]
+    fn submit_payload_serializes_sessions_with_camel_case_keys_and_ms_timestamps() {
+        let graph = graph_with_sessions(vec![
+            session_message(
+                "s1",
+                "claude-sonnet-4-5",
+                "anthropic",
+                1_780_000_000_000,
+                10,
+            ),
+            session_message(
+                "s1",
+                "claude-sonnet-4-5",
+                "anthropic",
+                1_780_000_030_000,
+                20,
+            ),
+            session_message("s1", "claude-haiku-4-5", "", 1_780_000_090_000, 30),
+            // Neither of these is a reportable session.
+            session_message("", "claude-sonnet-4-5", "anthropic", 1_780_000_000_000, 10),
+            {
+                let mut empty = session_message("s2", "claude-sonnet-4-5", "anthropic", 1, 0);
+                empty.tokens = TokenBreakdown::default();
+                empty
+            },
+        ]);
+
+        let json = serde_json::to_value(to_ts_token_contribution_data(&graph, None, None)).unwrap();
+
+        assert_eq!(
+            json["sessions"],
+            serde_json::json!([{
+                "sessionId": "s1",
+                "client": "claude",
+                "models": [
+                    {"modelId": "claude-haiku-4-5"},
+                    {"modelId": "claude-sonnet-4-5", "providerId": "anthropic"}
+                ],
+                "firstSeen": 1_780_000_000_000_i64,
+                "lastSeen": 1_780_000_090_000_i64,
+                "tokens": {
+                    "input": 60,
+                    "output": 6,
+                    "cacheRead": 9,
+                    "cacheWrite": 12,
+                    "reasoning": 15
+                },
+                "messages": 3,
+                "gitBranch": "feature/sessions",
+                "repoUrl": "https://github.com/acme/app.git"
+            }])
+        );
+
+        let without = to_ts_token_contribution_data(&graph_with_sessions(Vec::new()), None, None);
+        assert!(without.sessions.is_none());
+        assert!(serde_json::to_value(without)
+            .unwrap()
+            .get("sessions")
+            .is_none());
+    }
+
+    #[test]
+    fn submit_payload_never_carries_a_working_directory_or_path() {
+        let graph = graph_with_sessions(vec![session_message(
+            "s1",
+            "claude-sonnet-4-5",
+            "anthropic",
+            1_780_000_000_000,
+            10,
+        )]);
+        // The fixture records a cwd; the aggregate holds it, the wire must not.
+        assert_eq!(
+            graph.sessions[0].cwd.as_deref(),
+            Some("/Users/dev/work/app")
+        );
+        let wire =
+            serde_json::to_string(&to_ts_token_contribution_data(&graph, None, None)).unwrap();
+        assert!(!wire.contains("cwd"), "{wire}");
+        assert!(!wire.contains("/Users/dev"), "{wire}");
+        assert!(!wire.contains("work/app\""), "{wire}");
+        let json: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        for session in json["sessions"].as_array().unwrap() {
+            for (key, value) in session.as_object().unwrap() {
+                if let Some(text) = value.as_str().filter(|_| key != "repoUrl") {
+                    assert!(
+                        !text.starts_with('/') && !text.contains(":\\"),
+                        "{key}: {text}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn bound_fixture(index: i64, pad: usize) -> TsSessionContribution {
+        TsSessionContribution {
+            session_id: format!("s{index}{}", "x".repeat(pad)),
+            client: "claude".to_string(),
+            models: Vec::new(),
+            first_seen: index * 1000,
+            last_seen: index * 1000,
+            tokens: TsTokenBreakdown {
+                input: 1,
+                output: 1,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            messages: 1,
+            git_branch: None,
+            repo_url: None,
+        }
+    }
+
+    #[test]
+    fn submitted_sessions_keep_only_the_newest_by_last_seen() {
+        let sessions: Vec<_> = (1..=(MAX_SUBMIT_SESSIONS as i64 + 50))
+            .map(|i| bound_fixture(i, 0))
+            .collect();
+        let kept = bound_ts_sessions(sessions, MAX_SUBMIT_SESSIONS, usize::MAX).unwrap();
+        assert_eq!(kept.len(), MAX_SUBMIT_SESSIONS);
+        assert_eq!(kept[0].last_seen, (MAX_SUBMIT_SESSIONS as i64 + 50) * 1000);
+        assert_eq!(kept.last().unwrap().last_seen, 51 * 1000);
+    }
+
+    #[test]
+    fn submitted_sessions_drop_the_oldest_until_they_fit_the_byte_budget() {
+        let sessions: Vec<_> = (1..=10).map(|i| bound_fixture(i, 100)).collect();
+        let one = serde_json::to_vec(&sessions[0]).unwrap().len();
+        // Room for three sessions plus brackets and commas, not four.
+        let budget = 2 + 3 * one + 2 + 5;
+        let kept = bound_ts_sessions(sessions.clone(), 2_000, budget).unwrap();
+        assert_eq!(kept.len(), 3);
+        assert_eq!(kept[0].last_seen, 10_000);
+        assert!(serde_json::to_vec(&kept).unwrap().len() <= budget);
+
+        // Nothing fits: sessions are omitted, not truncated mid-session.
+        assert!(bound_ts_sessions(sessions, 2_000, one).is_none());
+    }
+
+    #[test]
+    fn oversized_sessions_are_omitted_so_daily_totals_still_submit() {
+        // One session alone exceeds the budget through a huge model list.
+        let mut huge = bound_fixture(1, 0);
+        huge.models = (0..MAX_SUBMIT_SESSIONS_BYTES / 10)
+            .map(|i| TsSessionModel {
+                model_id: format!("model-{i:08}"),
+                provider_id: None,
+            })
+            .collect();
+        assert!(bound_ts_sessions(vec![huge], 2_000, MAX_SUBMIT_SESSIONS_BYTES).is_none());
+    }
+
+    #[test]
+    fn sessions_without_a_timestamp_are_not_submitted() {
+        let graph = graph_with_sessions(vec![
+            session_message("zero", "claude-sonnet-4-5", "anthropic", 0, 10),
+            session_message(
+                "real",
+                "claude-sonnet-4-5",
+                "anthropic",
+                1_780_000_000_000,
+                10,
+            ),
+        ]);
+        let json = serde_json::to_value(to_ts_token_contribution_data(&graph, None, None)).unwrap();
+        let sessions = json["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["sessionId"], "real");
+    }
+
+    #[test]
+    fn submit_payload_sessions_carry_no_conversation_content() {
+        fn keys<'a>(value: &'a serde_json::Value, found: &mut Vec<&'a str>) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    for (key, child) in object {
+                        found.push(key);
+                        keys(child, found);
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter().for_each(|item| keys(item, found)),
+                _ => {}
+            }
+        }
+
+        let graph = graph_with_sessions(vec![session_message(
+            "s1",
+            "claude-sonnet-4-5",
+            "anthropic",
+            1_780_000_000_000,
+            10,
+        )]);
+        let json = serde_json::to_value(to_ts_token_contribution_data(&graph, None, None)).unwrap();
+        let wire = json.to_string();
+        assert!(
+            !wire.contains("payment token flow"),
+            "the title must not be sent"
+        );
+
+        let mut found = Vec::new();
+        keys(&json, &mut found);
+        for forbidden in [
+            "title",
+            "sessionTitle",
+            "description",
+            "aiTitle",
+            "lastPrompt",
+            "prompt",
+            "content",
+            "token",
+            "apiKey",
+        ] {
+            assert!(
+                !found.contains(&forbidden),
+                "payload has a `{forbidden}` key"
+            );
+        }
+
+        let session = json["sessions"][0].as_object().unwrap();
+        let session_keys: std::collections::BTreeSet<&str> =
+            session.keys().map(String::as_str).collect();
+        assert_eq!(
+            session_keys,
+            [
+                "sessionId",
+                "client",
+                "models",
+                "firstSeen",
+                "lastSeen",
+                "tokens",
+                "messages",
+                "gitBranch",
+                "repoUrl",
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
     #[test]
     fn submit_payload_marks_only_incomplete_cost_days() {
         let mut graph = graph_result_with_contributions(vec![
@@ -10461,6 +11118,27 @@ mod tests {
     }
 
     #[test]
+    fn submit_scan_scope_declares_cursor_bot_family_without_expanding_selection() {
+        let clients = vec!["cursor".to_string(), "grok-bot".to_string()];
+        for full_history in [true, false] {
+            let scope = submit_scan_scope(Some(&clients), full_history, true).unwrap();
+            assert_eq!(scope.parser_versions.get("cursor"), Some(&2));
+            assert_eq!(scope.parser_versions.get("grok-bot"), Some(&1));
+            assert_eq!(scope.full_history, full_history);
+            assert_eq!(scope.parser_versions.len(), 2);
+        }
+        for selected in ["cursor", "grok-bot"] {
+            let scope = submit_scan_scope(Some(&[selected.to_string()]), true, true).unwrap();
+            assert_eq!(scope.parser_versions.len(), 1);
+            assert!(scope.parser_versions.contains_key(selected));
+        }
+        let bot = Some(vec!["grok-bot".to_string()]);
+        assert!(client_filter_includes_cursor(&bot));
+        assert!(client_filter_explicitly_requests_cursor(&bot));
+        assert_eq!(ClientFilter::GrokBot.as_filter_str(), "grok-bot");
+    }
+
+    #[test]
     fn submit_scan_scope_declares_micode_family_without_expanding_selection() {
         let clients = vec!["micode".to_string(), "micode-desktop".to_string()];
         for full_history in [true, false] {
@@ -10576,7 +11254,10 @@ mod tests {
             scope.full_history_clients,
             vec!["cursor".to_string(), "devin-cli".to_string()]
         );
-        assert_eq!(scope.parser_versions.get("cursor"), Some(&2));
+        assert_eq!(
+            scope.parser_versions.get("cursor"),
+            Some(&CURSOR_SUBMISSION_PARSER_VERSION)
+        );
         assert_eq!(scope.parser_versions.get("devin-cli"), Some(&2));
     }
 
@@ -10619,7 +11300,10 @@ mod tests {
             vec!["devin-cli".to_string(), "droid".to_string()]
         );
         // Identity stays declared; only Cursor's completeness authority is gone.
-        assert_eq!(scope.parser_versions.get("cursor"), Some(&2));
+        assert_eq!(
+            scope.parser_versions.get("cursor"),
+            Some(&CURSOR_SUBMISSION_PARSER_VERSION)
+        );
     }
 
     /// Generation 2 lowers both recounting clients: Devin CLI collapses
@@ -10631,7 +11315,10 @@ mod tests {
         let clients = vec!["cursor".to_string(), "devin-cli".to_string()];
         let scope = submit_scan_scope(Some(&clients), true, true).expect("recount scope");
 
-        assert_eq!(scope.parser_versions.get("cursor"), Some(&2));
+        assert_eq!(
+            scope.parser_versions.get("cursor"),
+            Some(&CURSOR_SUBMISSION_PARSER_VERSION)
+        );
         assert_eq!(scope.parser_versions.get("devin-cli"), Some(&2));
         // The desktop surface parses an unrelated ACP stream and is unaffected
         // by the CLI request_id dedup; it keeps the default generation.
@@ -11274,6 +11961,30 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|error| error.contains("runtime unavailable")));
+    }
+
+    #[test]
+    fn cursor_sync_failure_without_cache_points_to_explicit_sync() {
+        let failed = cursor::SyncCursorResult {
+            synced: false,
+            rows: 0,
+            error: Some("request timed out".to_string()),
+        };
+        let warning = cursor_sync_warning(Some(&failed), false).unwrap();
+        assert!(warning.contains("request timed out"), "{warning}");
+        assert!(warning.contains("tokscale cursor sync"), "{warning}");
+
+        let warning = cursor_sync_warning(Some(&failed), true).unwrap();
+        assert!(warning.contains("using cached data"), "{warning}");
+        assert!(!warning.contains("tokscale cursor sync"), "{warning}");
+
+        let ok = cursor::SyncCursorResult {
+            synced: true,
+            rows: 1,
+            error: None,
+        };
+        assert!(cursor_sync_warning(Some(&ok), false).is_none());
+        assert!(cursor_sync_warning(None, false).is_none());
     }
 
     #[test]

@@ -307,6 +307,15 @@ impl ClientDef {
     }
 }
 
+/// Where `cursor.rs` writes the Cursor API cache. Not `PathRoot::Config`:
+/// without an override the cache has always lived at
+/// `~/.config/tokscale/cursor-cache` on every platform, and following
+/// `XDG_CONFIG_HOME` or `%APPDATA%` would hide existing caches.
+const CURSOR_CACHE_ROOT: PathRoot = PathRoot::EnvVar {
+    var: "TOKSCALE_CONFIG_DIR",
+    fallback_relative: ".config/tokscale",
+};
+
 macro_rules! define_clients {
     ( $( $variant:ident = $index:expr => { id: $id:expr, display: $display:expr, logo: $logo:expr, root: $root:expr, relative: $rel:expr, pattern: $pat:expr, headless: $hl:expr, parse_local: $pl:expr, submit_default: $sd:expr } ),+ $(,)? ) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -430,8 +439,8 @@ define_clients!(
     Cursor = 3 => {
         id: "cursor",
         display: "Cursor IDE",
-        logo: Some("https://tokscale.ai/assets/logos/cursor.jpg"),root: PathRoot::Home,
-        relative: ".config/tokscale/cursor-cache",
+        logo: Some("https://tokscale.ai/assets/logos/cursor.jpg"),root: CURSOR_CACHE_ROOT,
+        relative: "cursor-cache",
         pattern: "usage*.json|usage*.csv",
         headless: false,
         parse_local: false,
@@ -1125,7 +1134,19 @@ define_clients!(
         parse_local: true,
         submit_default: true
     },
-    Proma = 58 => {
+    // Attribution surface sharing Cursor's cache, not a second physical source.
+    GrokBot = 58 => {
+        id: "grok-bot",
+        display: "Grok Bot",
+        logo: None,
+        root: CURSOR_CACHE_ROOT,
+        relative: "cursor-cache",
+        pattern: "usage*.json|usage*.csv",
+        headless: false,
+        parse_local: false,
+        submit_default: true
+    },
+    Proma = 59 => {
         id: "proma",
         display: "Proma",
         logo: Some("https://raw.githubusercontent.com/proma-ai/Proma/86d9dfb511db4c1e3ffded3b6c3e312996f50cbf/apps/electron/resources/icon.png"),
@@ -1250,7 +1271,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 59);
+        assert_eq!(ClientId::COUNT, 60);
     }
 
     #[test]
@@ -2117,6 +2138,33 @@ mod tests {
         );
 
         restore_env("TOKSCALE_CONFIG_DIR", previous_override);
+    }
+
+    #[test]
+    #[serial]
+    fn test_cursor_cache_root_follows_override_but_keeps_home_default() {
+        let mut env = EnvGuard::capture(&["TOKSCALE_CONFIG_DIR"]);
+        let home = std::path::Path::new("/tmp/home");
+        let home_default = native_join(home, ".config/tokscale/cursor-cache");
+        for client in [ClientId::Cursor, ClientId::GrokBot] {
+            env.remove("TOKSCALE_CONFIG_DIR");
+            assert_eq!(client.data().resolve_path("/tmp/home"), home_default);
+
+            env.set("TOKSCALE_CONFIG_DIR", "/tmp/custom-config-root");
+            assert_eq!(
+                client.data().resolve_path("/tmp/home"),
+                native_join(
+                    std::path::Path::new("/tmp/custom-config-root"),
+                    "cursor-cache"
+                )
+            );
+            assert_eq!(
+                client
+                    .data()
+                    .resolve_path_with_env_strategy("/tmp/home", false),
+                home_default
+            );
+        }
     }
 
     #[test]

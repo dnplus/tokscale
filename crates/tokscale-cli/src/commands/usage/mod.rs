@@ -4,6 +4,7 @@ mod amp;
 mod antigravity;
 mod claude;
 pub mod codex;
+mod colab;
 mod copilot;
 mod cursor;
 mod grok;
@@ -240,7 +241,7 @@ impl UsageFetchDiagnostic {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct UsageFetchReport {
     pub outputs: Vec<UsageOutput>,
     pub diagnostics: Vec<UsageFetchDiagnostic>,
@@ -322,6 +323,7 @@ impl UsageOutput {
 
 // ── Cache ──
 
+const USAGE_CACHE_MAX_AGE_SECONDS: u64 = 300;
 const SUBSCRIPTION_CACHE_FILE: &str = "subscription-usage-cache.json";
 
 fn cache_path_in(dir: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -372,7 +374,7 @@ pub fn clear_cache() {
     }
 }
 
-fn load_cache_at(path: &std::path::Path) -> Option<Vec<UsageOutput>> {
+fn load_startup_cache_at(path: &std::path::Path) -> Option<Vec<UsageOutput>> {
     let content = std::fs::read_to_string(path).ok()?;
     let doc: serde_json::Value = serde_json::from_str(&content).ok()?;
     let timestamp = doc.get("timestamp")?.as_u64()?;
@@ -382,13 +384,17 @@ fn load_cache_at(path: &std::path::Path) -> Option<Vec<UsageOutput>> {
         .as_secs()
         .saturating_sub(timestamp);
     // Cache expires after 5 minutes
-    if age > 300 {
+    if age > USAGE_CACHE_MAX_AGE_SECONDS {
         return None;
     }
     let mut outputs: Vec<UsageOutput> = serde_json::from_value(doc.get("data")?.clone()).ok()?;
-    // Shared cards do not prove which Claude token supplied the observation.
-    // Rehydrate Claude only from its current-token state, including its time.
-    outputs.retain(|output| provider_id_for_label(&output.provider) != Some("claude"));
+    // Warp freshness comes from its own aggregate cache and must not be renewed
+    // by subscription recaching. Shared cards do not prove which Claude token
+    // supplied the observation; rehydrate Claude only from its current-token
+    // state, including its time.
+    outputs.retain(|output| {
+        output.provider != "Warp/Oz" && provider_id_for_label(&output.provider) != Some("claude")
+    });
     Some(outputs)
 }
 
@@ -396,7 +402,7 @@ fn load_cache_at(path: &std::path::Path) -> Option<Vec<UsageOutput>> {
 pub fn load_cache() -> Option<Vec<UsageOutput>> {
     // Constructors may call this on the UI thread. Credential-scoped Claude
     // data is loaded only by the existing background Usage fetcher.
-    load_cache_at(&cache_path()?)
+    load_startup_cache_at(&cache_path()?)
         .map(|outputs| filter_disabled_outputs(outputs, &disabled_provider_ids()))
 }
 
@@ -406,26 +412,19 @@ pub fn load_cache() -> Option<Vec<UsageOutput>> {
 enum Fetch {
     Single(fn() -> Result<UsageOutput>),
     Multi(fn() -> Result<Vec<UsageOutput>>),
-    Report(fn() -> UsageFetchReport),
+    Report(fn() -> Result<UsageFetchReport>),
 }
 
 impl Fetch {
-    #[cfg(test)]
-    fn call(self) -> Result<Vec<UsageOutput>> {
-        match self {
-            Fetch::Single(fetch) => fetch().map(|output| vec![output]),
-            Fetch::Multi(fetch) => fetch(),
-            Fetch::Report(_) => anyhow::bail!("report providers require call_report"),
-        }
-    }
-
-    fn call_report(self, provider: &'static str) -> UsageFetchReport {
+    fn call(self, provider: &'static str) -> UsageFetchReport {
         match self {
             Fetch::Single(fetch) => {
                 fetch_provider_report(provider, fetch().map(|output| vec![output]))
             }
             Fetch::Multi(fetch) => fetch_provider_report(provider, fetch()),
-            Fetch::Report(fetch) => fetch(),
+            Fetch::Report(fetch) => {
+                fetch().unwrap_or_else(|error| UsageFetchReport::from_error(provider, None, error))
+            }
         }
     }
 }
@@ -438,9 +437,15 @@ fn usage_providers(codex_fetch: Fetch) -> Vec<UsageProvider> {
             "claude",
             "Claude",
             claude::has_credentials,
-            Fetch::Report(claude::fetch_report),
+            Fetch::Report(|| Ok(claude::fetch_report())),
         ),
         ("codex", "Codex", codex::has_credentials, codex_fetch),
+        (
+            "colab",
+            "Colab",
+            colab::has_credentials,
+            Fetch::Single(colab::fetch),
+        ),
         (
             "zai",
             "Z.ai",
@@ -477,13 +482,15 @@ fn usage_providers(codex_fetch: Fetch) -> Vec<UsageProvider> {
             "grok-bot",
             "Grok Bot",
             cursor::has_grok_bot_credentials,
-            Fetch::Multi(cursor::fetch_grok_bot),
+            // One card per Cursor account signed into Grok Bot.app when the
+            // local sand-secrets store decrypts; otherwise Cursor desktop auth.
+            Fetch::Report(cursor::fetch_grok_bot_report),
         ),
         (
             "grok",
             "Grok",
             grok::has_credentials,
-            Fetch::Single(grok::fetch),
+            Fetch::Report(grok::fetch),
         ),
         (
             "kimi",
@@ -507,7 +514,7 @@ fn usage_providers(codex_fetch: Fetch) -> Vec<UsageProvider> {
             "warp",
             "Warp/Oz",
             warp::has_credentials,
-            Fetch::Single(warp::fetch),
+            Fetch::Report(warp::fetch),
         ),
         (
             "sakana",
@@ -644,7 +651,7 @@ fn fetch_all_report_from_providers(
                 let handle = if provider == "Codex" {
                     scope.spawn(codex_fetch)
                 } else {
-                    scope.spawn(move || fetch.call_report(provider))
+                    scope.spawn(move || fetch.call(provider))
                 };
                 (provider, handle)
             })
@@ -755,6 +762,14 @@ fn render_light(output: &UsageOutput) {
     println!("╰{}╯", "─".repeat(CARD_WIDTH));
 }
 
+fn serialize_usage_json(report: &UsageFetchReport, detailed: bool) -> Result<String> {
+    if detailed {
+        Ok(serde_json::to_string_pretty(report)?)
+    } else {
+        Ok(serde_json::to_string_pretty(&report.outputs)?)
+    }
+}
+
 fn diagnostic_disposition(
     report: &UsageFetchReport,
     diagnostic: &UsageFetchDiagnostic,
@@ -777,7 +792,7 @@ fn diagnostic_disposition(
     }
 }
 
-pub fn run(json: bool, _light: bool, debug: bool) -> Result<()> {
+pub fn run(json: bool, json_report: bool, _light: bool, debug: bool) -> Result<()> {
     if debug {
         // Log to stderr so `--json` stdout stays pure JSON for downstream
         // consumers (see the note in the json branch below).
@@ -786,27 +801,28 @@ pub fn run(json: bool, _light: bool, debug: bool) -> Result<()> {
             .with_writer(std::io::stderr)
             .try_init();
     }
-    let report = fetch_all_report_with_intent(UsageFetchIntent::CliReadOnly);
-    if json {
+    if json || json_report {
         // Keep stdout pure JSON: do NOT emit provider warnings here, since they
         // would corrupt downstream `--json` consumers that read stderr too.
-        println!("{}", serde_json::to_string_pretty(&report.outputs)?);
-    } else {
-        for o in &report.outputs {
-            render_light(o);
-        }
-        // Surface active-but-failed providers (e.g. an expired session cookie)
-        // so they don't silently vanish from the output. One concise line per
-        // failing provider, on stderr to keep stdout clean.
-        for diagnostic in &report.diagnostics {
-            let disposition = diagnostic_disposition(&report, diagnostic);
-            eprintln!(
-                "{}: {} — {}",
-                diagnostic.display_name(),
-                diagnostic.message,
-                disposition
-            );
-        }
+        let report = fetch_all_report_with_intent(UsageFetchIntent::CliReadOnly);
+        println!("{}", serialize_usage_json(&report, json_report)?);
+        return Ok(());
+    }
+    let report = fetch_all_report_with_intent(UsageFetchIntent::CliReadOnly);
+    for o in &report.outputs {
+        render_light(o);
+    }
+    // Surface active-but-failed providers (e.g. an expired session cookie)
+    // so they don't silently vanish from the output. One concise line per
+    // failing provider, on stderr to keep stdout clean.
+    for diagnostic in &report.diagnostics {
+        let disposition = diagnostic_disposition(&report, diagnostic);
+        eprintln!(
+            "{}: {} — {}",
+            diagnostic.display_name(),
+            diagnostic.message,
+            disposition
+        );
     }
     Ok(())
 }
@@ -862,11 +878,67 @@ mod tests {
     }
 
     #[test]
+    fn report_provider_preserves_partial_failures_in_detailed_json() {
+        let report = fetch_all_report_from_providers(
+            vec![(
+                "copilot",
+                "Copilot",
+                || true,
+                Fetch::Report(|| Ok(copilot_report_fetch())),
+            )],
+            &std::collections::HashSet::new(),
+            empty_codex_fetch,
+        );
+        let detailed: serde_json::Value =
+            serde_json::from_str(&serialize_usage_json(&report, true).unwrap()).unwrap();
+        assert_eq!(detailed["outputs"].as_array().unwrap().len(), 1);
+        assert_eq!(detailed["diagnostics"][0]["message"], "stale diagnostic");
+        let legacy: serde_json::Value =
+            serde_json::from_str(&serialize_usage_json(&report, false).unwrap()).unwrap();
+        assert!(legacy.is_array());
+        assert_eq!(legacy, detailed["outputs"]);
+    }
+
+    #[test]
+    fn no_credentials_is_distinct_from_a_failed_report() {
+        let fetch = Fetch::Report(|| Err(anyhow::anyhow!("HTTP 401")));
+        let absent = fetch_all_report_from_providers(
+            vec![("grok-bot", "Grok Bot", || false, fetch)],
+            &std::collections::HashSet::new(),
+            empty_codex_fetch,
+        );
+        assert!(absent.outputs.is_empty());
+        assert!(absent.diagnostics.is_empty());
+        let failed = fetch_all_report_from_providers(
+            vec![("grok-bot", "Grok Bot", || true, fetch)],
+            &std::collections::HashSet::new(),
+            empty_codex_fetch,
+        );
+        assert!(failed.outputs.is_empty());
+        assert_eq!(failed.diagnostics.len(), 1);
+        assert_eq!(failed.diagnostics[0].message, "HTTP 401");
+    }
+
+    #[test]
     fn subscription_cache_public_helpers_are_noop_in_tests() {
         assert!(cache_path().is_none());
         save_cache(&[sample_output("Codex")]);
         assert!(load_cache().is_none());
         clear_cache();
+    }
+
+    #[test]
+    fn warp_freshness_cannot_be_renewed_by_subscription_recaching() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("subscription.json");
+        for _ in 0..2 {
+            save_cache_at(&path, &[sample_output("Warp/Oz"), sample_output("Codex")]);
+            let cached = load_startup_cache_at(&path).unwrap();
+            assert_eq!(cached.len(), 1);
+            assert_eq!(cached[0].provider, "Codex");
+        }
+        save_cache_at(&path, &[sample_output("Codex")]);
+        assert_eq!(load_startup_cache_at(&path).unwrap()[0].provider, "Codex");
     }
 
     #[test]
@@ -880,7 +952,7 @@ mod tests {
             temp.path().join("cache/subscription-usage-cache.json")
         );
         save_cache_at(&expected, &data);
-        assert_eq!(load_cache_at(&expected).unwrap().len(), 1);
+        assert_eq!(load_startup_cache_at(&expected).unwrap().len(), 1);
         assert!(expected.exists());
         clear_cache_at(&expected);
         assert!(!expected.exists());
@@ -891,7 +963,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let path = cache_path_in(temp.path()).unwrap();
         save_cache_at(&path, &[sample_output("Claude"), sample_output("Codex")]);
-        let cached = load_cache_at(&path).unwrap();
+        let cached = load_startup_cache_at(&path).unwrap();
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].provider, "Codex");
     }
@@ -909,7 +981,7 @@ mod tests {
             stale: false,
         });
         save_cache_at(&path, &[current, sample_output("Codex")]);
-        let outputs = load_cache_at(&path).unwrap();
+        let outputs = load_startup_cache_at(&path).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].provider, "Codex");
     }
@@ -921,7 +993,7 @@ mod tests {
                 "copilot",
                 "Copilot",
                 || true,
-                Fetch::Report(copilot_report_fetch),
+                Fetch::Report(|| Ok(copilot_report_fetch())),
             )],
             &Default::default(),
             empty_codex_fetch,
@@ -1027,6 +1099,55 @@ mod tests {
 
         assert_eq!(report.outputs.len(), 1);
         assert_eq!(*counters().lock().unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn colab_registry_and_disabled_cache() {
+        assert_eq!(provider_id_for_label("Colab"), Some("colab"));
+        let disabled = std::collections::HashSet::from(["colab".to_string()]);
+        assert!(filter_disabled_outputs(vec![sample_output("Colab")], &disabled).is_empty());
+    }
+
+    #[test]
+    fn disabled_grok_filters_legacy_and_current_labels_only() {
+        let disabled = std::collections::HashSet::from(["grok".to_string()]);
+        let outputs = filter_disabled_outputs(
+            vec![
+                sample_output("Grok Build"),
+                sample_output("Grok"),
+                sample_output("Grok Bot"),
+                sample_output("Codex"),
+            ],
+            &disabled,
+        );
+        let labels = outputs
+            .iter()
+            .map(|output| output.provider.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["Grok Bot", "Codex"]);
+        assert_eq!(provider_id_for_label("Grok Build"), Some("grok"));
+        assert_eq!(provider_id_for_label("Grok"), Some("grok"));
+        assert_eq!(provider_id_for_label("Grok Other"), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn disabled_grok_skips_credential_probe_and_fetch() {
+        *counters().lock().unwrap() = (0, 0);
+        let disabled = std::collections::HashSet::from(["grok".to_string()]);
+        let report = fetch_all_report_from_providers(
+            vec![(
+                "grok",
+                "Grok",
+                counted_has_credentials,
+                Fetch::Single(counted_fetch),
+            )],
+            &disabled,
+            empty_codex_fetch,
+        );
+        assert!(report.outputs.is_empty());
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(*counters().lock().unwrap(), (0, 0));
     }
 
     #[test]

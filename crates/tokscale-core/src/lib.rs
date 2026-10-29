@@ -636,6 +636,14 @@ pub struct SessionContributionV2 {
     pub first_seen: i64,
     /// Latest message timestamp (unix seconds) in the session.
     pub last_seen: i64,
+    /// Each context field is the one recorded by the latest message that
+    /// recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_url: Option<String>,
 }
 
 /// Year totals with cost provenance; opt in from [`YearSummary`].
@@ -714,6 +722,9 @@ pub struct GraphResultV2 {
     /// not part of local report aggregation or exported historical reports.
     #[serde(skip)]
     pub incomplete_cost_dates: BTreeSet<String>,
+    /// Per-session aggregates, filled only for submission graphs.
+    #[serde(skip)]
+    pub sessions: Vec<SessionContributionV2>,
     /// Per-client evidence of what the previous parser generation counted on
     /// top of this snapshot, computed from the same bytes. Submission-only
     /// protocol metadata; see [`ClientRecountProof`].
@@ -3603,7 +3614,12 @@ fn parse_all_messages_streaming<S: MessageSink>(
     // file, and matches a legacy id-less row to an identified event by parsed
     // (session, model, timestamp). Keep the raw keyed rows in the source cache
     // so cold and warm scans can build the same proof from the same messages.
-    if include_synthetic || clients.iter().any(|client| client == "cursor") {
+    // Grok Bot rows are classified from the same Cursor caches.
+    if include_synthetic
+        || clients
+            .iter()
+            .any(|client| client == "cursor" || client == "grok-bot")
+    {
         let cursor_paths = scan_result.get(ClientId::Cursor);
         // Readability comes from the lane's own parse. A warm cache hit serves
         // the rows of an unchanged file, so no history is missing there; only a
@@ -3632,18 +3648,21 @@ fn parse_all_messages_streaming<S: MessageSink>(
             .iter()
             .filter(|(_, unreadable)| *unreadable)
             .count();
-        source_reads.insert(
-            ClientId::Cursor.as_str().to_string(),
-            SourceReadSummary {
-                discovered: cursor_paths.len(),
-                unreadable,
-            },
-        );
+        let cursor_reads = SourceReadSummary {
+            discovered: cursor_paths.len(),
+            unreadable,
+        };
+        source_reads.insert(ClientId::Cursor.as_str().to_string(), cursor_reads);
+        // Grok Bot history is read from the same caches.
+        source_reads.insert(ClientId::GrokBot.as_str().to_string(), cursor_reads);
 
         let mut cursor_proof = RecountProofBuilder::default();
         for (outcome, _) in cursor_outcomes {
             let keep = sessions::cursor::cursor_event_snapshot_keep_mask(&outcome.messages);
             for (message, kept) in outcome.messages.into_iter().zip(keep) {
+                // The proof covers every row of the Cursor caches, Grok Bot
+                // included: receivers credit Cursor and Grok Bot as one Cursor
+                // ledger, and un-split history stored them together.
                 if let Some((date, model_id)) = flushed_message_identity(&message, &flush_context) {
                     if kept {
                         cursor_proof.record_kept(&date, &model_id, &message);
@@ -6108,6 +6127,8 @@ struct GraphSink<'a> {
     requirement: GraphPricingRequirement,
     buffer: Vec<(UnifiedMessage, Option<EstimateSource>)>,
     daily: aggregator::DailyFoldV2,
+    /// Only submission builds the per-session aggregate; other reports skip its cost.
+    sessions: Option<aggregator::SessionFoldV2>,
     interner: sessionize::SpanInterner,
     spans: Vec<sessionize::SessionSpan>,
     /// Merged across batches by (provider, model); counts and tokens add.
@@ -6132,6 +6153,8 @@ impl<'a> GraphSink<'a> {
             requirement,
             buffer: Vec::new(),
             daily: aggregator::DailyFoldV2::default(),
+            sessions: matches!(requirement, GraphPricingRequirement::Submission)
+                .then(aggregator::SessionFoldV2::default),
             interner: sessionize::SpanInterner::default(),
             spans: Vec::new(),
             unpriced_usage: HashMap::new(),
@@ -6198,6 +6221,9 @@ impl<'a> GraphSink<'a> {
         for (message, estimate_source) in &batch {
             self.daily
                 .add_with_estimate_source(message, *estimate_source);
+            if let Some(sessions) = self.sessions.as_mut() {
+                sessions.add(message);
+            }
             if message.timestamp > 0 {
                 self.spans.push(sessionize::SessionSpan::from_message(
                     message,
@@ -6259,6 +6285,10 @@ impl<'a> GraphSink<'a> {
         result.time_metrics = Some(time_metrics);
         result.unpriced_submission_usage = unpriced_submission_usage;
         result.incomplete_cost_dates = self.incomplete_cost_dates;
+        result.sessions = self
+            .sessions
+            .map(aggregator::SessionFoldV2::finish)
+            .unwrap_or_default();
 
         for contribution in &mut result.contributions {
             if let Some(&ms) = daily_active_time.get(&contribution.date) {
@@ -8755,6 +8785,7 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
         pricing_model_id: msg.pricing_model_id.clone(),
         estimate_status: msg.estimate_status,
         copilot_context: None,
+        session_context: Default::default(),
         machine_label: None,
     }
 }
@@ -12938,6 +12969,62 @@ mod tests {
         assert_eq!(entry.corrected.messages, 2);
     }
 
+    /// Receivers credit Cursor and Grok Bot as one Cursor ledger, and un-split
+    /// history stored bot rows as Cursor, so the Cursor proof must describe
+    /// the duplicates of rows classified as Grok Bot too.
+    #[test]
+    fn cursor_recount_proof_covers_rows_classified_as_grok_bot() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cursor_cache_dir = source_home.path().join(".config/tokscale/cursor-cache");
+        std::fs::create_dir_all(&cursor_cache_dir).unwrap();
+        let bot = "11111111-1234-1234-1234-123456789abc";
+        let row = |conversation: &str, model: &str, event: &str, input: i64| {
+            serde_json::json!({
+                "timestamp": "1792841120156",
+                "model": model,
+                "usageEventId": event,
+                "tokenUsage": { "inputTokens": input },
+                "conversationId": conversation,
+            })
+        };
+        let json = serde_json::json!({
+            "usageEventsDisplay": [
+                row(bot, "grok-bot-default", "bot-event", 10),
+                row(bot, "grok-bot-default", "bot-event", 30),
+                row("cursor-conversation", "gpt-5", "cursor-event", 5),
+            ]
+        });
+        std::fs::write(
+            cursor_cache_dir.join("usage.json"),
+            serde_json::to_vec(&json).unwrap(),
+        )
+        .unwrap();
+
+        let mut messages = Vec::new();
+        let outcome = super::parse_all_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &["cursor".to_string(), "grok-bot".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            SourceCachePolicy::InMemory,
+            &mut messages,
+        );
+
+        let bot_rows: Vec<_> = messages.iter().filter(|m| m.client == "grok-bot").collect();
+        assert_eq!(bot_rows.len(), 1, "one surviving bot snapshot");
+        let proof = &outcome.recount_proofs["cursor"][&bot_rows[0].date];
+        let bot_entry = &proof["grok-bot-default"];
+        assert_eq!(bot_entry.previous.messages, 2);
+        assert_eq!(bot_entry.corrected.messages, 1);
+        assert_eq!(
+            bot_entry.previous.tokens.input, 40,
+            "the previous side counts every bot snapshot"
+        );
+        assert_eq!(proof["gpt-5"].previous.messages, 1);
+        assert!(!outcome.recount_proofs.contains_key("grok-bot"));
+    }
+
     #[test]
     fn cursor_snapshot_winner_uses_raw_cost_before_local_pricing() {
         let source_home = tempfile::TempDir::new().unwrap();
@@ -13124,6 +13211,88 @@ mod tests {
         assert_eq!(messages[0].model_id, "Composer 1.5");
         assert!(messages[0].cost > 0.0);
         assert!(!messages[0].has_authoritative_cost());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_grok_bot_shared_cursor_source_filters_and_cache_parity() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let cursor_dir = source_home.path().join(".config/tokscale/cursor-cache");
+        std::fs::create_dir_all(&cursor_dir).unwrap();
+        let bot = "12345678-1234-1234-1234-123456789abc";
+        let rows: Vec<_> = [
+            (bot, "claude-sonnet-4"),
+            (bot, "grok-bot-default"),
+            (
+                "sand-subagent-22222222-1234-1234-1234-123456789abc",
+                "gpt-5",
+            ),
+            ("33333333-1234-1234-1234-123456789abc", "grok-4"),
+        ]
+        .into_iter()
+        .map(|(id, model)| {
+            serde_json::json!({
+                "conversationId": id, "model": model,
+                "timestamp": if model == "grok-bot-default" { 1769800000000_i64 } else { 1770000000000_i64 },
+                "tokenUsage": {"inputTokens": 10, "outputTokens": 2, "totalCents": 25}
+            })
+        })
+        .collect();
+        std::fs::write(
+            cursor_dir.join("usage.json"),
+            serde_json::json!({"usageEventsDisplay": rows}).to_string(),
+        )
+        .unwrap();
+        // A stale CSV sibling must not cause a second source parse.
+        std::fs::write(cursor_dir.join("usage.csv"), "Date,Model\n").unwrap();
+        let _counter = sessions::cursor::register_parse_cursor_file_counter(source_home.path());
+        let home = source_home.path().to_str().unwrap();
+        let both = vec!["cursor".to_string(), "grok-bot".to_string()];
+        let cold = parse_all_messages_with_pricing(home, &both, None);
+        assert_eq!(cold.len(), 4);
+        assert_eq!(cold.iter().map(|m| m.cost).sum::<f64>(), 1.0);
+        assert_eq!(cold.iter().map(|m| m.tokens.input).sum::<i64>(), 40);
+        assert_eq!(
+            sessions::cursor::parse_cursor_file_call_count(source_home.path()),
+            1
+        );
+        let bot_only = parse_all_messages_with_pricing(home, &["grok-bot".to_string()], None);
+        let cursor_only = parse_all_messages_with_pricing(home, &["cursor".to_string()], None);
+        assert_eq!(bot_only.len(), 3);
+        assert!(bot_only
+            .iter()
+            .all(|m| m.client == "grok-bot" && m.agent.is_some() && m.parent_session_id.is_none()));
+        assert_eq!(cursor_only.len(), 1);
+        assert_eq!(cursor_only[0].model_id, "grok-4");
+        let recent = crate::parse_local_unified_messages_resolved(
+            LocalParseOptions {
+                since: Some(cursor_only[0].date.clone()),
+                ..Default::default()
+            },
+            home,
+            &["grok-bot".to_string()],
+            None,
+            SourceCachePolicy::Persistent,
+        )
+        .unwrap();
+        assert_eq!(recent.len(), 2);
+        assert!(recent.iter().all(|m| m.model_id != "grok-bot-default"));
+        assert!(
+            recent
+                .iter()
+                .any(|m| m.session_id == bot && m.client == "grok-bot"),
+            "a router anchor before the requested window must still classify later models"
+        );
+        assert_eq!(parse_all_messages_with_pricing(home, &both, None), cold);
+        assert_eq!(parse_all_messages_with_pricing(home, &[], None), cold);
+        assert_eq!(bot_only.len() + cursor_only.len(), cold.len());
+        assert_eq!(
+            sessions::cursor::parse_cursor_file_call_count(source_home.path()),
+            1,
+            "all filter variants reuse the one unfiltered physical source cache"
+        );
     }
 
     #[test]

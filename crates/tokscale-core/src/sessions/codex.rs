@@ -107,8 +107,11 @@ pub struct CodexPayload {
     /// (e.g. a VS Code "fork conversation"), which replays parent history but
     /// never emits a `task_started` for the child's own turn.
     pub thread_source: Option<String>,
-    /// Current working directory from session_meta.
+    /// Current working directory from session_meta or turn_context.
     pub cwd: Option<String>,
+    /// `session_meta` only: `{branch, repository_url, commit_hash}`. Untyped so
+    /// an unexpected shape cannot reject the rest of the line.
+    pub git: Option<Value>,
     /// Provider identity from session_meta (e.g. "openai", "azure")
     pub model_provider: Option<String>,
     /// Free-text body of an `event_msg` `user_message` payload. Used to detect
@@ -343,6 +346,10 @@ pub(crate) struct CodexParseState {
     pub session_agent: Option<String>,
     pub session_workspace_key: Option<String>,
     pub session_workspace_label: Option<String>,
+    /// Context stamped on each emitted message. Skipped because this state is
+    /// persisted positionally; the source cache stores it beside the entry.
+    #[serde(skip)]
+    pub session_context: super::SessionContext,
     pub forked_child_waiting_for_turn_context: bool,
     pub forked_child_inherited_baseline: Option<CodexTotals>,
     pub forked_child_inherited_reported_total: Option<i64>,
@@ -1471,9 +1478,24 @@ fn parse_codex_reader_with_record_limit<R: BufRead>(
                         state.session_workspace_key = workspace_key;
                         state.session_workspace_label = workspace_label;
                     }
+                    let git_field = |name: &str| {
+                        payload
+                            .git
+                            .as_ref()
+                            .and_then(|git| git.get(name))
+                            .and_then(Value::as_str)
+                    };
+                    state.session_context.update(
+                        payload.cwd.as_deref(),
+                        git_field("branch"),
+                        git_field("repository_url"),
+                    );
                 }
                 // Extract model from turn_context
                 if entry.entry_type == "turn_context" {
+                    state
+                        .session_context
+                        .update(payload.cwd.as_deref(), None, None);
                     state.current_model = payload_model.clone();
                     let turn_start_ms = parse_codex_entry_timestamp(entry.timestamp.as_deref());
                     state.current_turn_start_ms = turn_start_ms;
@@ -1791,6 +1813,7 @@ fn parse_codex_reader_with_record_limit<R: BufRead>(
                         state.session_workspace_key.clone(),
                         state.session_workspace_label.clone(),
                     );
+                    message.session_context = state.session_context.clone();
                     if let Some(timestamp_ms) = parsed_timestamp {
                         if state
                             .last_accepted_token_timestamp_ms
@@ -1857,6 +1880,7 @@ fn parse_codex_reader_with_record_limit<R: BufRead>(
                 state.session_workspace_key.clone(),
                 state.session_workspace_label.clone(),
             );
+            msg.session_context = state.session_context.clone();
             messages.push(msg);
             if used_fallback_timestamp {
                 fallback_timestamp_indices.push(messages.len() - 1);
@@ -1997,6 +2021,7 @@ fn emit_unconfirmed_usage_record(
         state.session_workspace_key.clone(),
         state.session_workspace_label.clone(),
     );
+    message.session_context = state.session_context.clone();
     state.turn_coverage.record(record.turn_id.as_deref());
     state.has_supported_usage = true;
     state.remember_settled_usage_record(record.usage);
@@ -2758,6 +2783,75 @@ mod tests {
         file.write_all(content.as_bytes()).unwrap();
         file.flush().unwrap();
         file
+    }
+
+    const CODEX_CONTEXT_ROLLOUT: &str = concat!(
+        r#"{"timestamp":"2026-05-28T10:00:00Z","type":"session_meta","payload":{"id":"thread-ctx","source":"cli","model_provider":"openai","cwd":"/Users/dev/work/app","git":{"commit_hash":"abc123","branch":"feature/sessions","repository_url":"https://user:tok@host/org/repo.git?x=1"}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-05-28T10:01:00Z","type":"turn_context","payload":{"turn_id":"t1","model":"gpt-5.5","cwd":"/Users/dev/work/app"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-05-28T10:01:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":10},"last_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":10}}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-05-28T10:02:00Z","type":"turn_context","payload":{"turn_id":"t2","model":"gpt-5.5","cwd":"/Users/dev/work/app/crates"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-05-28T10:02:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"cached_input_tokens":0,"output_tokens":15},"last_token_usage":{"input_tokens":50,"cached_input_tokens":0,"output_tokens":5}}}}"#,
+        "\n",
+    );
+
+    #[test]
+    fn codex_messages_carry_session_git_and_the_current_turn_cwd() {
+        let file = create_test_file(CODEX_CONTEXT_ROLLOUT);
+        let messages = parse_codex_file(file.path());
+
+        let context = |cwd: &str| crate::sessions::SessionContext {
+            cwd: Some(cwd.to_string()),
+            git_branch: Some("feature/sessions".to_string()),
+            repo_url: Some("https://host/org/repo.git".to_string()),
+        };
+        let contexts: Vec<_> = messages
+            .iter()
+            .map(|message| message.session_context.clone())
+            .collect();
+        assert_eq!(
+            contexts,
+            [
+                context("/Users/dev/work/app"),
+                context("/Users/dev/work/app/crates")
+            ]
+        );
+
+        let sessions = crate::aggregate_by_session_v2(messages);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].cwd.as_deref(),
+            Some("/Users/dev/work/app/crates")
+        );
+        assert_eq!(sessions[0].git_branch.as_deref(), Some("feature/sessions"));
+        assert_eq!(
+            sessions[0].repo_url.as_deref(),
+            Some("https://host/org/repo.git")
+        );
+    }
+
+    #[test]
+    fn malformed_codex_git_metadata_keeps_the_session_meta() {
+        let rollout = CODEX_CONTEXT_ROLLOUT.replacen(
+            r#""git":{"commit_hash":"abc123","branch":"feature/sessions","repository_url":"https://user:tok@host/org/repo.git?x=1"}"#,
+            r#""git":"not-an-object""#,
+            1,
+        );
+        let file = create_test_file(&rollout.replacen("openai", "azure", 1));
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 2);
+        // Both come only from this session_meta line.
+        assert_eq!(messages[0].provider_id, "azure");
+        assert_eq!(
+            messages[0].workspace_key.as_deref(),
+            Some("/Users/dev/work/app")
+        );
+        assert_eq!(messages[0].session_context.git_branch, None);
+        assert_eq!(messages[0].session_context.repo_url, None);
     }
 
     #[test]

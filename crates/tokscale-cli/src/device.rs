@@ -64,6 +64,29 @@ pub fn resolve_submit_device() -> Result<SubmitDevice> {
     })
 }
 
+/// Save `name` as this machine's device label in `device.json`, creating the
+/// device id if it does not exist yet. Scheduled runs read it from there, since
+/// they do not see `TOKSCALE_DEVICE_NAME`.
+pub fn store_device_name(name: &str) -> Result<()> {
+    let name = validate_device_name(name)?;
+    let path = device_file_path();
+    let stored = if path.exists() {
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let mut stored: StoredDevice = serde_json::from_str(&content)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        stored.name = Some(name);
+        stored
+    } else {
+        StoredDevice {
+            id: format!("dev_{}", Uuid::new_v4().simple()),
+            name: Some(name),
+            created_at: Utc::now().to_rfc3339(),
+        }
+    };
+    write_stored_device(&path, &stored)
+}
+
 fn env_value(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -99,7 +122,7 @@ fn validate_device_id(id: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
-fn validate_device_name(name: &str) -> Result<String> {
+pub(crate) fn validate_device_name(name: &str) -> Result<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err(anyhow!("{} must not be empty", DEVICE_NAME_ENV));
@@ -219,5 +242,47 @@ mod tests {
         assert!(first.id.starts_with("dev_"));
         assert_eq!(first, second);
         assert!(dir.path().join("device.json").exists());
+    }
+
+    #[test]
+    #[serial]
+    fn stored_device_name_keeps_the_id_and_labels_later_runs() {
+        let prev = save_env();
+        let _restore = EnvRestore(prev.0, prev.1, prev.2);
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            env::set_var("TOKSCALE_CONFIG_DIR", dir.path());
+            env::remove_var("TOKSCALE_DEVICE_ID");
+            env::remove_var("TOKSCALE_DEVICE_NAME");
+        }
+
+        let before = resolve_submit_device().unwrap();
+        assert_eq!(before.name, None);
+
+        store_device_name("  Work laptop  ").unwrap();
+        let after = resolve_submit_device().unwrap();
+
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.name.as_deref(), Some("Work laptop"));
+        assert!(store_device_name("   ").is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn stored_device_name_creates_a_device_when_none_exists() {
+        let prev = save_env();
+        let _restore = EnvRestore(prev.0, prev.1, prev.2);
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            env::set_var("TOKSCALE_CONFIG_DIR", dir.path());
+            env::remove_var("TOKSCALE_DEVICE_ID");
+            env::remove_var("TOKSCALE_DEVICE_NAME");
+        }
+
+        store_device_name("Desk").unwrap();
+        let device = resolve_submit_device().unwrap();
+
+        assert!(device.id.starts_with("dev_"));
+        assert_eq!(device.name.as_deref(), Some("Desk"));
     }
 }

@@ -82,6 +82,7 @@ pub const CLIENT_UI: [ClientUi; ClientId::COUNT] = [
     // letter from "misTral".
     ClientUi { hotkey: 'T' },
     ClientUi { hotkey: 'J' },
+    ClientUi { hotkey: 'Z' },
 ];
 
 pub fn display_name(client: ClientId) -> &'static str {

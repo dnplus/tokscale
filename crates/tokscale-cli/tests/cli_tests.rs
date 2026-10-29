@@ -1284,12 +1284,16 @@ fn write_fireworks_pricing_cache(base: &Path) {
     );
 }
 
+/// Saved login bound to the dead loopback server `cmd_with_home` pins
+/// `TOKSCALE_API_URL` to. A saved token is only ever sent to the origin it was
+/// saved with, so a credential without `apiUrl` (read as https://tokscale.ai)
+/// would be refused before the submit reached the code under test.
 fn write_fake_credentials(base: &Path) {
     let creds_dir = base.join(".config/tokscale");
     fs::create_dir_all(&creds_dir).unwrap();
     fs::write(
         creds_dir.join("credentials.json"),
-        r#"{"token":"fake","username":"testuser","createdAt":"2024-01-01T00:00:00Z"}"#,
+        r#"{"token":"fake","username":"testuser","createdAt":"2024-01-01T00:00:00Z","apiUrl":"http://127.0.0.1:9"}"#,
     )
     .unwrap();
 }
@@ -1657,6 +1661,48 @@ fn write_cursor_usage_cache(base: &Path) {
         r#"{"_tokscale":{"version":1,"accountId":"active-account"},"usageEventsDisplay":[]}"#,
     )
     .unwrap();
+}
+
+fn write_cursor_usage_cache_with_model(cache_dir: &Path, model: &str) {
+    fs::create_dir_all(cache_dir).unwrap();
+    fs::write(
+        cache_dir.join("usage.json"),
+        serde_json::json!({
+            "_tokscale": {"version": 1, "accountId": "active-account"},
+            "usageEventsDisplay": [{
+                "timestamp": "1788171994838",
+                "model": model,
+                "kind": "USAGE_EVENT_KIND_USAGE_BASED",
+                "chargedCents": 3,
+                "tokenUsage": {"inputTokens": 100, "outputTokens": 50, "totalCents": 3},
+                "conversationId": "b92fdbf1-36d4-4d78-bd5b-afcb939eab16"
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_cursor_cache_follows_tokscale_config_dir() {
+    let tmp = create_empty_fixture_dir();
+    let config_dir = tmp.path().join("isolated-config");
+    write_cursor_usage_cache_with_model(&config_dir.join("cursor-cache"), "override-cursor-model");
+    let home_cache = tmp.path().join(".config/tokscale/cursor-cache");
+    write_cursor_usage_cache_with_model(&home_cache, "home-cursor-model");
+
+    cmd_with_home(tmp.path())
+        .env("TOKSCALE_CONFIG_DIR", &config_dir)
+        .env("APPDATA", tmp.path().join("AppData/Roaming"))
+        .args(["models", "--json", "--client", "cursor", "--no-spinner"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("override-cursor-model"))
+        .stdout(predicate::str::contains("home-cursor-model").not());
+    assert!(
+        home_cache.join("usage.json").exists(),
+        "the default-location cache must be left in place"
+    );
 }
 
 fn write_cursor_desktop_session(base: &Path) {
@@ -3753,23 +3799,6 @@ fn test_submit_tip_recommends_only_the_client_filter() {
 /// `client_scope_tip_is_interactive_only` in main.rs is the test that flips
 /// only the mode.
 ///
-/// The home is deliberately empty of session data, and that is load-bearing.
-/// `autosubmit run` is the one submit path in this file that is not a dry run
-/// (`run_submit_command(.., dry_run = false, ..)` at the `AutosubmitRunDecision`
-/// call site), so any usage at all carries it past the `total_tokens == 0`
-/// short-circuit and into a real `POST {api}/api/submit` with
-/// `Authorization: Bearer test-token`. With `create_temp_fixture_dir` here the
-/// run reached "Submitting to server..." and issued that POST against
-/// `https://tokscale.ai`; the loopback proxies were all that kept the packet on
-/// the machine. `cmd_with_home` now also pins `TOKSCALE_API_URL` to a dead
-/// loopback port, so no test resolves the production endpoint any more — but
-/// an empty home is still what keeps *this* test off the submit path entirely.
-/// It ends the run at "No usage data found to submit." instead, which is what
-/// the last assertion pins, and the scope line and the tip gate are observable
-/// either way.
-///
-/// `prime_pricing_cache` is still needed: the pricing load runs before the
-/// usage check and ignores `TOKSCALE_PRICING_CACHE_ONLY`.
 #[test]
 fn test_autosubmit_run_omits_the_scan_scope_tip() {
     let tmp = TempDir::new().expect("failed to create temp dir");
@@ -3778,7 +3807,7 @@ fn test_autosubmit_run_omits_the_scan_scope_tip() {
 
     cmd_with_home(tmp.path())
         .env("TOKSCALE_API_TOKEN", "test-token")
-        .args(["--no-spinner", "autosubmit", "run", "--force"])
+        .args(["--no-spinner", "autosubmit", "run", "--force", "--no-quota"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Scanning local session data ("))
@@ -6912,6 +6941,39 @@ fn test_submit_orders_unpriced_warning_rows_by_token_impact() {
 /// make every local cost ungrounded; the day floor prevents a server-side
 /// decrease, but the CLI must still report the total pricing outage as failure.
 #[test]
+fn test_submit_refuses_to_send_a_saved_token_to_another_origin() {
+    let tmp = create_temp_fixture_dir_without_pricing_cache();
+    let creds_dir = tmp.path().join(".config/tokscale");
+    fs::create_dir_all(&creds_dir).unwrap();
+    // Saved for PA Cafe, while `cmd_with_home` points TOKSCALE_API_URL at a
+    // loopback server: the token must not be sent there.
+    fs::write(
+        creds_dir.join("credentials.json"),
+        r#"{"token":"tt_saved","username":"testuser","createdAt":"2024-01-01T00:00:00Z","apiUrl":"https://pa.example.com"}"#,
+    )
+    .unwrap();
+
+    let output = offline_cmd_with_home(tmp.path())
+        .args(["--no-spinner", "submit", "--client", "opencode"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Refusing to send the saved Tokscale token to http://127.0.0.1:9")
+            && stderr.contains("https://pa.example.com"),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    // Refused before scanning, so nothing about the submission was printed.
+    assert!(!stdout.contains("Data to submit"), "stdout: {stdout}");
+}
+
+#[test]
 fn test_submit_offline_without_pricing_cache_fails() {
     let tmp = create_temp_fixture_dir_without_pricing_cache();
     write_fake_credentials(tmp.path());
@@ -7937,6 +7999,613 @@ fn test_codex_compressed_session_reports_usage() {
         assert_eq!(json["totalMessages"].as_i64().unwrap(), 1);
         assert_eq!(json["entries"][0]["reasoning"].as_i64().unwrap(), 10);
     }
+}
+
+/// One request seen by an [`UploadFixture`].
+#[derive(Debug, Clone)]
+struct FixtureRequest {
+    method: String,
+    path: String,
+    authorization: Option<String>,
+}
+
+/// Loopback HTTP receiver for upload tests: one request per connection,
+/// answered by `respond(path, body) -> (status, body)`.
+struct UploadFixture {
+    url: String,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<FixtureRequest>>>,
+    stop: std::sync::mpsc::Sender<()>,
+    server: std::thread::JoinHandle<()>,
+}
+
+impl UploadFixture {
+    fn start(respond: impl Fn(&str, &[u8]) -> (u16, String) + Send + 'static) -> Self {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received = std::sync::Arc::clone(&requests);
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            while stopped.try_recv().is_err() {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                };
+                // Windows hands out accepted sockets that inherit the
+                // listener's nonblocking mode; reads would fail with WouldBlock.
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 8192];
+                let header_end = loop {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
+                let mut request_line = headers.lines().next().unwrap().split_whitespace();
+                let method = request_line.next().unwrap().to_owned();
+                let path = request_line.next().unwrap().to_owned();
+                let header = |wanted: &str| {
+                    headers.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case(wanted)
+                            .then(|| value.trim().to_owned())
+                    })
+                };
+                let length = header("content-length")
+                    .map(|value| value.parse::<usize>().unwrap())
+                    .unwrap_or(0);
+                while request.len() < header_end + length {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                received.lock().unwrap().push(FixtureRequest {
+                    method,
+                    path: path.clone(),
+                    authorization: header("authorization"),
+                });
+                let (status, body) = respond(&path, &request[header_end..]);
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        Self {
+            url,
+            requests,
+            stop,
+            server,
+        }
+    }
+
+    /// Accepts submits and quota readings, and validates tokens as `username`.
+    fn accepting(username: &'static str) -> Self {
+        Self::start(move |path, body| default_upload_response(path, body, username))
+    }
+
+    fn finish(self) -> Vec<FixtureRequest> {
+        self.stop.send(()).unwrap();
+        self.server.join().unwrap();
+        let requests = self.requests.lock().unwrap().clone();
+        requests
+    }
+}
+
+fn default_upload_response(path: &str, body: &[u8], username: &str) -> (u16, String) {
+    match path {
+        "/api/quota" => {
+            let json: serde_json::Value = serde_json::from_slice(body).unwrap();
+            assert!(json.is_array(), "quota must match usage --json");
+            (200, "{}".to_string())
+        }
+        "/api/auth/token" => (200, format!(r#"{{"user":{{"username":"{username}"}}}}"#)),
+        _ => (
+            200,
+            r#"{"submissionId":"fixture","metrics":{}}"#.to_string(),
+        ),
+    }
+}
+
+/// Uploads to `path`. The capability probe a submit sends first is a GET.
+fn count_posts(requests: &[FixtureRequest], path: &str) -> usize {
+    requests
+        .iter()
+        .filter(|request| request.method == "POST" && request.path == path)
+        .count()
+}
+
+/// A loopback URL that refuses connections on every platform.
+fn refused_url() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    url
+}
+
+/// `cmd_with_home` with the primary server pointed at `primary_url`.
+fn upload_cmd(home: &Path, primary_url: &str) -> Command {
+    let mut command = cmd_with_home(home);
+    command
+        .env("TOKSCALE_API_URL", primary_url)
+        .env("TOKSCALE_API_TOKEN", "fixture-token")
+        .env("NO_PROXY", "127.0.0.1")
+        .env("no_proxy", "127.0.0.1")
+        .arg("--no-spinner");
+    command
+}
+
+/// Saved next to `credentials.json`, which is where scheduled runs read it.
+fn write_extra_target(home: &Path, name: &str, api_url: &str, enabled: bool) {
+    let dir = home.join(".config").join("tokscale");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("targets.json");
+    let mut file: serde_json::Value = fs::read(&path)
+        .ok()
+        .map(|raw| serde_json::from_slice(&raw).unwrap())
+        .unwrap_or_else(|| serde_json::json!({ "targets": [] }));
+    file["targets"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "name": name,
+            "apiUrl": api_url,
+            "token": format!("tt_{name}_secret"),
+            "username": "pa-user",
+            "enabled": enabled,
+            "createdAt": "2026-10-17T00:00:00Z",
+        }));
+    fs::write(path, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+}
+
+fn extra_target_state(home: &Path, name: &str) -> serde_json::Value {
+    let raw = fs::read(home.join(".config/tokscale/targets-state.json")).unwrap();
+    let state: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    state["targets"][name].clone()
+}
+
+/// Exercise both command entry points against the same receiver, including
+/// quota errors after a successful usage upload.
+#[test]
+fn test_submit_and_autosubmit_share_default_quota_upload() {
+    for (automatic, no_quota, quota_status) in [
+        (false, false, 200),
+        (true, false, 200),
+        (false, true, 200),
+        (true, true, 200),
+        (false, false, 502),
+        (true, false, 502),
+    ] {
+        let tmp = create_temp_fixture_dir();
+        prime_pricing_cache_with_a_priced_model(tmp.path());
+        if automatic {
+            write_settings_json(
+                tmp.path(),
+                r#"{"autosubmit":{"enabled":true,"clients":["opencode"]}}"#,
+            );
+        }
+        let server = UploadFixture::start(move |path, body| {
+            if path == "/api/quota" && quota_status != 200 {
+                (quota_status, r#"{"error":"quota unavailable"}"#.to_string())
+            } else {
+                default_upload_response(path, body, "fixture")
+            }
+        });
+        let mut command = upload_cmd(tmp.path(), &server.url);
+        if automatic {
+            command.args(["autosubmit", "run", "--force"]);
+        } else {
+            command.args(["submit", "--client", "opencode"]);
+        }
+        if no_quota {
+            command.arg("--no-quota");
+        }
+        let output = command.output().unwrap();
+        let requests = server.finish();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Successfully submitted!"));
+        assert_eq!(count_posts(&requests, "/api/submit"), 1);
+        assert_eq!(count_posts(&requests, "/api/quota"), usize::from(!no_quota));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).contains("Warning: quota upload failed"),
+            quota_status == 502
+        );
+        if automatic {
+            let settings: serde_json::Value = serde_json::from_slice(
+                &fs::read(sandbox_config_dir(tmp.path()).join("settings.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(settings["autosubmit"]["lastRunAtMs"].is_number());
+            assert!(settings["autosubmit"]["lastError"].is_null());
+        }
+    }
+}
+
+#[test]
+fn test_target_add_validates_the_token_and_list_hides_it() {
+    let tmp = create_temp_fixture_dir();
+    let server = UploadFixture::accepting("pa-user");
+    let added = upload_cmd(tmp.path(), "http://127.0.0.1:9")
+        .args(["target", "add", "pa", "--api-url"])
+        .arg(format!("{}/", server.url))
+        .args(["--token", "tt_pa_secret"])
+        .output()
+        .unwrap();
+    let listed = upload_cmd(tmp.path(), "http://127.0.0.1:9")
+        .args(["target", "list", "--json"])
+        .output()
+        .unwrap();
+    let url = server.url.clone();
+    let requests = server.finish();
+
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/api/auth/token");
+    assert_eq!(
+        requests[0].authorization.as_deref(),
+        Some("Bearer tt_pa_secret")
+    );
+    let saved: serde_json::Value = serde_json::from_slice(
+        &fs::read(tmp.path().join(".config/tokscale/targets.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["targets"][0]["apiUrl"], url.as_str());
+    assert_eq!(saved["targets"][0]["token"], "tt_pa_secret");
+    assert_eq!(saved["targets"][0]["enabled"], true);
+
+    assert!(listed.status.success());
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(!stdout.contains("tt_pa_secret"), "{stdout}");
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed[0]["name"], "pa");
+    assert_eq!(listed[0]["username"], "pa-user");
+}
+
+#[test]
+fn test_target_add_rejects_a_token_the_server_refuses() {
+    let tmp = create_temp_fixture_dir();
+    let server = UploadFixture::start(|_, _| (401, r#"{"error":"Invalid token"}"#.to_string()));
+    let output = upload_cmd(tmp.path(), "http://127.0.0.1:9")
+        .args(["target", "add", "pa", "--api-url"])
+        .arg(&server.url)
+        .args(["--token", "tt_pa_secret"])
+        .output()
+        .unwrap();
+    server.finish();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("Invalid token"), "{stderr}");
+    assert!(!stderr.contains("tt_pa_secret"), "{stderr}");
+    assert!(!tmp.path().join(".config/tokscale/targets.json").exists());
+}
+
+/// Session metadata reaches only a receiver that advertises the sessions
+/// capability; an older receiver gets the same upload without it.
+#[test]
+fn test_submit_sends_sessions_only_to_receivers_that_advertise_them() {
+    for advertised in [true, false] {
+        let tmp = create_temp_fixture_dir();
+        prime_pricing_cache_with_a_priced_model(tmp.path());
+        let uploads = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let seen = std::sync::Arc::clone(&uploads);
+        let server = UploadFixture::start(move |path, body| {
+            if path == "/api/submit" && body.is_empty() {
+                let capabilities = if advertised {
+                    r#"{"capabilities":{"sessions":{"version":1}}}"#
+                } else {
+                    r#"{"capabilities":{}}"#
+                };
+                return (200, capabilities.to_string());
+            }
+            if path == "/api/submit" {
+                seen.lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(body).unwrap());
+            }
+            default_upload_response(path, body, "fixture")
+        });
+
+        let output = upload_cmd(tmp.path(), &server.url)
+            .args(["submit", "--client", "opencode", "--no-quota"])
+            .output()
+            .unwrap();
+        let requests = server.finish();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(count_posts(&requests, "/api/submit"), 1);
+        let uploads = uploads.lock().unwrap();
+        let sessions = uploads[0].get("sessions");
+        if advertised {
+            let sessions = sessions.and_then(|value| value.as_array()).unwrap();
+            assert!(!sessions.is_empty());
+            assert!(sessions
+                .iter()
+                .all(|session| session["client"] == "opencode" && session["firstSeen"].is_i64()));
+        } else {
+            assert!(sessions.is_none(), "{:?}", uploads[0]);
+        }
+    }
+}
+
+/// Both entry points upload the same submission, and the quota reading, to the
+/// logged-in server and to every enabled extra target, each with its own token.
+#[test]
+fn test_submit_and_autosubmit_upload_to_extra_targets() {
+    for automatic in [false, true] {
+        let tmp = create_temp_fixture_dir();
+        prime_pricing_cache_with_a_priced_model(tmp.path());
+        if automatic {
+            write_settings_json(
+                tmp.path(),
+                r#"{"autosubmit":{"enabled":true,"clients":["opencode"]}}"#,
+            );
+        }
+        let primary = UploadFixture::accepting("fixture");
+        let extra = UploadFixture::accepting("pa-user");
+        let disabled = UploadFixture::accepting("off-user");
+        write_extra_target(tmp.path(), "pa", &extra.url, true);
+        write_extra_target(tmp.path(), "off", &disabled.url, false);
+
+        let mut command = upload_cmd(tmp.path(), &primary.url);
+        if automatic {
+            command.args(["autosubmit", "run", "--force"]);
+        } else {
+            command.args(["submit", "--client", "opencode"]);
+        }
+        let output = command.output().unwrap();
+        let primary = primary.finish();
+        let extra = extra.finish();
+        let disabled = disabled.finish();
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("Submitted to extra target pa."), "{stdout}");
+        for (requests, token) in [(&primary, "fixture-token"), (&extra, "tt_pa_secret")] {
+            assert_eq!(count_posts(requests, "/api/submit"), 1);
+            assert_eq!(count_posts(requests, "/api/quota"), 1);
+            let expected = format!("Bearer {token}");
+            // The capability probe carries no token; every upload carries this target's.
+            assert!(requests
+                .iter()
+                .all(|request| match request.method.as_str() {
+                    "POST" => request.authorization.as_deref() == Some(expected.as_str()),
+                    _ => request.authorization.is_none(),
+                }));
+        }
+        assert!(disabled.is_empty(), "a disabled target must be skipped");
+        let state = extra_target_state(tmp.path(), "pa");
+        assert!(state["lastSuccessAtMs"].is_number());
+        assert!(state["lastError"].is_null());
+    }
+}
+
+/// A failing extra target is reported and recorded, while the logged-in
+/// server still receives the submission and the command succeeds.
+#[test]
+fn test_extra_target_failure_does_not_fail_the_primary_upload() {
+    for refused in [false, true] {
+        let tmp = create_temp_fixture_dir();
+        prime_pricing_cache_with_a_priced_model(tmp.path());
+        let primary = UploadFixture::accepting("fixture");
+        let failing =
+            UploadFixture::start(|_, _| (502, r#"{"error":"receiver unavailable"}"#.to_string()));
+        let extra_url = if refused {
+            refused_url()
+        } else {
+            failing.url.clone()
+        };
+        write_extra_target(tmp.path(), "pa", &extra_url, true);
+
+        let output = upload_cmd(tmp.path(), &primary.url)
+            .args(["submit", "--client", "opencode"])
+            .output()
+            .unwrap();
+        let primary = primary.finish();
+        let failing = failing.finish();
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("Successfully submitted!"), "{stdout}");
+        assert!(
+            stderr.contains("Warning: extra target pa upload failed"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("tt_pa_secret"), "{stderr}");
+        assert_eq!(count_posts(&primary, "/api/submit"), 1);
+        assert_eq!(count_posts(&primary, "/api/quota"), 1);
+        if refused {
+            assert!(failing.is_empty());
+        } else {
+            assert!(stderr.contains("receiver unavailable"), "{stderr}");
+            assert_eq!(count_posts(&failing, "/api/submit"), 1);
+            assert_eq!(count_posts(&failing, "/api/quota"), 0);
+        }
+        let state = extra_target_state(tmp.path(), "pa");
+        assert!(state["lastError"].is_string(), "{state}");
+        assert!(state["lastSuccessAtMs"].is_null());
+    }
+}
+
+/// The extra target is uploaded first, so a primary failure, which ends an
+/// interactive submit, cannot skip it.
+#[test]
+fn test_primary_failure_still_uploads_to_extra_targets() {
+    let tmp = create_temp_fixture_dir();
+    prime_pricing_cache_with_a_priced_model(tmp.path());
+    let primary = UploadFixture::start(|_, _| (500, r#"{"error":"primary down"}"#.to_string()));
+    let extra = UploadFixture::accepting("pa-user");
+    write_extra_target(tmp.path(), "pa", &extra.url, true);
+
+    let output = upload_cmd(tmp.path(), &primary.url)
+        .args(["submit", "--client", "opencode"])
+        .output()
+        .unwrap();
+    let primary = primary.finish();
+    let extra = extra.finish();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("primary down"), "{stderr}");
+    assert_eq!(count_posts(&primary, "/api/submit"), 1);
+    assert_eq!(count_posts(&extra, "/api/submit"), 1);
+    assert_eq!(count_posts(&extra, "/api/quota"), 1);
+    assert!(extra_target_state(tmp.path(), "pa")["lastSuccessAtMs"].is_number());
+}
+
+#[test]
+fn test_extra_target_flags_select_targets_per_run() {
+    // --no-extra-targets skips saved targets.
+    let tmp = create_temp_fixture_dir();
+    prime_pricing_cache_with_a_priced_model(tmp.path());
+    let primary = UploadFixture::accepting("fixture");
+    let extra = UploadFixture::accepting("pa-user");
+    write_extra_target(tmp.path(), "pa", &extra.url, true);
+    let output = upload_cmd(tmp.path(), &primary.url)
+        .args(["submit", "--client", "opencode", "--no-extra-targets"])
+        .output()
+        .unwrap();
+    let primary = primary.finish();
+    let extra = extra.finish();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(count_posts(&primary, "/api/submit"), 1);
+    assert!(extra.is_empty());
+
+    // --extra-target names a disabled target for this run only.
+    let tmp = create_temp_fixture_dir();
+    prime_pricing_cache_with_a_priced_model(tmp.path());
+    let primary = UploadFixture::accepting("fixture");
+    let extra = UploadFixture::accepting("pa-user");
+    write_extra_target(tmp.path(), "pa", &extra.url, false);
+    let output = upload_cmd(tmp.path(), &primary.url)
+        .args(["submit", "--client", "opencode", "--extra-target", "pa"])
+        .output()
+        .unwrap();
+    primary.finish();
+    let extra = extra.finish();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(count_posts(&extra, "/api/submit"), 1);
+
+    // An unknown name fails before anything is uploaded.
+    let tmp = create_temp_fixture_dir();
+    prime_pricing_cache_with_a_priced_model(tmp.path());
+    let primary = UploadFixture::accepting("fixture");
+    let output = upload_cmd(tmp.path(), &primary.url)
+        .args(["submit", "--client", "opencode", "--extra-target", "nope"])
+        .output()
+        .unwrap();
+    let primary = primary.finish();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("Unknown extra target `nope`"), "{stderr}");
+    assert!(primary.is_empty());
+}
+
+/// A corrupt `targets.json` must not stop the logged-in server from getting
+/// usage, but naming a target explicitly still fails, and status says why.
+#[test]
+fn test_unreadable_targets_file_keeps_the_primary_upload() {
+    let tmp = create_temp_fixture_dir();
+    prime_pricing_cache_with_a_priced_model(tmp.path());
+    let dir = tmp.path().join(".config/tokscale");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("targets.json"), r#"{"targets":[{"token":"tt_leak"#).unwrap();
+
+    let primary = UploadFixture::accepting("fixture");
+    let output = upload_cmd(tmp.path(), &primary.url)
+        .args(["submit", "--client", "opencode"])
+        .output()
+        .unwrap();
+    let named = upload_cmd(tmp.path(), &primary.url)
+        .args(["submit", "--client", "opencode", "--extra-target", "pa"])
+        .output()
+        .unwrap();
+    let primary = primary.finish();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Warning: skipping extra targets"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("tt_leak"), "{stderr}");
+    assert!(!named.status.success());
+    assert_eq!(count_posts(&primary, "/api/submit"), 1);
+
+    let status = upload_cmd(tmp.path(), "http://127.0.0.1:9")
+        .args(["autosubmit", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(status["extraTargetsError"].is_string(), "{status}");
+    let listed = upload_cmd(tmp.path(), "http://127.0.0.1:9")
+        .args(["target", "list"])
+        .output()
+        .unwrap();
+    assert!(!listed.status.success());
+}
+
+/// A hand-edited target URL that `target add` would refuse never receives the
+/// token.
+#[test]
+fn test_extra_target_with_an_unsafe_url_is_skipped() {
+    let tmp = create_temp_fixture_dir();
+    prime_pricing_cache_with_a_priced_model(tmp.path());
+    write_extra_target(tmp.path(), "pa", "http://pa.example.invalid", true);
+    let primary = UploadFixture::accepting("fixture");
+    let output = upload_cmd(tmp.path(), &primary.url)
+        .args(["submit", "--client", "opencode"])
+        .output()
+        .unwrap();
+    let primary = primary.finish();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("Skipping extra target pa"), "{stderr}");
+    assert!(
+        !stdout.contains("Submitting to extra target pa"),
+        "{stdout}"
+    );
+    assert_eq!(count_posts(&primary, "/api/submit"), 1);
+    assert!(!tmp
+        .path()
+        .join(".config/tokscale/targets-state.json")
+        .exists());
 }
 
 #[test]

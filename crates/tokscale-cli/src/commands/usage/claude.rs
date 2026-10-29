@@ -429,6 +429,10 @@ fn access_token(creds: &Credentials) -> Option<&str> {
         .filter(|token| !token.is_empty())
 }
 
+fn login_expired(creds: &Credentials, now: u64) -> bool {
+    expiry_ms(creds).is_some_and(|expiry| expiry <= (now as i64).saturating_mul(1000))
+}
+
 fn expiry_ms(creds: &Credentials) -> Option<i64> {
     creds
         .claude_ai_oauth
@@ -501,6 +505,7 @@ fn read_credentials() -> Result<Credentials> {
 #[derive(Debug)]
 enum FetchError {
     Limited(Option<String>),
+    Rejected(anyhow::Error),
     Other(anyhow::Error),
 }
 impl From<reqwest::Error> for FetchError {
@@ -540,7 +545,7 @@ async fn fetch_usage(
         ));
     }
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(FetchError::Other(anyhow::anyhow!("Claude usage unavailable: stored access token was rejected (HTTP {status}). Run 'claude' so Claude Code can refresh its own login, then retry.")));
+        return Err(FetchError::Rejected(anyhow::anyhow!("Claude usage unavailable: stored access token was rejected (HTTP {status}). Run 'claude' so Claude Code can refresh its own login, then retry.")));
     }
     if !status.is_success() {
         return Err(FetchError::Other(anyhow::anyhow!(
@@ -843,7 +848,21 @@ fn fetch_policy(
                 format!("HTTP 429; retry in {wait}s"),
             ))
         }
-        Err(FetchError::Other(error)) => {
+        Err(FetchError::Rejected(_)) if login_expired(&creds, now) => {
+            // An expired login is Claude Code's to refresh on its next run
+            // (#1001), so the rejection says nothing new about this token's
+            // account. Keep its last observation, labelled stale.
+            let mut report = UsageFetchReport::from_error(
+                "Claude",
+                None,
+                anyhow::anyhow!(
+                    "Claude Code login expired. Run 'claude' once so it can refresh its own login; no need to log in again."
+                ),
+            );
+            report.outputs.extend(state.last_known(now));
+            Ok(report)
+        }
+        Err(FetchError::Rejected(error) | FetchError::Other(error)) => {
             // Rejected or unavailable credentials must not remain eligible on startup.
             state.sample = None;
             state::save(&path, &mut state, now);
@@ -1194,6 +1213,85 @@ mod tests {
             );
             let path = state::path(temp.path(), &cooldown_key("stale-access-token"));
             assert!(state::load(&path, 1060).sample(1060, true).is_none());
+        }
+    }
+
+    /// 2026-08-03T10:00:00Z, two hours before `USAGE_BODY`'s session reset.
+    const IDLE_T0: u64 = 1_785_751_200;
+    const LONG_WINDOW_BODY: &str =
+        r#"{"seven_day":{"utilization":40,"resets_at":"2026-09-30T00:00:00Z"}}"#;
+
+    /// A login that was live for the successful read and expired one minute
+    /// later, as when Claude Code sits idle past its access-token lifetime.
+    fn idle_login() -> Result<Credentials> {
+        Ok(creds_with("idle-login", Some((IDLE_T0 as i64 + 60) * 1000)))
+    }
+
+    fn live_login() -> Result<Credentials> {
+        Ok(creds_with(
+            "live-login",
+            Some((IDLE_T0 as i64 + 30 * 86_400) * 1000),
+        ))
+    }
+
+    #[test]
+    fn policy_expired_login_shows_the_last_known_sample_until_it_is_outdated() {
+        const DAY: u64 = 86_400;
+        // (login, body, failure status, seconds after the read, expect a stale card)
+        let cases: [(CredentialReader, &str, u16, u64, bool); 8] = [
+            // The idle-expiry case: the same token's own observation survives.
+            (idle_login, USAGE_BODY, 401, 5_400, true),
+            (idle_login, USAGE_BODY, 403, 5_400, true),
+            // Beyond the one-hour rate-limit horizon, but within a week.
+            (idle_login, LONG_WINDOW_BODY, 401, 7 * DAY - 1, true),
+            (idle_login, LONG_WINDOW_BODY, 401, 7 * DAY + 1, false),
+            // A window past its reset no longer describes the account.
+            (idle_login, USAGE_BODY, 401, 3 * 3_600, false),
+            // A live token that is rejected was revoked, not left idle.
+            (live_login, USAGE_BODY, 401, 5_400, false),
+            (live_login, LONG_WINDOW_BODY, 403, 5_400, false),
+            // Server and transport failures keep the existing policy.
+            (idle_login, USAGE_BODY, 500, 5_400, false),
+        ];
+        for (index, (login, body, status, after, expect_card)) in cases.into_iter().enumerate() {
+            let temp = tempfile::tempdir().unwrap();
+            let (url, _) = spawn_server(move |_, n| {
+                if n == 0 {
+                    (200, body.into())
+                } else {
+                    (status, "{}".into())
+                }
+            });
+            assert_eq!(
+                fetch_report_at(&url, login, temp.path(), IDLE_T0)
+                    .outputs
+                    .len(),
+                1,
+                "case {index}: initial read"
+            );
+            let report = fetch_report_at(&url, login, temp.path(), IDLE_T0 + after);
+            assert_eq!(report.diagnostics.len(), 1, "case {index}");
+            assert_eq!(
+                report.outputs.len(),
+                usize::from(expect_card),
+                "case {index}"
+            );
+            if let Some(card) = report.outputs.first() {
+                assert_eq!(
+                    card.freshness,
+                    Some(UsageFreshness {
+                        fetched_at: IDLE_T0,
+                        stale: true
+                    }),
+                    "case {index}"
+                );
+                assert!(!card.metrics.is_empty(), "case {index}");
+                assert!(
+                    report.diagnostics[0].message.contains("Run 'claude' once"),
+                    "case {index}: {}",
+                    report.diagnostics[0].message
+                );
+            }
         }
     }
 

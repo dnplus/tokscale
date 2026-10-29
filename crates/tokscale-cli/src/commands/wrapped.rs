@@ -3032,8 +3032,17 @@ fn cursor_setup_warning_for_wrapped(
         "run `tokscale cursor login` (auto-detects Cursor desktop when signed in) and `tokscale cursor sync --json`"
     };
 
+    let cache_glob = if crate::paths::is_config_dir_overridden() {
+        crate::paths::get_config_dir()
+            .join("cursor-cache/usage*.json")
+            .to_string_lossy()
+            .to_string()
+    } else {
+        "~/.config/tokscale/cursor-cache/usage*.json".to_string()
+    };
+
     Some(format!(
-        "Cursor usage requires Tokscale's Cursor API cache at `~/.config/tokscale/cursor-cache/usage*.json`; {action}. Tokscale does not parse local `~/.cursor` session data."
+        "Cursor usage requires Tokscale's Cursor API cache at `{cache_glob}`; {action}. Tokscale does not parse local `~/.cursor` session data."
     ))
 }
 
