@@ -29,6 +29,22 @@ struct ApiData {
     plan_name: Option<String>,
 }
 
+/// Prompts used in the current interval: the explicit count, else the total
+/// less what remains. `None` when the response states neither, which is an
+/// unknown quota, not a spent one.
+fn interval_used(model: &ModelRemains, total: i64) -> Option<i64> {
+    model
+        .current_interval_used_count
+        .map(|used| used.clamp(0, total))
+        .or_else(|| {
+            // Both remaining_count and usage_count represent remaining prompts
+            model
+                .current_interval_remaining_count
+                .or(model.current_interval_usage_count)
+                .map(|remaining| (total - remaining).max(0))
+        })
+}
+
 #[derive(Debug, Deserialize)]
 struct ModelRemains {
     current_interval_total_count: Option<i64>,
@@ -199,24 +215,9 @@ pub fn fetch() -> Result<UsageOutput> {
 
             let total = model.current_interval_total_count.unwrap_or(0);
 
-            // Prefer explicit used_count, then compute from remaining
-            let used = model
-                .current_interval_used_count
-                .map(|u| u.clamp(0, total))
-                .unwrap_or_else(|| {
-                    // Both remaining_count and usage_count represent remaining prompts
-                    let remaining = model
-                        .current_interval_remaining_count
-                        .or(model.current_interval_usage_count)
-                        .unwrap_or(0);
-                    (total - remaining).max(0)
-                });
+            let used = interval_used(model, total);
 
-            let used_pct = if total > 0 {
-                (used as f64 / total as f64 * 100.0).clamp(0.0, 100.0)
-            } else {
-                0.0
-            };
+            let used_pct = used.map(|used| (used as f64 / total as f64 * 100.0).clamp(0.0, 100.0));
 
             // Reset time: prefer end_time, fallback to remains_time
             let resets_at = model.end_time.map(parse_end_time).or_else(|| {
@@ -231,13 +232,15 @@ pub fn fetch() -> Result<UsageOutput> {
                 })
             });
 
-            metrics.push(UsageMetric {
-                label: "Session".into(),
-                used_percent: used_pct,
-                remaining_percent: 100.0 - used_pct,
-                remaining_label: Some(format!("{}/{} prompts left", total - used, total)),
-                resets_at,
-            });
+            if let (Some(used), Some(used_pct)) = (used, used_pct) {
+                metrics.push(UsageMetric {
+                    label: "Session".into(),
+                    used_percent: used_pct,
+                    remaining_percent: 100.0 - used_pct,
+                    remaining_label: Some(format!("{}/{} prompts left", total - used, total)),
+                    resets_at,
+                });
+            }
 
             if plan.is_none() {
                 plan = infer_plan(total);
@@ -257,4 +260,43 @@ pub fn fetch() -> Result<UsageOutput> {
             spend_control: None,
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model(fields: serde_json::Value) -> ModelRemains {
+        serde_json::from_value(fields).unwrap()
+    }
+
+    #[test]
+    fn interval_without_a_count_is_unknown_rather_than_spent() {
+        let total = 100;
+        for (fields, expected) in [
+            (
+                serde_json::json!({"current_interval_used_count": 30}),
+                Some(30),
+            ),
+            (
+                serde_json::json!({"current_interval_remaining_count": 70}),
+                Some(30),
+            ),
+            (
+                serde_json::json!({"current_interval_usage_count": 0}),
+                Some(100),
+            ),
+            (
+                serde_json::json!({"current_interval_used_count": 500}),
+                Some(100),
+            ),
+            (serde_json::json!({}), None),
+        ] {
+            assert_eq!(
+                interval_used(&model(fields.clone()), total),
+                expected,
+                "{fields}"
+            );
+        }
+    }
 }
