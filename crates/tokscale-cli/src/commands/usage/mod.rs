@@ -10,6 +10,7 @@ mod cursor;
 mod grok;
 pub mod helpers;
 mod kimi;
+mod last_known;
 mod minimax;
 mod minimax_tokenplan;
 mod opencode_go;
@@ -603,11 +604,29 @@ pub fn fetch_all_report_with_intent(intent: UsageFetchIntent) -> UsageFetchRepor
 
 fn fetch_all_report_with_codex(codex_fetch: fn() -> UsageFetchReport) -> UsageFetchReport {
     let disabled = disabled_provider_ids();
-    fetch_all_report_from_providers(
+    let mut report = fetch_all_report_from_providers(
         usage_providers(Fetch::Multi(codex::fetch_all)),
         &disabled,
         codex_fetch,
-    )
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    last_known::apply(last_known_path().as_deref(), &mut report, now);
+    report
+}
+
+#[cfg(not(test))]
+fn last_known_path() -> Option<std::path::PathBuf> {
+    Some(crate::paths::get_cache_dir().join(last_known::FILE))
+}
+
+// As with `cache_path`, unit tests must never touch the developer's real
+// cache; they exercise `last_known::apply` with explicit paths.
+#[cfg(test)]
+fn last_known_path() -> Option<std::path::PathBuf> {
+    None
 }
 
 fn fetch_all_report_from_providers(
