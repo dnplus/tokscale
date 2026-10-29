@@ -143,15 +143,22 @@ fn parse_reset_time(val: Option<&serde_json::Value>) -> Option<String> {
     }
 }
 
-async fn fetch_quota(client: &reqwest::Client, key: &str) -> Result<QuotaResp> {
+const QUOTA_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
+const KEY_RECOVERY: &str = "Check ZAI_API_KEY or GLM_API_KEY.";
+
+async fn fetch_quota(client: &reqwest::Client, url: &str, key: &str) -> Result<QuotaResp> {
     let resp = client
-        .get("https://api.z.ai/api/monitor/usage/quota/limit")
+        .get(url)
         .header("Authorization", format!("Bearer {key}"))
         .header("Accept", "application/json")
         .send()
         .await?;
     if !resp.status().is_success() {
-        anyhow::bail!("Z.ai quota request failed (HTTP {})", resp.status());
+        return Err(super::helpers::http_failure(
+            "Z.ai quota",
+            resp.status(),
+            KEY_RECOVERY,
+        ));
     }
     Ok(resp.json().await?)
 }
@@ -251,7 +258,7 @@ pub fn fetch() -> Result<UsageOutput> {
         .build()?;
     rt.block_on(async {
         let client = super::helpers::http_client()?;
-        let quota = fetch_quota(&client, &api_key).await?;
+        let quota = fetch_quota(&client, QUOTA_URL, &api_key).await?;
         let sub = fetch_sub(&client, &api_key).await.ok();
 
         let base_plan = sub
@@ -329,6 +336,35 @@ pub fn fetch() -> Result<UsageOutput> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_failures_name_the_key_only_when_it_was_rejected() {
+        use super::super::helpers::{failure_reason, UsageFailureReason};
+        for (status, reason, names_key) in [
+            (401, UsageFailureReason::AuthRejected, true),
+            (429, UsageFailureReason::RateLimited, false),
+            (502, UsageFailureReason::Unavailable, false),
+        ] {
+            let (url, _) =
+                super::super::test_server::spawn_server(move |_, _| (status, "{}".into()));
+            let error = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(fetch_quota(
+                    &super::super::helpers::http_client().unwrap(),
+                    &url,
+                    "test-key",
+                ))
+                .unwrap_err();
+            assert_eq!(failure_reason(&error), Some(reason), "HTTP {status}");
+            assert_eq!(
+                error.to_string().contains("ZAI_API_KEY"),
+                names_key,
+                "{error}"
+            );
+        }
+    }
 
     fn limit(kind: &str, unit: i64, number: i64, percentage: f64) -> Limit {
         serde_json::from_value(serde_json::json!({

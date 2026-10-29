@@ -139,7 +139,7 @@ async fn fetch_task_usage(client: &reqwest::Client, token: &str) -> Result<Value
     let resp = bearer_request(client, token, TASK_USAGE_URL).send().await?;
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        anyhow::bail!("NEEDS_AUTH");
+        return Err(login_rejected(status));
     }
     if !status.is_success() {
         anyhow::bail!("Grok task usage request failed (HTTP {status})");
@@ -160,7 +160,7 @@ async fn fetch_billing_grpc(client: &reqwest::Client, token: &str) -> Result<Vec
         .await?;
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        anyhow::bail!("NEEDS_AUTH");
+        return Err(login_rejected(status));
     }
     if !status.is_success() {
         anyhow::bail!("Grok billing request failed (HTTP {status})");
@@ -524,12 +524,7 @@ fn fetch_network_usage(credentials: &Credentials) -> Result<UsageOutput> {
     })?;
 
     if metrics.is_empty() && plan.is_none() {
-        let detail = if errors.is_empty() {
-            "no usage or active subscription data returned".to_string()
-        } else {
-            errors.join("; ")
-        };
-        anyhow::bail!("Grok usage unavailable: {detail}");
+        return Err(unavailable(&errors));
     }
 
     Ok(usage_output(plan, credentials.email.clone(), metrics))
@@ -612,7 +607,7 @@ async fn fetch_proxy_billing(
         .await?;
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        anyhow::bail!("NEEDS_AUTH");
+        return Err(login_rejected(status));
     }
     if !status.is_success() {
         anyhow::bail!("Grok proxy billing request failed (HTTP {status})");
@@ -754,6 +749,33 @@ fn usage_output(
     }
 }
 
+const LOGIN_RECOVERY: &str = "Run 'grok login', then retry.";
+
+fn login_rejected(status: reqwest::StatusCode) -> anyhow::Error {
+    super::helpers::http_failure("Grok", status, LOGIN_RECOVERY)
+}
+
+/// The final failure after every candidate failed. Candidate errors are kept
+/// as text, so a rejected login is recognized by the phrase `http_failure`
+/// gives it and leads the message, since it is the one the user can fix.
+fn unavailable(errors: &[String]) -> anyhow::Error {
+    let detail = if errors.is_empty() {
+        "no usage or active subscription data returned".to_string()
+    } else {
+        errors.join("; ")
+    };
+    if errors
+        .iter()
+        .any(|error| error.contains("rejected the stored login"))
+    {
+        return super::helpers::usage_failure(
+            super::helpers::UsageFailureReason::AuthRejected,
+            format!("Grok rejected the stored login. {LOGIN_RECOVERY} ({detail})"),
+        );
+    }
+    anyhow::anyhow!("Grok usage unavailable: {detail}")
+}
+
 pub fn fetch() -> Result<UsageFetchReport> {
     let credentials = read_credentials()?;
     fetch_with(&credentials, fetch_network_usage)
@@ -764,6 +786,7 @@ fn fetch_with(
     mut fetch_network: impl FnMut(&Credentials) -> Result<UsageOutput>,
 ) -> Result<UsageFetchReport> {
     let mut errors = Vec::new();
+    let mut rejected_login = false;
     let mut plan_only: Option<UsageOutput> = None;
 
     for (index, credential) in credentials.iter().enumerate() {
@@ -785,7 +808,11 @@ fn fetch_with(
                     plan_only = Some(output);
                 }
             }
-            Err(error) => errors.push(format!("Grok credential #{} failed: {error}", index + 1)),
+            Err(error) => {
+                rejected_login |= super::helpers::failure_reason(&error)
+                    == Some(super::helpers::UsageFailureReason::AuthRejected);
+                errors.push(format!("Grok credential #{} failed: {error}", index + 1));
+            }
         }
     }
 
@@ -796,18 +823,28 @@ fn fetch_with(
     } else {
         UsageFetchDiagnosticSeverity::Error
     };
-    let mut message = "Grok quota unavailable; automatic agent billing fallback is unavailable without a documented quota-only surface.".to_string();
+    // A rejected login is the one failure the user can fix, so it leads.
+    let mut message = if rejected_login {
+        format!("Grok rejected the stored login. {LOGIN_RECOVERY} ")
+    } else {
+        String::new()
+    };
+    message.push_str("Grok quota unavailable; automatic agent billing fallback is unavailable without a documented quota-only surface.");
     if !errors.is_empty() {
         message.push_str(" HTTP candidates: ");
         message.push_str(&errors.join("; "));
     }
-    report.diagnostics.push(UsageFetchDiagnostic::with_kind(
+    let mut diagnostic = UsageFetchDiagnostic::with_kind(
         "Grok",
         None,
         UsageFetchDiagnosticKind::FetchFailed,
         severity,
         message,
-    ));
+    );
+    if rejected_login {
+        diagnostic.reason = Some(super::helpers::UsageFailureReason::AuthRejected);
+    }
+    report.diagnostics.push(diagnostic);
     Ok(report)
 }
 
@@ -829,6 +866,45 @@ mod tests {
             user_id: Some("user-test".into()),
             direct_xai: true,
         }
+    }
+
+    #[test]
+    fn rejected_login_leads_with_its_recovery_instead_of_an_internal_sentinel() {
+        use crate::commands::usage::helpers::{failure_reason, UsageFailureReason};
+        for status in [401, 403] {
+            let (url, _) = spawn_server(move |_, _| (status, "{}".into()));
+            let usage = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(fetch_proxy_usage(
+                    &super::super::helpers::http_client().unwrap(),
+                    &direct_credentials(),
+                    &url,
+                ));
+            let error = unavailable(&usage.errors);
+            assert_eq!(
+                failure_reason(&error),
+                Some(UsageFailureReason::AuthRejected)
+            );
+            assert!(error
+                .to_string()
+                .starts_with("Grok rejected the stored login. Run 'grok login'"));
+            assert!(!error.to_string().contains("NEEDS_AUTH"), "{error}");
+        }
+        let (url, _) = spawn_server(|_, _| (503, "{}".into()));
+        let usage = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fetch_proxy_usage(
+                &super::super::helpers::http_client().unwrap(),
+                &direct_credentials(),
+                &url,
+            ));
+        let error = unavailable(&usage.errors);
+        assert_eq!(failure_reason(&error), None);
+        assert!(!error.to_string().contains("grok login"), "{error}");
     }
 
     #[test]
@@ -980,6 +1056,38 @@ mod tests {
                 Vec::new()
             },
         )
+    }
+
+    #[test]
+    fn report_leads_with_login_recovery_only_when_a_login_was_rejected() {
+        use crate::commands::usage::helpers::UsageFailureReason;
+        for (status, rejected) in [(401, true), (403, true), (503, false)] {
+            let report = fetch_with(&[fixture_credentials("first")], |_| {
+                let status = reqwest::StatusCode::from_u16(status).unwrap();
+                Err(unavailable(&[super::super::helpers::http_failure(
+                    "Grok",
+                    status,
+                    LOGIN_RECOVERY,
+                )
+                .to_string()]))
+            })
+            .unwrap();
+            let diagnostic = &report.diagnostics[0];
+            assert_eq!(
+                diagnostic.reason,
+                rejected.then_some(UsageFailureReason::AuthRejected),
+                "HTTP {status}"
+            );
+            assert_eq!(
+                diagnostic
+                    .message
+                    .starts_with("Grok rejected the stored login. Run 'grok login'"),
+                rejected,
+                "{}",
+                diagnostic.message
+            );
+            assert!(diagnostic.message.contains("Grok quota unavailable"));
+        }
     }
 
     #[test]
