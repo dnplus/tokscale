@@ -8,9 +8,9 @@ use std::path::Path;
 
 const PROVIDER: &str = "Warp/Oz";
 
-/// Same window as the subscription usage cache: past it, the card is shown
-/// as cached rather than current.
-const STALE_AFTER_SECONDS: i64 = 300;
+/// Only a manual `tokscale warp sync` refreshes the cache, so a minutes-old
+/// sync is the normal state; past a day the card is shown as cached and warns.
+const STALE_AFTER_SECONDS: i64 = 24 * 60 * 60;
 
 /// Admit on the file alone so a malformed cache reaches `fetch_report` and is
 /// reported, instead of the provider silently disappearing.
@@ -172,9 +172,10 @@ mod tests {
         let path = temp.path().join("usage.json");
         for (synced_at, stale, age) in [
             ("2026-10-17T12:00:00Z", false, None),
-            ("2026-10-17T11:55:00Z", false, None),
-            ("2026-10-17T11:54:59Z", true, Some("5 min")),
-            ("2026-10-17T09:00:00Z", true, Some("3 h")),
+            ("2026-10-17T09:00:00Z", false, None),
+            ("2026-10-16T12:00:00Z", false, None),
+            ("2026-10-16T11:59:59Z", true, Some("24 h")),
+            ("2026-10-15T12:00:00Z", true, Some("2 days")),
             ("2026-10-10T12:00:00Z", true, Some("7 days")),
         ] {
             write_cache(&path, synced_at);
