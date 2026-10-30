@@ -3279,6 +3279,12 @@ fn test_models_cursor_explicit_home_override_reports_fixture_cache_path() {
     let warnings = json["warnings"]
         .as_array()
         .expect("explicit Cursor --home report should expose setup warnings");
+    // With --home the report prints the real joined path, so the tail uses
+    // the platform's separator (`cursor-cache\usage*.json` on Windows).
+    let cache_glob_tail = std::path::Path::new("cursor-cache")
+        .join("usage*.json")
+        .to_string_lossy()
+        .into_owned();
     assert!(
         warnings
             .iter()
@@ -3286,7 +3292,7 @@ fn test_models_cursor_explicit_home_override_reports_fixture_cache_path() {
                 .contains(tmp.path().to_str().unwrap())
                 && text.contains("tokscale cursor login")
                 && text.contains("tokscale cursor sync --json")
-                && text.contains("cursor-cache/usage*.json"))),
+                && text.contains(&cache_glob_tail))),
         "warnings did not explain Cursor --home setup: {warnings:?}"
     );
 }
