@@ -368,7 +368,14 @@ fn load_cache_at(path: &std::path::Path) -> Option<Vec<UsageOutput>> {
     let mut outputs: Vec<UsageOutput> = serde_json::from_value(doc.get("data")?.clone()).ok()?;
     // Shared cards do not prove which Claude token supplied the observation.
     // Rehydrate Claude only from its current-token state, including its time.
-    outputs.retain(|output| provider_id_for_label(&output.provider) != Some("claude"));
+    // Warp's stale flag is computed against its sync time when fetched, so a
+    // recached card would keep claiming it is current.
+    outputs.retain(|output| {
+        !matches!(
+            provider_id_for_label(&output.provider),
+            Some("claude" | "warp")
+        )
+    });
     Some(outputs)
 }
 
@@ -487,7 +494,7 @@ fn usage_providers(codex_fetch: Fetch) -> Vec<UsageProvider> {
             "warp",
             "Warp/Oz",
             warp::has_credentials,
-            Fetch::Single(warp::fetch),
+            Fetch::Report(warp::fetch_report),
         ),
         (
             "sakana",
@@ -864,6 +871,24 @@ mod tests {
         assert!(expected.exists());
         clear_cache_at(&expected);
         assert!(!expected.exists());
+    }
+
+    #[test]
+    fn shared_cache_does_not_rehydrate_warp_freshness() {
+        let temp = TempDir::new().unwrap();
+        let path = cache_path_in(temp.path()).unwrap();
+        let mut warp = sample_output("Warp/Oz");
+        warp.freshness = Some(UsageFreshness {
+            fetched_at: 1,
+            stale: false,
+        });
+        // Saving again must not let the card back in either.
+        for _ in 0..2 {
+            save_cache_at(&path, &[warp.clone(), sample_output("Codex")]);
+            let cached = load_cache_at(&path).unwrap();
+            assert_eq!(cached.len(), 1);
+            assert_eq!(cached[0].provider, "Codex");
+        }
     }
 
     #[test]
