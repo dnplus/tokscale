@@ -1639,15 +1639,8 @@ fn cursor_setup_state(home_dir: &Option<String>) -> Option<CursorSetupState> {
     } else {
         cursor::is_cursor_logged_in()
     };
-    let has_cache = cursor::has_cursor_usage_cache_in_home(&home_path);
-    let cache_glob = if home_override {
-        home_path
-            .join(".config/tokscale/cursor-cache/usage*.json")
-            .to_string_lossy()
-            .to_string()
-    } else {
-        "~/.config/tokscale/cursor-cache/usage*.json".to_string()
-    };
+    let has_cache = cursor::has_cursor_usage_cache_in_home(&home_path, !home_override);
+    let cache_glob = cursor::usage_cache_glob(&home_path, !home_override);
 
     Some(CursorSetupState {
         has_credentials,

@@ -427,11 +427,17 @@ define_clients!(
         parse_local: true,
         submit_default: true
     },
+    // Not `PathRoot::Config`: without an override the cache has always lived
+    // at `~/.config/tokscale/cursor-cache` on every platform, and following
+    // `XDG_CONFIG_HOME` or `%APPDATA%` would orphan existing caches.
     Cursor = 3 => {
         id: "cursor",
         display: "Cursor IDE",
-        logo: Some("https://tokscale.ai/assets/logos/cursor.jpg"),root: PathRoot::Home,
-        relative: ".config/tokscale/cursor-cache",
+        logo: Some("https://tokscale.ai/assets/logos/cursor.jpg"),root: PathRoot::EnvVar {
+            var: "TOKSCALE_CONFIG_DIR",
+            fallback_relative: ".config/tokscale",
+        },
+        relative: "cursor-cache",
         pattern: "usage*.json|usage*.csv",
         headless: false,
         parse_local: false,
@@ -2142,6 +2148,48 @@ mod tests {
 
         restore_env("TOKSCALE_CONFIG_DIR", previous_override);
         restore_env("XDG_CONFIG_HOME", previous_xdg);
+    }
+
+    #[test]
+    #[serial]
+    fn test_cursor_cache_follows_config_dir_override_only() {
+        let mut env = EnvGuard::capture(&["TOKSCALE_CONFIG_DIR", "XDG_CONFIG_HOME"]);
+        let home = std::path::Path::new("/tmp/home");
+        let home_default = native_join(home, ".config/tokscale/cursor-cache");
+        let overridden = native_join(
+            std::path::Path::new("/tmp/custom-config-root"),
+            "cursor-cache",
+        );
+        for override_value in [None, Some(""), Some("/tmp/custom-config-root")] {
+            for xdg in [None, Some("/tmp/xdg-config-home")] {
+                for use_env_roots in [true, false] {
+                    match override_value {
+                        Some(value) => env.set("TOKSCALE_CONFIG_DIR", value),
+                        None => env.remove("TOKSCALE_CONFIG_DIR"),
+                    }
+                    match xdg {
+                        Some(value) => env.set("XDG_CONFIG_HOME", value),
+                        None => env.remove("XDG_CONFIG_HOME"),
+                    }
+                    // Only a non-empty override under env roots moves the
+                    // cache; XDG never does, and an explicit home stays
+                    // hermetic.
+                    let expected =
+                        if use_env_roots && override_value.is_some_and(|value| !value.is_empty()) {
+                            &overridden
+                        } else {
+                            &home_default
+                        };
+                    assert_eq!(
+                        &ClientId::Cursor
+                            .data()
+                            .resolve_path_with_env_strategy("/tmp/home", use_env_roots),
+                        expected,
+                        "override={override_value:?} xdg={xdg:?} env_roots={use_env_roots}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

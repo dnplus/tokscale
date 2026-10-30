@@ -1,6 +1,6 @@
 //! Cursor IDE session parser
 //!
-//! Parses usage files cached locally at ~/.config/tokscale/cursor-cache/.
+//! Parses usage files cached locally at ~/.config/tokscale/cursor-cache/ (or `$TOKSCALE_CONFIG_DIR/cursor-cache/` when set).
 //! The active account's cache is `usage.json` (or legacy `usage.csv`);
 //! additional accounts use `usage.account-<sha256>.json` with exact-owner metadata.
 //! Unmarked legacy JSON/CSV caches remain readable until the CLI preserves them
