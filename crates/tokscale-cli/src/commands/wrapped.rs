@@ -3022,6 +3022,23 @@ fn cursor_setup_warning_for_wrapped(
     include_cursor_in_graph: bool,
     cursor_logged_in: bool,
 ) -> Option<String> {
+    let cache_glob = crate::paths::home_dir()
+        .map(|home| cursor::usage_cache_glob(&home, true))
+        .unwrap_or_else(|| "~/.config/tokscale/cursor-cache/usage*.json".to_string());
+    cursor_setup_warning_with_cache_glob(
+        explicit_cursor,
+        include_cursor_in_graph,
+        cursor_logged_in,
+        &cache_glob,
+    )
+}
+
+fn cursor_setup_warning_with_cache_glob(
+    explicit_cursor: bool,
+    include_cursor_in_graph: bool,
+    cursor_logged_in: bool,
+    cache_glob: &str,
+) -> Option<String> {
     if !explicit_cursor || include_cursor_in_graph {
         return None;
     }
@@ -3033,13 +3050,13 @@ fn cursor_setup_warning_for_wrapped(
     };
 
     Some(format!(
-        "Cursor usage requires Tokscale's Cursor API cache at `~/.config/tokscale/cursor-cache/usage*.json`; {action}. Tokscale does not parse local `~/.cursor` session data."
+        "Cursor usage requires Tokscale's Cursor API cache at `{cache_glob}`; {action}. Tokscale does not parse local `~/.cursor` session data."
     ))
 }
 
 #[cfg(test)]
 mod cursor_setup_warning_tests {
-    use super::cursor_setup_warning_for_wrapped;
+    use super::{cursor_setup_warning_for_wrapped, cursor_setup_warning_with_cache_glob};
 
     #[test]
     fn wrapped_cursor_warning_suggests_login_when_not_authenticated() {
@@ -3057,6 +3074,22 @@ mod cursor_setup_warning_tests {
         let warning = cursor_setup_warning_for_wrapped(true, false, true).unwrap();
         assert!(!warning.contains("tokscale cursor login"));
         assert!(warning.contains("tokscale cursor sync --json"));
+    }
+
+    #[test]
+    fn wrapped_cursor_warning_names_the_resolved_cache_location() {
+        let warning = cursor_setup_warning_with_cache_glob(
+            true,
+            false,
+            true,
+            "/custom/cursor-cache/usage*.json",
+        )
+        .unwrap();
+        assert!(
+            warning.contains("`/custom/cursor-cache/usage*.json`"),
+            "{warning}"
+        );
+        assert!(!warning.contains("~/.config/tokscale"), "{warning}");
     }
 
     #[test]

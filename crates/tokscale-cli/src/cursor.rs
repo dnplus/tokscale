@@ -122,14 +122,32 @@ fn old_cursor_credentials_path(home_dir: &Path) -> PathBuf {
 /// Resolved through the scanner's own `ClientId::Cursor` root so the writer and
 /// the reader cannot disagree. `TOKSCALE_CONFIG_DIR` relocates the cache only
 /// for the user's own home; any other home (a test's scratch home) stays
-/// hermetic, as the scanner ignores env roots for an explicit `--home`.
+/// hermetic.
 fn cursor_cache_dir(home_dir: &Path) -> PathBuf {
     let use_env_roots = crate::paths::home_dir().as_deref() == Some(home_dir);
+    scanned_cursor_cache_dir(home_dir, use_env_roots)
+}
+
+/// The directory a report scans for `home_dir`. Reports enable env roots only
+/// without an explicit `--home`, so `--home "$HOME"` reads the home default
+/// even when `TOKSCALE_CONFIG_DIR` is set.
+fn scanned_cursor_cache_dir(home_dir: &Path, use_env_roots: bool) -> PathBuf {
     PathBuf::from(
         tokscale_core::ClientId::Cursor
             .data()
             .resolve_path_with_env_strategy(&home_dir.to_string_lossy(), use_env_roots),
     )
+}
+
+/// The cache glob setup warnings point at: the directory the report scans,
+/// abbreviated to `~/...` only when it is the user's own default location.
+pub fn usage_cache_glob(home_dir: &Path, use_env_roots: bool) -> String {
+    let cache_dir = scanned_cursor_cache_dir(home_dir, use_env_roots);
+    if use_env_roots && cache_dir == home_dir.join(".config/tokscale/cursor-cache") {
+        "~/.config/tokscale/cursor-cache/usage*.json".to_string()
+    } else {
+        cache_dir.join("usage*.json").to_string_lossy().into_owned()
+    }
 }
 
 /// Whether the cache lives outside the home's default root, in which case the
@@ -1637,9 +1655,11 @@ fn is_cursor_usage_cache_filename(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
 }
 
-pub fn has_cursor_usage_cache_in_home(home_dir: &Path) -> bool {
+/// Whether a report for `home_dir` will find a cache; see
+/// [`scanned_cursor_cache_dir`] for `use_env_roots`.
+pub fn has_cursor_usage_cache_in_home(home_dir: &Path, use_env_roots: bool) -> bool {
     migrate_cache_dir_from_old_path_in_home(home_dir);
-    let cache_dir = cursor_cache_dir(home_dir);
+    let cache_dir = scanned_cursor_cache_dir(home_dir, use_env_roots);
     if !cache_dir.exists() {
         return false;
     }
@@ -1658,7 +1678,7 @@ pub fn has_cursor_usage_cache() -> bool {
         Ok(home_dir) => home_dir,
         Err(_) => return false,
     };
-    has_cursor_usage_cache_in_home(&home_dir)
+    has_cursor_usage_cache_in_home(&home_dir, true)
 }
 
 fn expected_cursor_usage_cache_paths_in(home_dir: &Path) -> Vec<PathBuf> {
@@ -3202,6 +3222,66 @@ mod tests {
                     scratch_home.path().join(".config/tokscale/cursor-cache"),
                     "{label}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_report_setup_checks_the_directory_the_scan_reads() {
+        let home = TempDir::new().unwrap();
+        let config = TempDir::new().unwrap();
+        for config_override in [None, Some(config.path())] {
+            let _env = cursor_cache_env(home.path(), config_override, None);
+            let own_home = home_dir().unwrap();
+            let home_default = own_home.join(".config/tokscale/cursor-cache");
+            for use_env_roots in [true, false] {
+                let label = format!("override={config_override:?} env_roots={use_env_roots}");
+                let scanned = PathBuf::from(
+                    tokscale_core::ClientId::Cursor
+                        .data()
+                        .resolve_path_with_env_strategy(own_home.to_str().unwrap(), use_env_roots),
+                );
+                let glob = usage_cache_glob(&own_home, use_env_roots);
+                if use_env_roots && config_override.is_none() {
+                    assert_eq!(
+                        glob, "~/.config/tokscale/cursor-cache/usage*.json",
+                        "{label}"
+                    );
+                } else {
+                    assert_eq!(
+                        glob,
+                        scanned.join("usage*.json").to_string_lossy(),
+                        "{label}"
+                    );
+                }
+
+                // A cache only in the other location must not satisfy the
+                // check: `--home "$HOME"` scans the home default even when
+                // the override is set, and vice versa.
+                let other = if scanned == home_default {
+                    config.path().join("cursor-cache")
+                } else {
+                    home_default.clone()
+                };
+                for dir in [&scanned, &other] {
+                    let _ = fs::remove_dir_all(dir);
+                }
+                fs::create_dir_all(&other).unwrap();
+                fs::write(other.join("usage.json"), "{}").unwrap();
+                assert!(
+                    !has_cursor_usage_cache_in_home(&own_home, use_env_roots),
+                    "{label}"
+                );
+                fs::create_dir_all(&scanned).unwrap();
+                fs::write(scanned.join("usage.json"), "{}").unwrap();
+                assert!(
+                    has_cursor_usage_cache_in_home(&own_home, use_env_roots),
+                    "{label}"
+                );
+                for dir in [&scanned, &other] {
+                    let _ = fs::remove_dir_all(dir);
+                }
             }
         }
     }
