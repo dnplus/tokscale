@@ -1740,7 +1740,8 @@ fn fetch_all_report_with_opencode_fallback_at(
 }
 
 /// Codex sometimes answers with a plan but no quota windows or credits. Keep
-/// that card, as Grok does, and say its quota is unknown.
+/// that card (Grok keeps plan-only cards too) and add a warning that its
+/// quota is unknown.
 fn warn_plan_only_outputs(mut report: UsageFetchReport) -> UsageFetchReport {
     for output in &report.outputs {
         let plan_only = output.metrics.is_empty()
