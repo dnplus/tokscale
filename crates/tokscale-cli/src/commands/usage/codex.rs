@@ -1483,16 +1483,40 @@ async fn fetch_with_auth_async(
         }
     }
 
-    let credit_status = resp.credits.map(|credits| UsageCreditStatus {
-        balance: json_scalar_string(credits.balance),
-        has_credits: credits.has_credits,
-        unlimited: credits.unlimited,
-        overage_limit_reached: credits.overage_limit_reached,
-    });
-    let spend_control = resp.spend_control.map(|control| UsageSpendControl {
-        individual_limit: json_scalar_string(control.individual_limit),
-        reached: control.reached,
-    });
+    // An object whose fields are all absent carries no status; dropping it
+    // keeps "credits: {}" from passing as a known balance.
+    let credit_status = resp
+        .credits
+        .map(|credits| UsageCreditStatus {
+            balance: json_scalar_string(credits.balance),
+            has_credits: credits.has_credits,
+            unlimited: credits.unlimited,
+            overage_limit_reached: credits.overage_limit_reached,
+        })
+        .filter(|credits| {
+            credits.balance.is_some()
+                || credits.has_credits.is_some()
+                || credits.unlimited.is_some()
+                || credits.overage_limit_reached.is_some()
+        });
+    let spend_control = resp
+        .spend_control
+        .map(|control| UsageSpendControl {
+            individual_limit: json_scalar_string(control.individual_limit),
+            reached: control.reached,
+        })
+        .filter(|control| control.individual_limit.is_some() || control.reached.is_some());
+
+    // A plan alone still identifies the account; the report layer warns that
+    // its quota is unknown instead of hiding the card.
+    if metrics.is_empty()
+        && reset_credits.is_none()
+        && credit_status.is_none()
+        && spend_control.is_none()
+        && plan.is_none()
+    {
+        anyhow::bail!("Codex returned no parseable usage or credit status");
+    }
 
     let has_credit_status = credit_status.as_ref().is_some_and(|credits| {
         credits.balance.is_some()
@@ -1736,7 +1760,8 @@ fn fetch_all_report_with_opencode_fallback_at(
 }
 
 /// Codex sometimes answers with a plan but no quota windows or credits. Keep
-/// that card, as Grok does, and say its quota is unknown.
+/// that card (Grok keeps plan-only cards too) and add a warning that its
+/// quota is unknown.
 fn warn_plan_only_outputs(mut report: UsageFetchReport) -> UsageFetchReport {
     for output in &report.outputs {
         let plan_only = output.metrics.is_empty()
@@ -2294,7 +2319,12 @@ mod tests {
                 r#"{"rate_limit_reset_credits":{"available_count":0}}"#,
                 true,
             ),
+            (r#"{"credits":{},"spend_control":{}}"#, false),
             (r#"{"plan_type":"plus"}"#, true),
+            (
+                r#"{"plan_type":"plus","credits":{},"spend_control":{}}"#,
+                true,
+            ),
         ] {
             let (base, _) = spawn_server(move |path, _| {
                 if path == USAGE_PATH {
@@ -2317,7 +2347,14 @@ mod tests {
                 None,
             );
             if usable {
-                assert!(result.unwrap().metrics.is_empty());
+                let output = result.unwrap();
+                assert!(output.metrics.is_empty(), "{body}");
+                if output.plan.is_some() {
+                    // Empty objects must not read as a known credit status, or
+                    // the card would escape the unknown-quota warning.
+                    assert!(output.credit_status.is_none(), "{body}");
+                    assert!(output.spend_control.is_none(), "{body}");
+                }
             } else {
                 assert!(result
                     .unwrap_err()

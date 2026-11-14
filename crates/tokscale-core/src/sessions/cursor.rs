@@ -1,6 +1,6 @@
 //! Cursor IDE session parser
 //!
-//! Parses usage files cached locally at ~/.config/tokscale/cursor-cache/.
+//! Parses usage files cached locally at ~/.config/tokscale/cursor-cache/ (or `$TOKSCALE_CONFIG_DIR/cursor-cache/` when set).
 //! The active account's cache is `usage.json` (or legacy `usage.csv`);
 //! additional accounts use `usage.account-<sha256>.json` with exact-owner metadata.
 //! Unmarked legacy JSON/CSV caches remain readable until the CLI preserves them
@@ -494,7 +494,7 @@ fn is_conversation_uuid(id: &str) -> bool {
 /// The full cache is examined before time/model filtering so switching models
 /// within an anchored conversation does not change ownership.
 fn classify_grok_bot_messages(messages: &mut [UnifiedMessage], account_id: &str) {
-    let anchored: HashSet<String> = messages
+    let anchored: HashSet<super::SharedStr> = messages
         .iter()
         .filter(|m| is_conversation_uuid(&m.session_id) && m.model_id.starts_with("grok-bot-"))
         .map(|m| m.session_id.clone())
@@ -506,7 +506,7 @@ fn classify_grok_bot_messages(messages: &mut [UnifiedMessage], account_id: &str)
                 .strip_prefix("sand-subagent-")
                 .is_some_and(is_conversation_uuid)
         {
-            message.client = "grok-bot".to_string();
+            message.client = "grok-bot".into();
             // This is a local conversation identity, not a verified bot name or
             // parent relationship. Include the account to avoid cross-account
             // aggregation. Keep the entire ID so no two conversations merge.
@@ -514,7 +514,7 @@ fn classify_grok_bot_messages(messages: &mut [UnifiedMessage], account_id: &str)
                 Some(id) => (id, "subagent"),
                 None => (message.session_id.as_str(), "conversation"),
             };
-            message.agent = Some(format!("{id} [{account_id}; {kind}]"));
+            message.agent = Some(format!("{id} [{account_id}; {kind}]").into());
         }
     }
 }
@@ -629,7 +629,8 @@ fn assign_cursor_event_dedup_keys(
     messages: &mut [UnifiedMessage],
     snapshot_ids: &[Option<String>],
 ) {
-    let mut identified_by_fallback: HashMap<(String, String, i64), String> = HashMap::new();
+    let mut identified_by_fallback: HashMap<(super::SharedStr, super::SharedStr, i64), String> =
+        HashMap::new();
     for (message, snapshot_id) in messages.iter().zip(snapshot_ids) {
         let Some(snapshot_id) = snapshot_id.as_ref() else {
             continue;

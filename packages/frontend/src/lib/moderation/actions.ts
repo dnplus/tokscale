@@ -1,4 +1,4 @@
-import { and, desc, eq, ne } from "drizzle-orm";
+import { and, desc, eq, ne, sql } from "drizzle-orm";
 import { revalidatePath, revalidateTag } from "next/cache";
 import { db, moderationActions, users } from "@/lib/db";
 import {
@@ -10,6 +10,8 @@ import {
 } from "@/lib/db/usernameLookup";
 import type { ModerationAction } from "@/lib/db/schema";
 import { revalidateUserGroupLeaderboards } from "@/lib/groups/cache";
+import { expireExploreCache } from "@/lib/explore/cache";
+import { advanceExploreCacheRevision } from "@/lib/explore/revision";
 
 export interface ModerationTarget {
   id: string;
@@ -59,7 +61,15 @@ export async function applyModerationAction(params: {
   action: ModerationAction;
   reason: string;
 }): Promise<{ changed: boolean; leaderboardHidden: boolean }> {
-  const { target, actorUserId, actorUsername, action, reason } = params;
+  const { target, actorUserId, action, reason } = params;
+  const actorUsername = params.actorUsername?.trim() ?? "";
+  if (!actorUsername) {
+    throw new Error("Actor username is required");
+  }
+  const trimmedReason = reason?.trim() ?? "";
+  if (!trimmedReason) {
+    throw new Error("A reason is required");
+  }
   const nextHidden = action === "hide";
 
   const changed = await db.transaction(async (tx) => {
@@ -89,9 +99,13 @@ export async function applyModerationAction(params: {
       actorUserId,
       actorUsername,
       action,
-      reason,
+      reason: trimmedReason,
+      // The user row remains locked until commit. now() would instead record
+      // BEGIN time and can sort a delayed decision before an earlier change.
+      createdAt: sql`clock_timestamp()`,
     });
 
+    await advanceExploreCacheRevision(tx);
     return updatedTarget.username;
   });
 
@@ -108,9 +122,16 @@ export async function applyModerationAction(params: {
  * Best-effort by design: the write has already committed, so a revalidation
  * failure must not surface as a failed moderation action. Worst case the
  * change appears after the existing TTLs expire (60s for the leaderboard and
- * profiles, an hour for the sitemap).
+ * profiles, ten minutes for explore, an hour for the sitemap). Explore uses
+ * immediate expiration so successful invalidation never serves hidden users
+ * through stale-while-revalidate.
  */
 async function invalidateAfterModeration(userId: string, username: string): Promise<void> {
+  try {
+    expireExploreCache();
+  } catch (error) {
+    console.error("[moderation] explore cache revalidation failed:", error);
+  }
   try {
     // Every leaderboard cache entry carries this tag, including the per-period
     // ones, so one call covers all of them.
@@ -144,7 +165,7 @@ export async function getModerationHistory(
     })
     .from(moderationActions)
     .where(eq(moderationActions.targetUserId, targetUserId))
-    .orderBy(desc(moderationActions.createdAt))
+    .orderBy(desc(moderationActions.createdAt), desc(moderationActions.id))
     .limit(limit);
 
   return rows;

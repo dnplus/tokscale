@@ -1542,6 +1542,23 @@ describe("droid parser high-water", () => {
     expect(plan.mode).toBe("freeze");
     expect(plan.increments).toEqual({});
   });
+
+  it("does not credit complete days, because a growing session moves tokens between days", () => {
+    const state = droidPlan(wholeSessionOnOneDay, sessionSplitAcrossDays).nextState!;
+
+    const plan = planParserHighWaterSubmission({
+      client: "droid",
+      incomingVersion: SUPPORTED_VERSIONED_PARSERS.droid,
+      fullHistory: false,
+      completeDays: true,
+      existingLegacyDays: {},
+      incomingDays: droidSnapshot(droidContribution("2026-08-10", 500_000)),
+      state,
+    });
+
+    expect(plan.mode).toBe("freeze");
+    expect(plan.increments).toEqual({});
+  });
 });
 
 describe("devin-cli recount proof", () => {
@@ -1746,11 +1763,13 @@ describe("devin-cli recount proof", () => {
     }
   });
 
-  it("keeps a day the transition could not correct when the missing source is read again", () => {
+  it("corrects a day the transition could not correct when the missing source is read again", () => {
     // Continuing from the A-only scan above (ledger kept at 1,000): B becomes
-    // readable and carries 60 duplicates of its own. The proof now explains
-    // the whole stored cell, but the device is past its transition, so a
-    // proof no longer lowers counts and the day stays as stored.
+    // readable and carries 110 duplicates of its own. The proof now explains
+    // the whole stored cell — its previous side equals it exactly — and the
+    // cell was never credited in this generation's units (the observed
+    // snapshot holds only A's 350), so the residue is still lowered to the
+    // corrected count.
     const stored = devinSnapshot(devinContribution("2026-10-08", 1_000));
     const first = devinPlan(stored, devinSnapshot(devinContribution("2026-10-08", 350)), {
       recountProof: proof({
@@ -1769,15 +1788,134 @@ describe("devin-cli recount proof", () => {
     expect(second.mode).toBe("incremental");
     expect(second.recountDays).toEqual(["2026-10-08"]);
     expect(second.recountTransition).toBeUndefined();
-    expect(second.nextState?.days["2026-10-08"]?.tokens).toBe(1_000);
-    expect(second.nextState?.aggregate.tokens).toBe(1_000);
+    expect(second.nextState?.days["2026-10-08"]?.tokens).toBe(890);
+    expect(second.nextState?.aggregate.tokens).toBe(890);
 
-    // A transition that reads both sources corrects the day then.
+    // A transition that reads both sources corrects the day the same way.
     const transition = devinPlan(stored, devinSnapshot(devinContribution("2026-10-08", 890)), {
       recountProof: bothSources,
     });
     expect(transition.recountTransition).toBe(true);
     expect(transition.nextState?.days["2026-10-08"]?.tokens).toBe(890);
+  });
+
+  it("clears the high-water deficit once residue is corrected, crediting new usage", () => {
+    // Stored 1,000 under generation 1 (400 = A with 50 dupes, 600 = B). The
+    // transition-era scan read only A, so the cell stayed. Now the snapshot
+    // reads both sources and reports 100 tokens of genuinely new usage on a
+    // later day. Without the correction the credited 1,000 would exceed the
+    // incoming 990 and freeze the new day's growth behind the deficit.
+    const stored = devinSnapshot(devinContribution("2026-10-08", 1_000));
+    const first = devinPlan(stored, devinSnapshot(devinContribution("2026-10-08", 350)), {
+      recountProof: proof({
+        "2026-10-08": { previous: proofCell(400), corrected: proofCell(350) },
+      }),
+    });
+
+    const second = devinPlan(
+      {},
+      devinSnapshot(
+        devinContribution("2026-10-08", 890),
+        devinContribution("2026-10-09", 100)
+      ),
+      {
+        state: first.nextState,
+        recountProof: proof({
+          "2026-10-08": { previous: proofCell(1_000), corrected: proofCell(890) },
+        }),
+      }
+    );
+
+    expect(second.highWaterDeficit).toBeUndefined();
+    expect(second.nextState?.days["2026-10-08"]?.tokens).toBe(890);
+    expect(second.increments["2026-10-09"]?.tokens).toBe(100);
+    expect(second.nextState?.days["2026-10-09"]?.tokens).toBe(100);
+    expect(second.nextState?.aggregate.tokens).toBe(990);
+  });
+
+  it("infers residue on a v2 state written before the set was tracked", () => {
+    // The credited day (1,000) was never corrected — the last snapshot held
+    // only A's 350 — so the divergence marks the cell as residue and the
+    // proof that now covers both sources heals it post-transition.
+    const stored = devinSnapshot(devinContribution("2026-10-08", 1_000));
+    const first = devinPlan(stored, devinSnapshot(devinContribution("2026-10-08", 350)), {
+      recountProof: proof({
+        "2026-10-08": { previous: proofCell(400), corrected: proofCell(350) },
+      }),
+    });
+    const legacyState = { ...first.nextState! } as ParserClientHighWaterState;
+    delete legacyState.residueDays;
+
+    const second = devinPlan({}, devinSnapshot(devinContribution("2026-10-08", 890)), {
+      state: legacyState,
+      recountProof: proof({
+        "2026-10-08": { previous: proofCell(1_000), corrected: proofCell(890) },
+      }),
+    });
+
+    expect(second.nextState?.days["2026-10-08"]?.tokens).toBe(890);
+    expect(second.nextState?.residueDays).toEqual({});
+  });
+
+  it("keeps a cell equal to its last snapshot from inference marks", () => {
+    // A baseline-new state credited 200 from A and B under this generation.
+    // Without a residue set, inference must not mark it: A's later proof can
+    // count the same 200 under generation 1 after B disappears, and lowering
+    // the day would erase B's usage.
+    const state = {
+      ...devinPlan(
+        {},
+        devinSnapshot(devinContribution("2026-10-08", 200, "swe-2-high", 0, 2))
+      ).nextState!,
+    } as ParserClientHighWaterState;
+    delete state.residueDays;
+
+    const afterDelete = devinPlan(
+      {},
+      devinSnapshot(devinContribution("2026-10-08", 100, "swe-2-high", 0, 1)),
+      {
+        state,
+        recountProof: proof({
+          "2026-10-08": { previous: proofCell(200, 0, 2), corrected: proofCell(100, 0, 1) },
+        }),
+      }
+    );
+
+    expect(afterDelete.nextState?.days["2026-10-08"]?.tokens).toBe(200);
+  });
+
+  it("treats every credited cell of a pre-v2 state as residue", () => {
+    // A state written before allocation schema v2 predates recounts: its
+    // stored rows are all previous-generation counts, so a matching proof
+    // corrects them without a transition or a residue set.
+    const stored = devinSnapshot(devinContribution("2026-10-08", 1_000));
+    const legacyState = {
+      version: SUPPORTED_VERSIONED_PARSERS["devin-cli"],
+      baselineEstablished: true,
+      aggregate: {
+        input: 1_000,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        reasoning: 0,
+        tokens: 1_000,
+        messages: 1,
+        inputIncludingCacheRead: 1_000,
+      },
+      days: stored,
+    } as ParserClientHighWaterState;
+
+    const plan = devinPlan(stored, devinSnapshot(devinContribution("2026-10-08", 890)), {
+      state: legacyState,
+      recountProof: proof({
+        "2026-10-08": { previous: proofCell(1_000), corrected: proofCell(890) },
+      }),
+    });
+
+    expect(plan.mode).toBe("incremental");
+    expect(plan.nextState?.days["2026-10-08"]?.tokens).toBe(890);
+    expect(plan.nextState?.residueDays).toEqual({});
+    expect(plan.nextState?.aggregate.tokens).toBe(890);
   });
 
   it("keeps a corrected day when one of its sources later disappears", () => {
@@ -1905,7 +2043,7 @@ describe("devin-cli recount proof", () => {
       }
     );
     expect(lower.mode).toBe("incremental");
-    expect(lower.highWaterDeficit).toBeGreaterThan(0);
+    expect(lower.highWaterDeficit).toBeUndefined();
     expect(lower.increments["2026-10-08"]).toBeUndefined();
     expect(lower.nextState?.days["2026-10-08"]?.tokens).toBe(455_000_000);
 
@@ -1921,6 +2059,35 @@ describe("devin-cli recount proof", () => {
     );
     expect(grown.mode).toBe("incremental");
     expect(grown.nextState?.aggregate.tokens).toBe(700_000_000);
+  });
+
+  it("keeps crediting new usage after local Devin history shrinks", () => {
+    // Devin CLI deletes `message_nodes` rows (a deleted session, a rewound
+    // branch), so later scans no longer carry that usage. The stored days
+    // stay, and new usage must still count.
+    const stored = devinSnapshot(
+      devinContribution("2026-10-01", 5_000),
+      devinContribution("2026-10-08", 400)
+    );
+    const transition = devinPlan(stored, devinSnapshot(devinContribution("2026-10-08", 400)));
+    expect(transition.mode).toBe("baseline-legacy");
+    expect(transition.nextState?.days["2026-10-01"]?.tokens).toBe(5_000);
+
+    const grown = devinPlan(
+      {},
+      devinSnapshot(
+        devinContribution("2026-10-08", 450, "swe-2-high", 0, 2),
+        devinContribution("2026-10-09", 300)
+      ),
+      { state: transition.nextState }
+    );
+    expect(grown.mode).toBe("incremental");
+    expect(grown.highWaterDeficit).toBeUndefined();
+    expect(grown.increments["2026-10-08"]?.tokens).toBe(50);
+    expect(grown.increments["2026-10-08"]?.messages).toBe(1);
+    expect(grown.increments["2026-10-09"]?.tokens).toBe(300);
+    expect(grown.nextState?.days["2026-10-01"]?.tokens).toBe(5_000);
+    expect(grown.nextState?.aggregate.tokens).toBe(5_750);
   });
 
   it("rejects a proof that does not describe the submitted snapshot", () => {
@@ -2496,6 +2663,7 @@ describe("cursor recount proof rollout", () => {
     existing: Record<string, ClientBreakdownData>;
     incoming: Record<string, ClientBreakdownData>;
     fullHistory?: boolean;
+    completeDays?: boolean;
     incomingVersion?: number;
     state?: ParserClientHighWaterState;
     persistedVersion?: number;
@@ -2506,6 +2674,7 @@ describe("cursor recount proof rollout", () => {
       incomingVersion:
         args.incomingVersion ?? SUPPORTED_VERSIONED_PARSERS.cursor,
       fullHistory: args.fullHistory ?? true,
+      completeDays: args.completeDays,
       existingLegacyDays: args.existing,
       incomingDays: args.incoming,
       state: args.state,
@@ -2768,15 +2937,17 @@ describe("cursor recount proof rollout", () => {
     expect(transition.nextState?.days["2026-10-08"]?.tokens ?? 0).toBe(0);
     expect(transition.nextState?.days["2026-10-09"]?.tokens).toBe(110);
 
-    // After the transition a proof never lowers counts, so a snapshot that
-    // moves later is credited on both days, as the ordinary merge did.
+    // After a transition that ran without a proof, the stored day is still
+    // previous-generation residue, so a proof that arrives later can still
+    // zero it — the stored 100 is exactly what generation 1 counted, and
+    // keeping it would double-count the event the snapshot re-dated.
     const day8 = cursorSnapshot(cursorContribution("2026-10-08", 100, 1, 1));
     const state = cursorPlan({ existing: day8, incoming: day8 }).nextState!;
     const later = cursorPlan({ existing: {}, incoming: day9, state, recountProof: moved });
     expect(later.recountTransition).toBeUndefined();
-    expect(later.nextState?.days["2026-10-08"]?.tokens).toBe(100);
+    expect(later.nextState?.days["2026-10-08"]?.tokens ?? 0).toBe(0);
     expect(later.nextState?.days["2026-10-09"]?.tokens).toBe(110);
-    expect(later.nextState?.aggregate.tokens).toBe(210);
+    expect(later.nextState?.aggregate.tokens).toBe(110);
   });
 
   it("keeps an empty full-history snapshot pending", () => {
@@ -2793,6 +2964,93 @@ describe("cursor recount proof rollout", () => {
     });
     expect(followed.recountDays).toEqual(["2026-10-08"]);
     expect(followed.nextState?.days["2026-10-08"]?.tokens).toBe(400);
+  });
+
+  it("credits a date-bounded scan's complete days after the baseline and keeps older days", () => {
+    const history = cursorSnapshot(
+      cursorContribution("2026-10-01", 5_000, 50, 10),
+      cursorContribution("2026-10-08", 400, 4, 1)
+    );
+    const baseline = cursorPlan({ existing: {}, incoming: history });
+    expect(baseline.mode).toBe("baseline-new");
+
+    const week = cursorPlan({
+      existing: history,
+      incoming: cursorSnapshot(
+        cursorContribution("2026-10-08", 450, 4.5, 2),
+        cursorContribution("2026-10-09", 300, 3, 1)
+      ),
+      fullHistory: false,
+      completeDays: true,
+      state: baseline.nextState,
+    });
+
+    expect(week.mode).toBe("incremental");
+    expect(week.increments["2026-10-08"]?.tokens).toBe(50);
+    expect(week.increments["2026-10-08"]?.messages).toBe(1);
+    expect(week.increments["2026-10-09"]?.tokens).toBe(300);
+    expect(week.nextState?.days["2026-10-01"]?.tokens).toBe(5_000);
+    expect(week.nextState?.observedDays?.["2026-10-01"]?.tokens).toBe(5_000);
+    expect(week.nextState?.aggregate.tokens).toBe(5_750);
+
+    const full = cursorPlan({
+      existing: {},
+      incoming: cursorSnapshot(
+        cursorContribution("2026-10-01", 5_000, 50, 10),
+        cursorContribution("2026-10-08", 450, 4.5, 2),
+        cursorContribution("2026-10-09", 300, 3, 1)
+      ),
+      state: week.nextState,
+    });
+    expect(full.increments).toEqual({});
+    expect(full.nextState?.aggregate.tokens).toBe(5_750);
+  });
+
+  it("keeps a date-bounded scan frozen until a full snapshot establishes the baseline", () => {
+    const first = cursorPlan({
+      existing: inflated,
+      incoming: corrected,
+      fullHistory: false,
+      completeDays: true,
+    });
+    expect(first.mode).toBe("freeze");
+    expect(first.nextState?.baselineEstablished).toBe(false);
+
+    const again = cursorPlan({
+      existing: inflated,
+      incoming: corrected,
+      fullHistory: false,
+      completeDays: true,
+      state: first.nextState,
+    });
+    expect(again.mode).toBe("freeze");
+    expect(again.nextState).toBeUndefined();
+  });
+
+  it("leaves residue for a full snapshot to correct instead of a date-bounded scan", () => {
+    const transition = cursorPlan({ existing: inflated, incoming: corrected });
+    expect(transition.nextState?.days["2026-10-08"]?.tokens).toBe(1_000);
+
+    const week = cursorPlan({
+      existing: inflated,
+      incoming: corrected,
+      fullHistory: false,
+      completeDays: true,
+      state: transition.nextState,
+      recountProof: proof,
+    });
+    expect(week.mode).toBe("incremental");
+    expect(week.recountDays).toBeUndefined();
+    expect(week.nextState?.days["2026-10-08"]?.tokens).toBe(1_000);
+
+    const full = cursorPlan({
+      existing: inflated,
+      incoming: corrected,
+      state: week.nextState,
+      recountProof: proof,
+    });
+    expect(full.recountDays).toEqual(["2026-10-08"]);
+    expect(full.nextState?.days["2026-10-08"]?.tokens).toBe(400);
   });
 });
 

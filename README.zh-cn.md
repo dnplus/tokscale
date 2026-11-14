@@ -28,7 +28,7 @@
 [![GitHub Forks](https://img.shields.io/github/forks/junhoyeo/tokscale?color=0073FF&labelColor=black&style=flat-square)](https://github.com/junhoyeo/tokscale/network/members)
 [![GitHub Stars](https://img.shields.io/github/stars/junhoyeo/tokscale?color=0073FF&labelColor=black&style=flat-square)](https://github.com/junhoyeo/tokscale/stargazers)
 [![GitHub Issues](https://img.shields.io/github/issues/junhoyeo/tokscale?color=0073FF&labelColor=black&style=flat-square)](https://github.com/junhoyeo/tokscale/issues)
-[![License](https://img.shields.io/badge/license-MIT-white?labelColor=black&style=flat-square)](https://github.com/junhoyeo/tokscale/blob/master/LICENSE)
+[![License](https://img.shields.io/badge/license-MIT%20%2B%20AGPL--3.0-white?labelColor=black&style=flat-square)](#许可证)
 [![Coverage](https://raw.githubusercontent.com/junhoyeo/tokscale/refs/heads/main/.github/badges/coverage.svg)](https://github.com/junhoyeo/tokscale/issues/403)
 
 [🇺🇸 English](README.md) | [🇰🇷 한국어](README.ko.md) | [🇯🇵 日本語](README.ja.md) | [🇨🇳 简体中文](README.zh-cn.md)
@@ -121,6 +121,8 @@
 | <img width="48px" src=".github/assets/client-aside.png" alt="Aside" /> | [Aside](https://asidehq.com) | `~/.aside/u/<account>/sessions/<session>/messages.jsonl` |
 | <img width="48px" src="https://github.com/mistralai.png" alt="Mistral Vibe" /> | [Mistral Vibe](https://github.com/mistralai/mistral-vibe) | `~/.vibe/logs/session/<session-dir>/meta.json`（Windows 通用路径；可用 `VIBE_HOME` 覆盖根目录） |
 | <img width="48px" src="https://raw.githubusercontent.com/proma-ai/Proma/86d9dfb511db4c1e3ffded3b6c3e312996f50cbf/apps/electron/resources/icon.png" alt="Proma" /> | [Proma](https://github.com/proma-ai/Proma) | `~/.proma/agent-sessions/`, `~/.proma/sdk-config/{sessions,projects}/`; `~/.proma-dev/` |
+| <img width="48px" src="https://github.com/get-bb.png" alt="BB" /> | [BB](https://getbb.app) | `~/.bb/bb.db`, `$BB_DATA_DIR/bb.db`, `~/.bb-dev/*/bb.db` |
+| <img width="48px" src="https://github.com/alibaba.png" alt="Qoder" /> | [Qoder](https://qoder.com) | `~/.qoder/projects/**/*.jsonl`, `~/.qoder-cn/projects/**/*.jsonl`（可用 `QODER_CONFIG_DIR` / `QODERCN_CONFIG_DIR` 覆盖根目录） |
 
 使用 [🚅 LiteLLM 的价格数据](https://github.com/BerriAI/litellm)提供实时价格计算，支持分层定价模型和缓存 Token 折扣。
 
@@ -193,7 +195,7 @@
   - 支持可配置颜色主题的 GitHub 风格贡献图
   - 实时筛选和排序
   - 零闪烁渲染
-- **多平台支持** - 跟踪 OpenCode、Claude Code、Codex CLI、Prime Agent、Copilot CLI、Cursor IDE、Gemini CLI、Amp、Codebuff、Droid、OpenClaw、Hermes Agent、Pi、Kimchi Coding、Reasonix、Kimi CLI、Kimi Work、Qwen CLI、Roo Code、Kilo、Mux、Kilo CLI、Crush、Goose、Antigravity、Antigravity CLI、Antigravity IDE Extension、Zed、Kiro、Trae、Warp/Oz、Cline、Gajae-Code、Grok Build、Jcode、MiMo Code、Xiaomi MiMo AI、Command Code、Junie、ZCode、OpenCodeReview、CodeBuddy、WorkBuddy、Devin CLI、Devin Desktop、Augment Code、Synthetic、Cherry Studio、LM Studio、Unsloth Studio、Hindsight、fx、Oh My Pi、Muse Code、Aside 和 Mistral Vibe、Proma 的使用情况
+- **多平台支持** - 跟踪 OpenCode、Claude Code、Codex CLI、Prime Agent、Copilot CLI、Cursor IDE、Gemini CLI、Amp、Codebuff、Droid、OpenClaw、Hermes Agent、Pi、Kimchi Coding、Reasonix、Kimi CLI、Kimi Work、Qwen CLI、Roo Code、Kilo、Mux、Kilo CLI、Crush、Goose、Antigravity、Antigravity CLI、Antigravity IDE Extension、Zed、Kiro、Trae、Warp/Oz、Cline、Gajae-Code、Grok Build、Jcode、MiMo Code、Xiaomi MiMo AI、Command Code、Junie、ZCode、OpenCodeReview、CodeBuddy、WorkBuddy、Devin CLI、Devin Desktop、Augment Code、Synthetic、Cherry Studio、LM Studio、Unsloth Studio、Hindsight、fx、Oh My Pi、Muse Code、Aside、Mistral Vibe、Proma、BB 和 Qoder 的使用情况
 - **实时定价** - 从 LiteLLM 获取当前价格，带 1 小时磁盘缓存；OpenRouter 自动回退和新模型的 Cursor 定价支持
 - **详细分解** - 输入、输出、缓存读写和推理 Token 跟踪
 - **原生 Rust 核心** - 所有解析和聚合在 Rust 中完成，处理速度提升 10 倍
@@ -461,7 +463,7 @@ tokscale --client synthetic
 tokscale --client opencode,claude --week --json
 ```
 
-可用值：`opencode`、`claude`、`codex`、`copilot`、`gemini`、`cursor`、`amp`、`codebuff`、`droid`、`openclaw`、`hermes`、`pi`、`prime-agent`、`kimchi`、`kimi`、`qwen`、`roocode`、`kilocode`、`kilo`、`mux`、`crush`、`goose`、`antigravity`、`antigravity-cli`、`antigravity-extension`、`zed`、`kiro`、`trae`、`warp`、`cline`、`gjc`、`grok`、`jcode`、`micode`、`micode-desktop`、`commandcode`、`junie`、`zcode`、`opencodereview`、`codebuddy`、`augment`、`synthetic`、`cherrystudio`、`lmstudio`、`unsloth`、`hindsight`、`muse`、`aside` 和 `vibe`。
+可用值：`opencode`、`claude`、`codex`、`copilot`、`gemini`、`cursor`、`amp`、`codebuff`、`droid`、`openclaw`、`hermes`、`pi`、`prime-agent`、`kimchi`、`kimi`、`qwen`、`roocode`、`kilocode`、`kilo`、`mux`、`crush`、`goose`、`antigravity`、`antigravity-cli`、`antigravity-extension`、`zed`、`kiro`、`trae`、`warp`、`cline`、`gjc`、`grok`、`jcode`、`micode`、`micode-desktop`、`commandcode`、`junie`、`zcode`、`opencodereview`、`codebuddy`、`augment`、`synthetic`、`cherrystudio`、`lmstudio`、`unsloth`、`hindsight`、`muse`、`aside`、`vibe`、`proma`、`bb` 和 `qoder`。
 
 > **破坏性变更（v4.0.0）**：单客户端布尔选项（`--opencode`、`--claude`、`--codex` 等）已被移除，现在会直接报错。请改用规范的 `--client`/`-c` 选项——例如 `tokscale --client opencode,claude`。
 
@@ -1167,7 +1169,7 @@ tokscale sources --json
 - **交互式提示**：悬停查看详细的每日分解
 - **每日分解面板**：点击查看每个来源和模型的详情
 - **年份筛选**：在年份之间导航
-- **来源筛选**：按平台筛选（OpenCode、Claude、Codex、Copilot、Cursor、Gemini、Amp、Codebuff、Droid、OpenClaw、Hermes Agent、Pi、Prime Agent、Kimi、Qwen、Roo Code、Kilo、Mux、Kilo CLI、Crush、Goose、Antigravity、Antigravity CLI、Antigravity IDE Extension、Zed、Kiro、Trae、Warp、Cline、Gajae-Code、Grok Build、Jcode、MiMo Code、Xiaomi MiMo AI、Command Code、Junie、ZCode、OpenCodeReview、CodeBuddy、WorkBuddy、Devin CLI、Devin Desktop、Augment Code、Synthetic、Cherry Studio、LM Studio、Unsloth、Hindsight、Muse Code、Aside 和 Mistral Vibe、Proma）
+- **来源筛选**：按平台筛选（OpenCode、Claude、Codex、Copilot、Cursor、Gemini、Amp、Codebuff、Droid、OpenClaw、Hermes Agent、Pi、Prime Agent、Kimi、Qwen、Roo Code、Kilo、Mux、Kilo CLI、Crush、Goose、Antigravity、Antigravity CLI、Antigravity IDE Extension、Zed、Kiro、Trae、Warp、Cline、Gajae-Code、Grok Build、Jcode、MiMo Code、Xiaomi MiMo AI、Command Code、Junie、ZCode、OpenCodeReview、CodeBuddy、WorkBuddy、Devin CLI、Devin Desktop、Augment Code、Synthetic、Cherry Studio、LM Studio、Unsloth、Hindsight、Muse Code、Aside、Mistral Vibe、Proma、BB、Qoder）
 - **统计面板**：总成本、Token、活跃天数、连续记录
 - **FOUC 防护**：在 React 水合前应用主题（无闪烁）
 
@@ -1591,6 +1593,8 @@ AI 编程工具将会话数据存储在跨平台位置。大多数工具在所�
 | Aside | `~/.aside/u/<account>/sessions/<session>/messages.jsonl` | `%USERPROFILE%\.aside\u\<account>\sessions\<session>\messages.jsonl` | 按账户读取原生浏览器用量；仅扫描 `messages.jsonl`，排除 artifacts、memory 和 passwords。 |
 | Mistral Vibe | `$VIBE_HOME/logs/session/`（默认：`~/.vibe/logs/session/`） | `%VIBE_HOME%\logs\session\`（默认：`%USERPROFILE%\.vibe\logs\session\`） | 全平台通用 `~/.vibe` 根目录；仅读取各会话目录的 `meta.json` 累计 `stats`，不读取 `messages.jsonl` 对话内容 |
 | Proma | `~/.proma/`, `~/.proma-dev/` | `%USERPROFILE%\.proma\`, `%USERPROFILE%\.proma-dev\` | 优先使用 Pi SDK 用量，避免重复计算界面副本；同时支持旧版 Claude SDK 记录及独立界面日志。详见[统计规则与限制](docs/proma.md)。 |
+| BB | `$BB_DATA_DIR`（默认：`~/.bb/`）、`~/.bb-dev/` | `%BB_DATA_DIR%`（默认：`%USERPROFILE%\.bb\`）、`%USERPROFILE%\.bb-dev\` | 解析 `bb.db` SQLite 数据库（`threads` 和 `events` 表）。准确提取编排代理 Harness 中的 Prompt 缓存和推理 Token 分解。BB 在常规主目录下运行 Claude Code 和 Codex，因此两边都记录的响应只在 `claude` 或 `codex` 下统计一次；仅指定 `--client bb` 时仍显示 BB 记录的全部内容。 |
+| Qoder | `$QODER_CONFIG_DIR/projects/`（默认：`~/.qoder/projects/`）、`$QODERCN_CONFIG_DIR/projects/`（默认：`~/.qoder-cn/projects/`） | `%QODER_CONFIG_DIR%\projects\`（默认：`%USERPROFILE%\.qoder\projects\`）、`%QODERCN_CONFIG_DIR%\projects\`（默认：`%USERPROFILE%\.qoder-cn\projects\`） | 解析 Qoder 和 Qoder CN 的 JSONL 会话及子代理日志；合并多分块助手片段，并在托管模型 Token 数被归零时从对话文本进行估算 |
 
 > **Devin Desktop 代理支持**：本地用量解析适用于会在 NDJSON 流中发出 `usage_update` 事件的 ACP 连接代理（例如 Cascade/Windsurf、claude-code、opencode）。默认的 **devin-cloud** 代理不会发出本地 `usage_update` 事件——其用量仍保留在服务器端，tokscale 无法在没有账号级 API 的情况下跟踪它。
 
@@ -2168,6 +2172,8 @@ Tokscale 从 [LiteLLM 的价格数据库](https://github.com/BerriAI/litellm/blo
 6. 推送到分支（`git push origin feature/amazing-feature`）
 7. 打开 Pull Request
 
+修改 `packages/frontend` 的 Pull Request 需要一次性签署[贡献者许可协议（CLA）](CLA.md)。CLA 检查会在 Pull Request 中评论签署方法。详情请参阅 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
 ### 开发指南
 
 - 遵循现有代码风格
@@ -2193,7 +2199,9 @@ Tokscale 从 [LiteLLM 的价格数据库](https://github.com/BerriAI/litellm/blo
 </p>
 
 <p align="center">
-  <strong>MIT © <a href="https://github.com/junhoyeo">Junho Yeo</a></strong>
+  <strong>CLI 与核心：MIT © <a href="https://github.com/junhoyeo">Junho Yeo</a> · Web 应用：AGPL-3.0</strong>
 </p>
+
+CLI 和核心库（`crates/`）采用 [MIT 许可证](LICENSE)。`packages/frontend` 中的 Web 应用采用 [GNU AGPL v3.0](packages/frontend/LICENSE)，适用范围见 [`LICENSING.md`](packages/frontend/LICENSING.md)。`packages/frontend/src/content` 中由 Tokscale 整理的数据采用 [CC BY 4.0](packages/frontend/src/content/LICENSE.md)。Tokscale 名称和标志适用[商标政策](TRADEMARKS.md)。
 
 如果您觉得这个项目有趣，**请考虑给它一个星标 ⭐** 或 [在 GitHub 上关注我](https://github.com/junhoyeo) 加入旅程（已有 1.1k+ 人加入）。我全天候编程，定期发布令人惊叹的东西——您的支持不会白费。
