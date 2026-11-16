@@ -47,6 +47,7 @@ export const AGENT_ICONS: Readonly<Record<string, string>> = {
   gjc: "/assets/v2/agents/github-com-7246e920-f3f8-4b6e-847e-030ae04e86c2.webp",
   "9router": "/assets/v2/agents/9router.svg",
   grok: "/assets/v2/agents/gh-xai-org.webp",
+  "grok-bot": "/assets/v2/agents/gh-xai-org.webp",
   jcode: "/assets/v2/agents/client-jcode.webp",
   commandcode: "/assets/v2/agents/raw-githubusercontent-com-command-code-logo-black-bg.webp",
   micode: "/assets/v2/agents/gh-xiaomimimo.webp",
