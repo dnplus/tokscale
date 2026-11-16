@@ -63,6 +63,7 @@ export const SUPPORTED_CLIENT_TYPES = [
   "proma",
   "bb",
   "qoder",
+  "capy",
 ] as const;
 
 export type CcMirrorClientType = `cc-mirror/${string}`;

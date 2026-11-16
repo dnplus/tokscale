@@ -3386,7 +3386,7 @@ dependencies = [
 
 [[package]]
 name = "tokscale-cli"
-version = "4.22.1"
+version = "4.23.0"
 dependencies = [
  "ab_glyph",
  "aes",
@@ -3441,7 +3441,7 @@ dependencies = [
 
 [[package]]
 name = "tokscale-core"
-version = "4.22.1"
+version = "4.23.0"
 dependencies = [
  "bincode",
  "chrono",

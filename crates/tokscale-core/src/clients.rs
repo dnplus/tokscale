@@ -1176,8 +1176,22 @@ define_clients!(
         parse_local: true,
         submit_default: true
     },
+    // Capy (capy.ai) runs its agent loop on Capy's servers, including local
+    // threads and connected subscriptions such as Codex, so no token record is
+    // written locally. `tokscale capy sync` caches rows from Capy's usage API.
+    Capy = 61 => {
+        id: "capy",
+        display: "Capy",
+        logo: None,
+        root: PathRoot::Config,
+        relative: "capy-cache",
+        pattern: "usage*.json",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
     // Attribution surface sharing Cursor's cache, not a second physical source.
-    GrokBot = 61 => {
+    GrokBot = 62 => {
         id: "grok-bot",
         display: "Grok Bot",
         logo: None,
@@ -1302,7 +1316,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 62);
+        assert_eq!(ClientId::COUNT, 63);
     }
 
     #[test]
