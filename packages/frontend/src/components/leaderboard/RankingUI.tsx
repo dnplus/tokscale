@@ -3,6 +3,7 @@
 import Link from "next/link";
 import styled from "styled-components";
 import { getGroupMonogram } from "./presentation";
+import { avatarSrc, sizedAvatarUrl } from "@/lib/avatar";
 
 export const CompactBadge = styled.span`
   display: inline-flex;
@@ -127,7 +128,7 @@ export function GroupMark({
 }) {
   return (
     <Mark $size={size} aria-hidden="true">
-      {avatarUrl ? <MarkImage src={avatarUrl} alt="" /> : getGroupMonogram(name)}
+      {avatarUrl ? <MarkImage src={sizedAvatarUrl(avatarUrl, size === "detail" ? 64 : 42)} alt="" /> : getGroupMonogram(name)}
     </Mark>
   );
 }
@@ -160,10 +161,20 @@ const MobileRankingLink = styled(Link)<{ $current: boolean }>`
   background: ${({ $current }) => $current ? "var(--service-accent-soft)" : "transparent"};
   color: inherit;
   text-decoration: none;
+  transition: background-color 120ms ease;
+
+  /* The row is one link: the same hover as other row links (globals.css). */
+  &:hover {
+    background: ${({ $current }) => $current ? "var(--service-accent-soft)" : "var(--v2-row-hover)"};
+  }
 
   &:focus-visible {
     outline: 2px solid var(--service-focus);
     outline-offset: -2px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    transition: none;
   }
 `;
 
@@ -246,6 +257,13 @@ const MobileMeta = styled.p`
   white-space: nowrap;
 `;
 
+/**
+ * Requested size of a row avatar. A ranking renders a table row and a phone row
+ * for each account and CSS shows one of them, so both ask for the same URL and
+ * load lazily: the browser then fetches one image per account, near the viewport.
+ */
+export const ROW_AVATAR_PX = 38;
+
 export function MobileRankingRow({
   rank,
   href,
@@ -271,13 +289,16 @@ export function MobileRankingRow({
     <MobileRankingItem>
       <MobileRankingLink
         href={href}
+        prefetch={false}
         $current={isCurrentUser}
         aria-current={isCurrentUser ? "true" : undefined}
       >
         <MobileRank data-rank={rank <= 3 ? rank : undefined}>#{rank}</MobileRank>
         <MobileAvatar
-          src={avatarUrl || `https://github.com/${username}.png`}
+          src={avatarSrc(avatarUrl, username, ROW_AVATAR_PX)}
           alt=""
+          loading="lazy"
+          decoding="async"
         />
         <MobileIdentity>
           <MobileName>{displayName}</MobileName>

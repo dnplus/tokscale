@@ -436,6 +436,9 @@ define_clients!(
         parse_local: true,
         submit_default: true
     },
+    // Not `PathRoot::Config`: without an override the cache has always lived
+    // at `~/.config/tokscale/cursor-cache` on every platform, and following
+    // `XDG_CONFIG_HOME` or `%APPDATA%` would orphan existing caches.
     Cursor = 3 => {
         id: "cursor",
         display: "Cursor IDE",
@@ -1134,19 +1137,7 @@ define_clients!(
         parse_local: true,
         submit_default: true
     },
-    // Attribution surface sharing Cursor's cache, not a second physical source.
-    GrokBot = 58 => {
-        id: "grok-bot",
-        display: "Grok Bot",
-        logo: None,
-        root: CURSOR_CACHE_ROOT,
-        relative: "cursor-cache",
-        pattern: "usage*.json|usage*.csv",
-        headless: false,
-        parse_local: false,
-        submit_default: true
-    },
-    Proma = 59 => {
+    Proma = 58 => {
         id: "proma",
         display: "Proma",
         logo: Some("https://raw.githubusercontent.com/proma-ai/Proma/86d9dfb511db4c1e3ffded3b6c3e312996f50cbf/apps/electron/resources/icon.png"),
@@ -1155,6 +1146,60 @@ define_clients!(
         pattern: "proma-session",
         headless: false,
         parse_local: true,
+        submit_default: true
+    },
+    Bb = 59 => {
+        id: "bb",
+        display: "BB",
+        logo: Some("https://github.com/get-bb.png"),
+        root: PathRoot::EnvVar {
+            var: "BB_DATA_DIR",
+            fallback_relative: ".bb",
+        },
+        relative: "bb.db",
+        pattern: "bb.db",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    Qoder = 60 => {
+        id: "qoder",
+        display: "Qoder",
+        logo: None,
+        root: PathRoot::EnvVar {
+            var: "QODER_CONFIG_DIR",
+            fallback_relative: ".qoder",
+        },
+        relative: "projects",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    // Capy (capy.ai) runs its agent loop on Capy's servers, including local
+    // threads and connected subscriptions such as Codex, so no token record is
+    // written locally. `tokscale capy sync` caches rows from Capy's usage API.
+    Capy = 61 => {
+        id: "capy",
+        display: "Capy",
+        logo: None,
+        root: PathRoot::Config,
+        relative: "capy-cache",
+        pattern: "usage*.json",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    // Attribution surface sharing Cursor's cache, not a second physical source.
+    GrokBot = 62 => {
+        id: "grok-bot",
+        display: "Grok Bot",
+        logo: None,
+        root: CURSOR_CACHE_ROOT,
+        relative: "cursor-cache",
+        pattern: "usage*.json|usage*.csv",
+        headless: false,
+        parse_local: false,
         submit_default: true
     }
 );
@@ -1271,7 +1316,28 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 60);
+        assert_eq!(ClientId::COUNT, 63);
+    }
+
+    #[test]
+    fn test_qoder_client_registered_as_local_session_source() {
+        let client = ClientId::from_str("qoder").expect("qoder client should be registered");
+        assert_eq!(client.display_name(), "Qoder");
+        assert_eq!(client.data().relative_path, "projects");
+        assert_eq!(client.data().pattern, "*.jsonl");
+        assert!(client.data().parse_local);
+        assert!(client.data().submit_default);
+        assert!(!client.data().headless);
+    }
+
+    #[test]
+    fn test_bb_client_registered_as_local_session_source() {
+        let client = ClientId::from_str("bb").expect("bb client should be registered");
+        assert_eq!(client.data().relative_path, "bb.db");
+        assert_eq!(client.data().pattern, "bb.db");
+        assert!(client.data().parse_local);
+        assert!(client.data().submit_default);
+        assert!(!client.data().headless);
     }
 
     #[test]
@@ -2190,6 +2256,48 @@ mod tests {
 
         restore_env("TOKSCALE_CONFIG_DIR", previous_override);
         restore_env("XDG_CONFIG_HOME", previous_xdg);
+    }
+
+    #[test]
+    #[serial]
+    fn test_cursor_cache_follows_config_dir_override_only() {
+        let mut env = EnvGuard::capture(&["TOKSCALE_CONFIG_DIR", "XDG_CONFIG_HOME"]);
+        let home = std::path::Path::new("/tmp/home");
+        let home_default = native_join(home, ".config/tokscale/cursor-cache");
+        let overridden = native_join(
+            std::path::Path::new("/tmp/custom-config-root"),
+            "cursor-cache",
+        );
+        for override_value in [None, Some(""), Some("/tmp/custom-config-root")] {
+            for xdg in [None, Some("/tmp/xdg-config-home")] {
+                for use_env_roots in [true, false] {
+                    match override_value {
+                        Some(value) => env.set("TOKSCALE_CONFIG_DIR", value),
+                        None => env.remove("TOKSCALE_CONFIG_DIR"),
+                    }
+                    match xdg {
+                        Some(value) => env.set("XDG_CONFIG_HOME", value),
+                        None => env.remove("XDG_CONFIG_HOME"),
+                    }
+                    // Only a non-empty override under env roots moves the
+                    // cache; XDG never does, and an explicit home stays
+                    // hermetic.
+                    let expected =
+                        if use_env_roots && override_value.is_some_and(|value| !value.is_empty()) {
+                            &overridden
+                        } else {
+                            &home_default
+                        };
+                    assert_eq!(
+                        &ClientId::Cursor
+                            .data()
+                            .resolve_path_with_env_strategy("/tmp/home", use_env_roots),
+                        expected,
+                        "override={override_value:?} xdg={xdg:?} env_roots={use_env_roots}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

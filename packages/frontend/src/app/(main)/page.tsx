@@ -1,8 +1,9 @@
 import type { Metadata } from "next";
 import { Navigation } from "@/components/layout/Navigation";
-import { LandingPage } from "@/components/landing/LandingPage";
-import { getStargazersCount } from "@/lib/github";
-import { getLeaderboardData, type LeaderboardData } from "@/lib/leaderboard/getLeaderboard";
+import { HomePage } from "@/components/home/HomePage";
+import { getCommunitySnapshot, getFeaturedHuman, getModelLeaderboard } from "@/lib/explore";
+import { getHomeCapital } from "@/lib/capital/ledger/home";
+import { isPrerenderedDeployment } from "@/lib/prerender";
 import { homeUrl } from "@/lib/seo/urls";
 
 // Declared per-page rather than on the root layout: `alternates.canonical` is
@@ -14,41 +15,39 @@ export const metadata: Metadata = {
   },
 };
 
-function createEmptyLeaderboardData(sortBy: "tokens" | "cost"): LeaderboardData {
-  return {
-    users: [],
-    pagination: {
-      page: 1,
-      limit: 5,
-      totalUsers: 0,
-      totalPages: 0,
-      hasNext: false,
-      hasPrev: false,
-    },
-    stats: {
-      totalTokens: 0,
-      totalCost: 0,
-      uniqueUsers: 0,
-    },
-    period: "all",
-    sortBy,
-  };
+/** Where pages are prerendered, rebuild this one in the background as often as the explore rollups refresh. */
+export const revalidate = 600;
+
+/** The home page features this account. It is pinned by hand: change the username to feature someone else. */
+const FEATURED_HUMAN_USERNAME = "Dicklesworthstone";
+
+/**
+ * A per-request render shows the sections it could load. A prerendered page is
+ * published as a whole and kept for ten minutes, so there a failed load fails
+ * the rebuild and the last complete page stays up.
+ */
+function section<T>(load: Promise<T>): Promise<T | null> {
+  return isPrerenderedDeployment() ? load : load.catch(() => null);
 }
 
-export default async function HomePage() {
-  const [stargazersCount, topUsersByCost, topUsersByTokens] = await Promise.all([
-    getStargazersCount("junhoyeo/tokscale"),
-    getLeaderboardData("all", 1, 5, "cost").catch(() => createEmptyLeaderboardData("cost")),
-    getLeaderboardData("all", 1, 5, "tokens").catch(() => createEmptyLeaderboardData("tokens")),
+export default async function Page() {
+  const [snapshot, featured, models, capital] = await Promise.all([
+    section(getCommunitySnapshot("30d")),
+    section(getFeaturedHuman(FEATURED_HUMAN_USERNAME, "30d")),
+    section(getModelLeaderboard({ period: "30d", sort: "users", limit: 2 })),
+    section(getHomeCapital()),
   ]);
 
   return (
     <>
       <Navigation />
-      <LandingPage
-        stargazersCount={stargazersCount}
-        topUsersByCost={topUsersByCost.users}
-        topUsersByTokens={topUsersByTokens.users}
+      <HomePage
+        snapshot={snapshot}
+        featuredHuman={featured?.human ?? null}
+        humansCoverage={featured?.coverage ?? null}
+        models={models?.rows ?? []}
+        modelsCoverage={models?.coverage ?? null}
+        capital={capital}
       />
     </>
   );

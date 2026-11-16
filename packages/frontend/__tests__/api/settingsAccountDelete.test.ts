@@ -4,6 +4,7 @@ const mockState = vi.hoisted(() => {
   const getSession = vi.fn();
   const getSessionFromHeader = vi.fn();
   const clearSession = vi.fn();
+  const advanceExploreCacheRevision = vi.fn(async () => {});
   const revalidateTag = vi.fn();
   const revalidatePath = vi.fn();
   const revalidateUserGroupLeaderboards = vi.fn();
@@ -33,16 +34,17 @@ const mockState = vi.hoisted(() => {
   let deletedRows: Array<{ id: string }> = [];
   let deleteError: Error | null = null;
 
+  const deleteFromTable = vi.fn(() => ({ where }));
   const db = {
-    delete: vi.fn(() => ({
-      where,
-    })),
+    delete: deleteFromTable,
+    transaction: vi.fn(async (callback: (tx: { delete: typeof deleteFromTable }) => Promise<unknown>) => callback(db)),
   };
 
   return {
     getSession,
     getSessionFromHeader,
     clearSession,
+    advanceExploreCacheRevision,
     revalidateTag,
     revalidatePath,
     revalidateUserGroupLeaderboards,
@@ -54,12 +56,14 @@ const mockState = vi.hoisted(() => {
       getSession.mockReset();
       getSessionFromHeader.mockReset();
       clearSession.mockReset();
+      advanceExploreCacheRevision.mockReset();
       revalidateTag.mockReset();
       revalidatePath.mockReset();
       revalidateUserGroupLeaderboards.mockReset();
       revalidateUsernamePaths.mockClear();
       eq.mockClear();
       db.delete.mockClear();
+      db.transaction.mockClear();
       where.mockClear();
       returning.mockClear();
       deletedRows = [];
@@ -73,6 +77,8 @@ const mockState = vi.hoisted(() => {
     },
   };
 });
+
+vi.mock("@/lib/explore/revision", () => ({ advanceExploreCacheRevision: mockState.advanceExploreCacheRevision }));
 
 vi.mock("next/cache", () => ({
   revalidateTag: mockState.revalidateTag,
@@ -120,10 +126,13 @@ beforeEach(() => {
 
 // The route goes through the real getSessionFromRequest, so cookie-auth
 // DELETEs must carry an allowlisted Origin header (CSRF gate from #615).
-function createRequest(options: { origin?: string | null } = {}) {
+function createRequest(options: { origin?: string | null; authorization?: string } = {}) {
   const headers = new Headers();
   if (options.origin !== null) {
     headers.set("Origin", options.origin ?? "http://localhost:3000");
+  }
+  if (options.authorization) {
+    headers.set("Authorization", options.authorization);
   }
   return new Request("http://localhost/api/settings/account", {
     method: "DELETE",
@@ -141,6 +150,59 @@ describe("DELETE /api/settings/account", () => {
     expect(await response.json()).toEqual({ error: "Not authenticated" });
     expect(mockState.db.delete).not.toHaveBeenCalled();
     expect(mockState.revalidateUserGroupLeaderboards).not.toHaveBeenCalled();
+  });
+
+  it("rejects Authorization-header bearer auth", async () => {
+    mockState.getSession.mockResolvedValue(null);
+    mockState.getSessionFromHeader.mockResolvedValue({
+      id: "user-1",
+      username: "alice",
+      displayName: "Alice",
+      avatarUrl: null,
+      isAdmin: false,
+    });
+
+    const bearerResponse = await DELETE(
+      createRequest({
+        origin: "http://localhost:3000",
+        authorization: "Bearer tt_personal_token",
+      })
+    );
+
+    expect(bearerResponse.status).toBe(401);
+    expect(await bearerResponse.json()).toEqual({ error: "Not authenticated" });
+    expect(mockState.getSessionFromHeader).not.toHaveBeenCalled();
+    expect(mockState.db.delete).not.toHaveBeenCalled();
+  });
+
+  it("enforces the Origin allowlist even when an Authorization header is sent", async () => {
+    mockState.getSession.mockResolvedValue({
+      id: "user-1",
+      username: "alice",
+      displayName: "Alice",
+      avatarUrl: null,
+      isAdmin: false,
+    });
+    mockState.getSessionFromHeader.mockResolvedValue({
+      id: "user-1",
+      username: "alice",
+      displayName: "Alice",
+      avatarUrl: null,
+      isAdmin: false,
+    });
+
+    const csrfBypassAttempt = await DELETE(
+      createRequest({
+        origin: "https://attacker.example",
+        authorization: "Bearer tt_personal_token",
+      })
+    );
+
+    expect(csrfBypassAttempt.status).toBe(401);
+    expect(await csrfBypassAttempt.json()).toEqual({ error: "Not authenticated" });
+    expect(mockState.getSessionFromHeader).not.toHaveBeenCalled();
+    expect(mockState.getSession).not.toHaveBeenCalled();
+    expect(mockState.db.delete).not.toHaveBeenCalled();
   });
 
   it("returns 401 when Origin is missing and never touches the DB", async () => {
@@ -197,6 +259,8 @@ describe("DELETE /api/settings/account", () => {
       deleted: true,
     });
     expect(mockState.db.delete).toHaveBeenCalledTimes(1);
+    expect(mockState.db.transaction).toHaveBeenCalledTimes(1);
+    expect(mockState.advanceExploreCacheRevision).toHaveBeenCalledWith(mockState.db);
     expect(mockState.eq).toHaveBeenCalledWith("users.id", "user-1");
     expect(mockState.clearSession).toHaveBeenCalledTimes(1);
 
@@ -209,14 +273,15 @@ describe("DELETE /api/settings/account", () => {
       mockState.revalidateUserGroupLeaderboards.mock.invocationCallOrder[0]
     ).toBeLessThan(mockState.db.delete.mock.invocationCallOrder[0]);
 
-    expect(mockState.revalidateTag).toHaveBeenCalledTimes(7);
-    expect(mockState.revalidateTag).toHaveBeenNthCalledWith(1, "leaderboard", "max");
-    expect(mockState.revalidateTag).toHaveBeenNthCalledWith(2, "user:alice", "max");
-    expect(mockState.revalidateTag).toHaveBeenNthCalledWith(3, "user-rank", "max");
-    expect(mockState.revalidateTag).toHaveBeenNthCalledWith(4, "user-rank:alice", "max");
-    expect(mockState.revalidateTag).toHaveBeenNthCalledWith(5, "embed-user:alice", "max");
-    expect(mockState.revalidateTag).toHaveBeenNthCalledWith(6, "embed-user:alice:tokens", "max");
-    expect(mockState.revalidateTag).toHaveBeenNthCalledWith(7, "embed-user:alice:cost", "max");
+    expect(mockState.revalidateTag).toHaveBeenCalledTimes(8);
+    expect(mockState.revalidateTag).toHaveBeenNthCalledWith(1, "explore", { expire: 0 });
+    expect(mockState.revalidateTag).toHaveBeenNthCalledWith(2, "leaderboard", "max");
+    expect(mockState.revalidateTag).toHaveBeenNthCalledWith(3, "user:alice", "max");
+    expect(mockState.revalidateTag).toHaveBeenNthCalledWith(4, "user-rank", "max");
+    expect(mockState.revalidateTag).toHaveBeenNthCalledWith(5, "user-rank:alice", "max");
+    expect(mockState.revalidateTag).toHaveBeenNthCalledWith(6, "embed-user:alice", "max");
+    expect(mockState.revalidateTag).toHaveBeenNthCalledWith(7, "embed-user:alice:tokens", "max");
+    expect(mockState.revalidateTag).toHaveBeenNthCalledWith(8, "embed-user:alice:cost", "max");
     expect(mockState.revalidateUsernamePaths).toHaveBeenCalledWith("Alice");
     expect(mockState.revalidatePath).toHaveBeenNthCalledWith(1, "/leaderboard");
     expect(mockState.revalidatePath).toHaveBeenNthCalledWith(2, "/profile");
@@ -237,6 +302,16 @@ describe("DELETE /api/settings/account", () => {
     expect(response.status).toBe(404);
     expect(await response.json()).toEqual({ error: "User not found" });
     expect(mockState.clearSession).not.toHaveBeenCalled();
+  });
+
+  it("fails the mutation when its transactional privacy revision cannot advance", async () => {
+    mockState.getSession.mockResolvedValue({ id: "user-1", username: "alice", displayName: "Alice", avatarUrl: null });
+    mockState.setDeletedRows([{ id: "deleted-1" }]);
+    mockState.advanceExploreCacheRevision.mockRejectedValueOnce(new Error("revision unavailable"));
+    const response = await DELETE(createRequest());
+    expect(response.status).toBe(500);
+    expect(mockState.db.transaction).toHaveBeenCalledTimes(1);
+    expect(mockState.revalidateTag).not.toHaveBeenCalled();
   });
 
   it("returns 500 when deletion fails", async () => {

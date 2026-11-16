@@ -82,7 +82,17 @@ pub const CLIENT_UI: [ClientUi; ClientId::COUNT] = [
     // letter from "misTral".
     ClientUi { hotkey: 'T' },
     ClientUi { hotkey: 'J' },
+    // BB: both cases of `b` are taken (`b` and `B`), `s` is the global
+    // "sources" picker binding, so `Z` takes the next available slot.
     ClientUi { hotkey: 'Z' },
+    // Qoder: uppercase `Q` stays mnemonic while lowercase `q` belongs to ZCode.
+    ClientUi { hotkey: 'Q' },
+    // Capy: every letter in both cases and every digit is taken (`s` is the
+    // global "sources" picker binding), so the first punctuation slot is used.
+    ClientUi { hotkey: '!' },
+    // Grok Bot (fork-only partition of Cursor): kept last so upstream client
+    // indexes never shift; takes the next punctuation slot after Capy.
+    ClientUi { hotkey: '@' },
 ];
 
 pub fn display_name(client: ClientId) -> &'static str {

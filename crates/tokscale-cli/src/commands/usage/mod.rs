@@ -1,7 +1,7 @@
 #![cfg_attr(test, allow(dead_code))]
 
 mod amp;
-mod antigravity;
+pub mod antigravity;
 mod claude;
 pub mod codex;
 mod colab;
@@ -356,7 +356,24 @@ fn save_cache_at(path: &std::path::Path, data: &[UsageOutput]) {
         "timestamp": timestamp,
         "data": data,
     });
-    let _ = std::fs::write(path, serde_json::to_string(&json).unwrap_or_default());
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> std::io::Result<()> {
+        let serialized = serde_json::to_vec(&json).map_err(std::io::Error::other)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            file.set_permissions(metadata.permissions())?;
+        }
+        use std::io::Write;
+        file.write_all(&serialized)?;
+        file.flush()?;
+        tokscale_core::fs_atomic::replace_file(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
 }
 
 pub fn save_cache(data: &[UsageOutput]) {
@@ -389,12 +406,15 @@ fn load_startup_cache_at(path: &std::path::Path) -> Option<Vec<UsageOutput>> {
         return None;
     }
     let mut outputs: Vec<UsageOutput> = serde_json::from_value(doc.get("data")?.clone()).ok()?;
-    // Warp freshness comes from its own aggregate cache and must not be renewed
-    // by subscription recaching. Shared cards do not prove which Claude token
-    // supplied the observation; rehydrate Claude only from its current-token
-    // state, including its time.
+    // Shared cards do not prove which Claude token supplied the observation.
+    // Rehydrate Claude only from its current-token state, including its time.
+    // Warp's stale flag is computed against its sync time when fetched, so a
+    // recached card would keep claiming it is current.
     outputs.retain(|output| {
-        output.provider != "Warp/Oz" && provider_id_for_label(&output.provider) != Some("claude")
+        !matches!(
+            provider_id_for_label(&output.provider),
+            Some("claude" | "warp")
+        )
     });
     Some(outputs)
 }
@@ -515,7 +535,7 @@ fn usage_providers(codex_fetch: Fetch) -> Vec<UsageProvider> {
             "warp",
             "Warp/Oz",
             warp::has_credentials,
-            Fetch::Report(warp::fetch),
+            Fetch::Report(|| Ok(warp::fetch_report())),
         ),
         (
             "sakana",
@@ -946,6 +966,25 @@ mod tests {
         clear_cache();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn subscription_cache_save_replaces_the_file_instead_of_rewriting_it() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = TempDir::new().unwrap();
+        let path = cache_path_in(temp.path()).unwrap();
+        save_cache_at(&path, &[sample_output("Codex")]);
+        let open_file = std::fs::File::open(&path).unwrap();
+        let original_inode = open_file.metadata().unwrap().ino();
+        let original_permissions = open_file.metadata().unwrap().permissions();
+
+        save_cache_at(&path, &[sample_output("Copilot")]);
+
+        let replacement = std::fs::metadata(&path).unwrap();
+        assert_ne!(replacement.ino(), original_inode);
+        assert_eq!(replacement.permissions(), original_permissions);
+    }
+
     #[test]
     fn warp_freshness_cannot_be_renewed_by_subscription_recaching() {
         let temp = TempDir::new().unwrap();
@@ -975,6 +1014,24 @@ mod tests {
         assert!(expected.exists());
         clear_cache_at(&expected);
         assert!(!expected.exists());
+    }
+
+    #[test]
+    fn shared_cache_does_not_rehydrate_warp_freshness() {
+        let temp = TempDir::new().unwrap();
+        let path = cache_path_in(temp.path()).unwrap();
+        let mut warp = sample_output("Warp/Oz");
+        warp.freshness = Some(UsageFreshness {
+            fetched_at: 1,
+            stale: false,
+        });
+        // Saving again must not let the card back in either.
+        for _ in 0..2 {
+            save_cache_at(&path, &[warp.clone(), sample_output("Codex")]);
+            let cached = load_startup_cache_at(&path).unwrap();
+            assert_eq!(cached.len(), 1);
+            assert_eq!(cached[0].provider, "Codex");
+        }
     }
 
     #[test]

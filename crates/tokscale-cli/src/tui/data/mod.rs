@@ -378,7 +378,7 @@ fn accumulate_session_entry(
     {
         entry.models.push(SessionModel {
             display_name: normalized_model.to_string(),
-            provider: msg.provider_id.clone(),
+            provider: msg.provider_id.to_string(),
             color_key: model_key.to_string(),
         });
     }
@@ -805,7 +805,7 @@ impl DataLoader {
     ) -> Result<UsageData> {
         let mut model_map: HashMap<String, ModelUsage> = HashMap::new();
         let mut agent_map: HashMap<String, AgentUsage> = HashMap::new();
-        let mut agent_clients: HashMap<String, BTreeSet<String>> = HashMap::new();
+        let mut agent_clients: HashMap<String, BTreeSet<tokscale_core::SharedStr>> = HashMap::new();
         let mut daily_map: HashMap<NaiveDate, DailyUsage> = HashMap::new();
         let mut hourly_map: HashMap<NaiveDateTime, HourlyUsage> = HashMap::new();
         let mut minutely_map: HashMap<NaiveDateTime, MinutelyUsage> = HashMap::new();
@@ -875,7 +875,8 @@ impl DataLoader {
         let mut session_rolled_map: HashMap<String, SessionUsage> = HashMap::new();
         // Distinct subagent session ids rolled into each bucket, so the
         // "(+N)" marker counts sessions, not messages.
-        let mut rolled_child_sessions: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut rolled_child_sessions: HashMap<String, HashSet<tokscale_core::SharedStr>> =
+            HashMap::new();
         // Immediate-parent edge per subagent session (child key -> parent
         // key), recorded once per link. Messages name only their immediate
         // parent, so sub-sub-agent chains are resolved to the root session
@@ -972,8 +973,8 @@ impl DataLoader {
             let model_entry = model_map.entry(key.clone()).or_insert_with(|| ModelUsage {
                 model: normalized_model.clone(),
                 color_key: model_key.clone(),
-                provider: msg.provider_id.clone(),
-                client: msg.client.clone(),
+                provider: msg.provider_id.to_string(),
+                client: msg.client.to_string(),
                 workspace_key: if *group_by == GroupBy::WorkspaceModel {
                     workspace_key.clone()
                 } else {
@@ -1094,7 +1095,7 @@ impl DataLoader {
             if !is_recovery_floor {
                 if let Some(agent) = msg.agent.as_ref() {
                     let normalized_agent = if msg.client == "grok-bot" {
-                        agent.clone()
+                        agent.to_string()
                     } else if msg.client == "opencode" {
                         sessions::normalize_opencode_agent_name(agent)
                     } else if msg.client == "copilot" {
@@ -1228,7 +1229,7 @@ impl DataLoader {
                     .models
                     .entry(daily_model_key)
                     .or_insert_with(|| DailyModelInfo {
-                        provider: msg.provider_id.clone(),
+                        provider: msg.provider_id.to_string(),
                         display_name: daily_source_model_display_name(
                             group_by,
                             &workspace_label,
@@ -1325,7 +1326,7 @@ impl DataLoader {
                     .models
                     .entry(hourly_model_key)
                     .or_insert_with(|| HourlyModelInfo {
-                        provider: msg.provider_id.clone(),
+                        provider: msg.provider_id.to_string(),
                         display_name: hourly_model_display_name(
                             group_by,
                             &msg.provider_id,
@@ -1420,7 +1421,7 @@ impl DataLoader {
                         .models
                         .entry(m_model_key)
                         .or_insert_with(|| HourlyModelInfo {
-                            provider: msg.provider_id.clone(),
+                            provider: msg.provider_id.to_string(),
                             display_name: hourly_model_display_name(
                                 group_by,
                                 &msg.provider_id,
@@ -1571,7 +1572,7 @@ impl DataLoader {
                 }
 
                 if !project_entry.clients.iter().any(|c| c == &msg.client) {
-                    project_entry.clients.push(msg.client.clone());
+                    project_entry.clients.push(msg.client.to_string());
                 }
 
                 if !project_entry
@@ -1581,7 +1582,7 @@ impl DataLoader {
                 {
                     project_entry.models.push(SessionModel {
                         display_name: normalized_model.clone(),
-                        provider: msg.provider_id.clone(),
+                        provider: msg.provider_id.to_string(),
                         color_key: model_key.clone(),
                     });
                 }
@@ -2132,21 +2133,21 @@ mod tests {
     fn accumulate_session_entry_normalizes_and_deduplicates_agents() {
         let mut entry = SessionUsage::new("opencode", "sess-test");
         let mut msg = UnifiedMessage {
-            client: "opencode".to_string(),
-            model_id: "test-model".to_string(),
-            provider_id: "test-provider".to_string(),
-            session_id: "sess-test".to_string(),
-            workspace_key: Some("/path/to/project".to_string()),
-            workspace_label: Some("project".to_string()),
+            client: "opencode".to_string().into(),
+            model_id: "test-model".to_string().into(),
+            provider_id: "test-provider".to_string().into(),
+            session_id: "sess-test".to_string().into(),
+            workspace_key: Some("/path/to/project".to_string().into()),
+            workspace_label: Some("project".to_string().into()),
             timestamp: 1_700_000_000,
-            date: "2023-11-14".to_string(),
+            date: "2023-11-14".to_string().into(),
             tokens: tokscale_core::TokenBreakdown::default(),
             cost: 0.0,
             cost_source: tokscale_core::sessions::CostSource::default(),
             service_tier: None,
             duration_ms: None,
             message_count: 1,
-            agent: Some("hephaestus".to_string()),
+            agent: Some("hephaestus".to_string().into()),
             dedup_key: None,
             session_title: None,
             parent_session_id: None,
@@ -2157,6 +2158,7 @@ mod tests {
             estimate_status: tokscale_core::sessions::EstimateStatus::Unpriced,
             copilot_context: None,
             session_context: Default::default(),
+            claude_entry_uuid: Default::default(),
             machine_label: None,
         };
 
@@ -2164,7 +2166,7 @@ mod tests {
         assert_eq!(entry.agents, vec!["Hephaestus".to_string()]);
 
         // Duplicate with variant formatting doesn't add duplicate
-        msg.agent = Some(" Hephaestus ".to_string());
+        msg.agent = Some(" Hephaestus ".to_string().into());
         accumulate_session_entry(&mut entry, &msg, 0.0, "test-model", "test-model", true);
         assert_eq!(entry.agents, vec!["Hephaestus".to_string()]);
     }
@@ -2428,7 +2430,11 @@ mod tests {
         assert_eq!(clients[55], ClientId::AntigravityExtension);
         assert_eq!(clients[56], ClientId::Aside);
         assert_eq!(clients[57], ClientId::Vibe);
-        assert_eq!(clients[58], ClientId::GrokBot);
+        assert_eq!(clients[58], ClientId::Proma);
+        assert_eq!(clients[59], ClientId::Bb);
+        assert_eq!(clients[60], ClientId::Qoder);
+        assert_eq!(clients[61], ClientId::Capy);
+        assert_eq!(clients[62], ClientId::GrokBot);
     }
 
     #[test]
@@ -2492,8 +2498,11 @@ mod tests {
             "Antigravity IDE Extension",
             "Aside",
             "Mistral Vibe",
-            "Grok Bot",
             "Proma",
+            "BB",
+            "Qoder",
+            "Capy",
+            "Grok Bot",
         ];
 
         assert_eq!(expected.len(), ClientId::COUNT);
@@ -2552,6 +2561,9 @@ mod tests {
             'I'
         );
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::Vibe), 'T');
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::Proma), 'J');
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::Bb), 'Z');
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::Qoder), 'Q');
     }
 
     #[test]
@@ -2679,6 +2691,19 @@ mod tests {
         assert_eq!(
             crate::tui::client_ui::from_hotkey('T'),
             Some(ClientId::Vibe)
+        );
+        assert_eq!(
+            crate::tui::client_ui::from_hotkey('J'),
+            Some(ClientId::Proma)
+        );
+        assert_eq!(crate::tui::client_ui::from_hotkey('Z'), Some(ClientId::Bb));
+        assert_eq!(
+            crate::tui::client_ui::from_hotkey('Q'),
+            Some(ClientId::Qoder)
+        );
+        assert_eq!(
+            crate::tui::client_ui::from_hotkey('!'),
+            Some(ClientId::Capy)
         );
     }
 
@@ -2846,7 +2871,7 @@ mod tests {
                     reasoning: 0,
                 },
                 1.25,
-                Some("builder".to_string()),
+                Some("builder"),
             ),
             UnifiedMessage::new_with_agent(
                 "roocode",
@@ -2863,7 +2888,7 @@ mod tests {
                     reasoning: 0,
                 },
                 2.75,
-                Some("builder".to_string()),
+                Some("builder"),
             ),
         ];
 
@@ -2964,7 +2989,7 @@ mod tests {
                 None,
                 None,
             );
-            msg.machine_label = Some(machine.to_string());
+            msg.machine_label = Some(machine.to_string().into());
             msg
         };
         let loader = DataLoader::new(None);
@@ -3011,7 +3036,7 @@ mod tests {
             None,
             None,
         );
-        steven.machine_label = Some("steven".to_string());
+        steven.machine_label = Some("steven".to_string().into());
         vec![local, steven]
     }
 
@@ -3079,7 +3104,7 @@ mod tests {
                 None,
                 None,
             );
-            msg.date = date.to_string();
+            msg.date = date.to_string().into();
             msg.duration_ms = duration_ms;
             msg
         };
@@ -4034,7 +4059,7 @@ mod tests {
                     reasoning: 0,
                 },
                 1.5,
-                Some("Sisyphus".to_string()),
+                Some("Sisyphus"),
             ),
             UnifiedMessage::new_with_agent(
                 "opencode",
@@ -4051,7 +4076,7 @@ mod tests {
                     reasoning: 0,
                 },
                 2.5,
-                Some("Sisyphus (Ultraworker)".to_string()),
+                Some("Sisyphus (Ultraworker)"),
             ),
         ];
 
@@ -4086,7 +4111,7 @@ mod tests {
                     reasoning: 0,
                 },
                 1.5,
-                Some("Hephaestus".to_string()),
+                Some("Hephaestus"),
             ),
             UnifiedMessage::new_with_agent(
                 "opencode",
@@ -4103,7 +4128,7 @@ mod tests {
                     reasoning: 0,
                 },
                 2.5,
-                Some("hephaestus".to_string()),
+                Some("hephaestus"),
             ),
         ];
 
@@ -4137,7 +4162,7 @@ mod tests {
                     reasoning: 0,
                 },
                 1.5,
-                Some("Sisyphus".to_string()),
+                Some("Sisyphus"),
             ),
             UnifiedMessage::new_with_agent(
                 "claude",
@@ -4154,7 +4179,7 @@ mod tests {
                     reasoning: 0,
                 },
                 2.5,
-                Some("Sisyphus (Ultraworker)".to_string()),
+                Some("Sisyphus (Ultraworker)"),
             ),
         ];
 
@@ -4500,8 +4525,8 @@ after"#,
                 },
                 cost,
             );
-            msg.session_title = title.map(str::to_string);
-            msg.parent_session_id = parent.map(str::to_string);
+            msg.session_title = title.map(tokscale_core::SharedStr::from);
+            msg.parent_session_id = parent.map(tokscale_core::SharedStr::from);
             msg
         };
 
@@ -4601,7 +4626,7 @@ after"#,
                 },
                 0.1,
             );
-            msg.session_title = title.map(str::to_string);
+            msg.session_title = title.map(tokscale_core::SharedStr::from);
             msg
         };
 
@@ -4647,7 +4672,7 @@ after"#,
                 },
                 input as f64 / 100.0,
             );
-            msg.parent_session_id = parent.map(str::to_string);
+            msg.parent_session_id = parent.map(tokscale_core::SharedStr::from);
             msg
         };
 
@@ -4877,7 +4902,7 @@ after"#,
         native.agent = Some("build".into());
         let mut floor = make_msg(0, 400, 200, 4.0);
         let floor_key = "local-recovery:daily:claude:2025-01-15".to_string();
-        floor.session_id = floor_key.clone();
+        floor.session_id = floor_key.clone().into();
         floor.dedup_key = Some(floor_key);
         floor.date = native.date.clone();
         floor.agent = Some("Recovered daily aggregate (component split estimated)".into());
@@ -4958,7 +4983,7 @@ mod subagent_rollup_tests {
             },
             n as f64 * 0.25,
         );
-        m.parent_session_id = parent.map(str::to_owned);
+        m.parent_session_id = parent.map(tokscale_core::SharedStr::from);
         m.is_turn_start = true;
         m
     }

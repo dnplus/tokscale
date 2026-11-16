@@ -1,0 +1,185 @@
+{
+  "sources": [
+    {
+      "id": "src_anthropic_microsoft_nvidia",
+      "url": "https://www.anthropic.com/news/microsoft-nvidia-anthropic-announce-strategic-partnerships",
+      "publisher": "Anthropic",
+      "type": "company_announcement",
+      "title": "Microsoft, NVIDIA, and Anthropic announce strategic partnerships",
+      "publishedAt": "2025-11-18",
+      "retrievedAt": "2026-10-21",
+      "license": "publisher"
+    },
+    {
+      "id": "src_anthropic_s1a_2026_11_10",
+      "url": "https://www.sec.gov/Archives/edgar/data/2130357/000162828026072484/anthropicpbc-sx1ax2.htm",
+      "publisher": "SEC EDGAR (Anthropic, PBC)",
+      "type": "sec_filing",
+      "title": "Anthropic, PBC Amendment No. 2 to Form S-1, November 10, 2026",
+      "publishedAt": "2026-11-10",
+      "retrievedAt": "2026-11-12",
+      "filing": {
+        "form": "S-1/A",
+        "accession": "0001628280-26-072484",
+        "cik": "0002130357",
+        "filedAt": "2026-11-10"
+      },
+      "license": "public-domain-sec"
+    }
+  ],
+  "event": {
+    "id": "evt_anthropic_microsoft_nvidia_2025",
+    "slug": "anthropic-microsoft-nvidia-2025",
+    "kind": "deal",
+    "types": [
+      "compute_commitment",
+      "strategic_investment"
+    ],
+    "title": "Microsoft, NVIDIA and Anthropic strategic partnerships",
+    "summary": "Anthropic committed to buy Azure compute capacity from Microsoft and later disclosed that amendments through November 2026 increased its aggregate commitment to at least $47.2 billion and up to $49.2 billion. NVIDIA and Microsoft also committed to invest up to $10 billion and up to $5 billion in Anthropic.",
+    "date": "2025-11-18",
+    "dates": {
+      "announced": "2025-11-18",
+      "filed": "2026-11-10"
+    },
+    "status": "signed",
+    "participants": [
+      {
+        "org": "org_anthropic",
+        "roles": [
+          "buyer",
+          "issuer"
+        ]
+      },
+      {
+        "org": "org_microsoft",
+        "roles": [
+          "provider",
+          "strategic_investor"
+        ]
+      },
+      {
+        "org": "org_nvidia",
+        "roles": [
+          "partner",
+          "strategic_investor"
+        ]
+      }
+    ],
+    "amounts": [
+      {
+        "id": "azure_compute",
+        "label": "Minimum Azure compute commitment after amendments",
+        "measure": "compute_commitment",
+        "value": 47200000000,
+        "currency": "USD",
+        "basis": "at_least",
+        "status": "signed",
+        "asOf": "2026-11-10",
+        "from": "org_anthropic",
+        "to": "org_microsoft",
+        "term": {
+          "starts": "November 2026 through June 2033"
+        },
+        "sourceId": "src_anthropic_s1a_2026_11_10",
+        "quote": "In November 2025, we entered into an agreement with Microsoft, which was subsequently amended between February and November 2026, pursuant to which we committed to spend an aggregate of at least $47.2 billion and up to $49.2 billion between November 2026 and June 2033, regardless of actual usage."
+      },
+      {
+        "id": "azure_compute_maximum",
+        "label": "Maximum Azure compute commitment after amendments",
+        "measure": "compute_commitment",
+        "value": 49200000000,
+        "currency": "USD",
+        "basis": "up_to",
+        "status": "signed",
+        "asOf": "2026-11-10",
+        "from": "org_anthropic",
+        "to": "org_microsoft",
+        "term": {
+          "starts": "November 2026 through June 2033"
+        },
+        "condition": "Maximum aggregate spend under the amended agreement",
+        "alternativeTo": "azure_compute",
+        "sourceId": "src_anthropic_s1a_2026_11_10",
+        "quote": "In November 2025, we entered into an agreement with Microsoft, which was subsequently amended between February and November 2026, pursuant to which we committed to spend an aggregate of at least $47.2 billion and up to $49.2 billion between November 2026 and June 2033, regardless of actual usage."
+      },
+      {
+        "id": "nvidia_investment",
+        "label": "NVIDIA investment commitment",
+        "measure": "investment_commitment",
+        "value": 10000000000,
+        "currency": "USD",
+        "basis": "up_to",
+        "status": "announced",
+        "asOf": "2025-11-18",
+        "from": "org_nvidia",
+        "to": "org_anthropic",
+        "sourceId": "src_anthropic_microsoft_nvidia",
+        "quote": "As part of the partnership, NVIDIA and Microsoft are committing to invest up to $10 billion and up to $5 billion respectively in Anthropic."
+      },
+      {
+        "id": "microsoft_investment",
+        "label": "Microsoft investment commitment",
+        "measure": "investment_commitment",
+        "value": 5000000000,
+        "currency": "USD",
+        "basis": "up_to",
+        "status": "announced",
+        "asOf": "2025-11-18",
+        "from": "org_microsoft",
+        "to": "org_anthropic",
+        "sourceId": "src_anthropic_microsoft_nvidia",
+        "quote": "As part of the partnership, NVIDIA and Microsoft are committing to invest up to $10 billion and up to $5 billion respectively in Anthropic."
+      }
+    ],
+    "quantities": [
+      {
+        "id": "additional_capacity",
+        "label": "Additional compute capacity",
+        "measure": "capacity_gw",
+        "value": 1,
+        "basis": "up_to",
+        "sourceId": "src_anthropic_microsoft_nvidia",
+        "quote": "Anthropic has committed to purchase $30 billion of Azure compute capacity and to contract additional compute capacity up to one gigawatt."
+      }
+    ],
+    "facts": [
+      {
+        "label": "NVIDIA systems",
+        "text": "The compute commitment starts with up to one gigawatt on NVIDIA Grace Blackwell and Vera Rubin systems.",
+        "sourceId": "src_anthropic_microsoft_nvidia",
+        "quote": "Anthropic's compute commitment will initially be up to one gigawatt of compute capacity with NVIDIA Grace Blackwell and Vera Rubin systems."
+      },
+      {
+        "label": "Technology partnership",
+        "text": "Anthropic and NVIDIA will work together on design and engineering of models and future NVIDIA architectures.",
+        "sourceId": "src_anthropic_microsoft_nvidia",
+        "quote": "Anthropic and NVIDIA will collaborate on design and engineering, with the goal of optimizing Anthropic models for the best possible performance, efficiency, and TCO, and optimizing future NVIDIA architectures for Anthropic workloads."
+      },
+      {
+        "label": "Amazon",
+        "text": "Amazon stays Anthropic's primary cloud provider and training partner.",
+        "sourceId": "src_anthropic_microsoft_nvidia",
+        "quote": "Amazon remains Anthropic's primary cloud provider and training partner."
+      }
+    ],
+    "relations": [
+      {
+        "type": "related",
+        "event": "evt_anthropic_series_g_2026",
+        "note": "Anthropic says its Series G round includes a portion of these investments."
+      }
+    ],
+    "sourceIds": [
+      "src_anthropic_microsoft_nvidia",
+      "src_anthropic_s1a_2026_11_10"
+    ],
+    "reviewedAt": "2026-11-12",
+    "corrections": [
+      {
+        "date": "2026-11-12",
+        "text": "Updated the Azure commitment to the $47.2 billion minimum and $49.2 billion maximum disclosed after amendments through November 2026."
+      }
+    ]
+  }
+}

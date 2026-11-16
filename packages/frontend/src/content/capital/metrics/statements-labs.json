@@ -1,0 +1,94 @@
+{
+  "sources": [
+    {
+      "id": "src_anthropic_series_f",
+      "url": "https://www.anthropic.com/news/anthropic-raises-series-f-at-usd183b-post-money-valuation",
+      "publisher": "Anthropic",
+      "type": "company_announcement",
+      "title": "Anthropic raises $13B Series F at $183B post-money valuation",
+      "publishedAt": "2025-09-02",
+      "retrievedAt": "2026-10-21",
+      "license": "publisher"
+    },
+    {
+      "id": "src_anthropic_series_g",
+      "url": "https://www.anthropic.com/news/anthropic-raises-30-billion-series-g-funding-380-billion-post-money-valuation",
+      "publisher": "Anthropic",
+      "type": "company_announcement",
+      "title": "Anthropic raises $30 billion in Series G funding at $380 billion post-money valuation",
+      "publishedAt": "2026-02-12",
+      "retrievedAt": "2026-10-21",
+      "license": "publisher"
+    },
+    {
+      "id": "src_anthropic_s1a_2026_11_10",
+      "url": "https://www.sec.gov/Archives/edgar/data/2130357/000162828026072484/anthropicpbc-sx1ax2.htm",
+      "publisher": "SEC EDGAR (Anthropic, PBC)",
+      "type": "sec_filing",
+      "title": "Anthropic, PBC Amendment No. 2 to Form S-1, November 10, 2026",
+      "publishedAt": "2026-11-10",
+      "retrievedAt": "2026-11-12",
+      "filing": {
+        "form": "S-1/A",
+        "accession": "0001628280-26-072484",
+        "cik": "0002130357",
+        "filedAt": "2026-11-10"
+      },
+      "license": "public-domain-sec"
+    }
+  ],
+  "statements": [
+    {
+      "id": "met_anthropic_run_rate_2025_01",
+      "org": "org_anthropic",
+      "label": "Run-rate revenue at the beginning of 2025",
+      "measure": "revenue_run_rate",
+      "value": 1000000000,
+      "currency": "USD",
+      "basis": "approximately",
+      "status": "announced",
+      "asOf": "2025-01-01",
+      "sourceId": "src_anthropic_series_f",
+      "quote": "At the beginning of 2025, less than two years after launch, Anthropic's run-rate revenue had grown to approximately $1 billion."
+    },
+    {
+      "id": "met_anthropic_run_rate_2025_08",
+      "org": "org_anthropic",
+      "label": "Run-rate revenue by August 2025",
+      "measure": "revenue_run_rate",
+      "value": 5000000000,
+      "currency": "USD",
+      "basis": "more_than",
+      "status": "announced",
+      "asOf": "2025-08-31",
+      "sourceId": "src_anthropic_series_f",
+      "quote": "By August 2025, just eight months later, our run-rate revenue reached over $5 billion—making Anthropic one of the fastest-growing technology companies in history."
+    },
+    {
+      "id": "met_anthropic_run_rate_2026_02",
+      "org": "org_anthropic",
+      "label": "Run-rate revenue",
+      "measure": "revenue_run_rate",
+      "value": 14000000000,
+      "currency": "USD",
+      "basis": "exact",
+      "status": "announced",
+      "asOf": "2026-02-12",
+      "sourceId": "src_anthropic_series_g",
+      "quote": "Today, our run-rate revenue is $14 billion, with this figure growing over 10x annually in each of those past three years."
+    },
+    {
+      "id": "met_anthropic_run_rate_2026_10",
+      "org": "org_anthropic",
+      "label": "Run-rate revenue",
+      "measure": "revenue_run_rate",
+      "value": 81000000000,
+      "currency": "USD",
+      "basis": "approximately",
+      "status": "filed",
+      "asOf": "2026-10-31",
+      "sourceId": "src_anthropic_s1a_2026_11_10",
+      "quote": "Additionally, our Run-Rate Revenue was approximately $81 billion as of October 31, 2026, up $10 billion from September 30, 2026."
+    }
+  ]
+}
