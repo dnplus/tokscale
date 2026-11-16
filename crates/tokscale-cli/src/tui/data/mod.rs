@@ -2498,11 +2498,11 @@ mod tests {
             "Antigravity IDE Extension",
             "Aside",
             "Mistral Vibe",
-            "Grok Bot",
             "Proma",
             "BB",
             "Qoder",
             "Capy",
+            "Grok Bot",
         ];
 
         assert_eq!(expected.len(), ClientId::COUNT);

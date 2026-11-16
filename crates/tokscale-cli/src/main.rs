@@ -1339,12 +1339,12 @@ pub enum ClientFilter {
     AntigravityExtension,
     Aside,
     Vibe,
-    #[value(name = "grok-bot")]
-    GrokBot,
     Proma,
     Bb,
     Qoder,
     Capy,
+    #[value(name = "grok-bot")]
+    GrokBot,
     Synthetic,
 }
 
