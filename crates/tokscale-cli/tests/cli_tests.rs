@@ -9619,10 +9619,20 @@ fn capy_submit_failed_refresh_does_not_promise_foreign_cached_usage() {
     }"#;
     fs::write(&usage_path, original).unwrap();
 
+    // `cmd_with_home` pins a non-official `TOKSCALE_API_URL`, which in this
+    // fork defaults to uploading quota even when `total_tokens == 0`. Pass
+    // `--no-quota` to exercise the zero-token early exit without hitting prod.
     let output = cmd_with_home(tmp.path())
         .env("CAPY_API_KEY", "capy_scope_b_synthetic")
         .env("TOKSCALE_API_TOKEN", "synthetic-token")
-        .args(["--no-spinner", "submit", "--client", "capy", "--dry-run"])
+        .args([
+            "--no-spinner",
+            "submit",
+            "--client",
+            "capy",
+            "--dry-run",
+            "--no-quota",
+        ])
         .output()
         .unwrap();
     let rendered = format!(
