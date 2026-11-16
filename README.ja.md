@@ -27,7 +27,7 @@
 [![GitHub Forks](https://img.shields.io/github/forks/junhoyeo/tokscale?color=0073FF&labelColor=black&style=flat-square)](https://github.com/junhoyeo/tokscale/network/members)
 [![GitHub Stars](https://img.shields.io/github/stars/junhoyeo/tokscale?color=0073FF&labelColor=black&style=flat-square)](https://github.com/junhoyeo/tokscale/stargazers)
 [![GitHub Issues](https://img.shields.io/github/issues/junhoyeo/tokscale?color=0073FF&labelColor=black&style=flat-square)](https://github.com/junhoyeo/tokscale/issues)
-[![License](https://img.shields.io/badge/license-MIT-white?labelColor=black&style=flat-square)](https://github.com/junhoyeo/tokscale/blob/master/LICENSE)
+[![License](https://img.shields.io/badge/license-MIT%20%2B%20AGPL--3.0-white?labelColor=black&style=flat-square)](#ライセンス)
 [![Coverage](https://raw.githubusercontent.com/junhoyeo/tokscale/refs/heads/main/.github/badges/coverage.svg)](https://github.com/junhoyeo/tokscale/issues/403)
 
 [🇺🇸 English](README.md) | [🇰🇷 한국어](README.ko.md) | [🇯🇵 日本語](README.ja.md) | [🇨🇳 简体中文](README.zh-cn.md)
@@ -120,6 +120,9 @@
 | <img width="48px" src=".github/assets/client-aside.png" alt="Aside" /> | [Aside](https://asidehq.com) | `~/.aside/u/<account>/sessions/<session>/messages.jsonl` |
 | <img width="48px" src="https://github.com/mistralai.png" alt="Mistral Vibe" /> | [Mistral Vibe](https://github.com/mistralai/mistral-vibe) | `~/.vibe/logs/session/<session-dir>/meta.json`（Windows も共通のパス。ルートは `VIBE_HOME` で変更可能） |
 | <img width="48px" src="https://raw.githubusercontent.com/proma-ai/Proma/86d9dfb511db4c1e3ffded3b6c3e312996f50cbf/apps/electron/resources/icon.png" alt="Proma" /> | [Proma](https://github.com/proma-ai/Proma) | `~/.proma/agent-sessions/`, `~/.proma/sdk-config/{sessions,projects}/`; `~/.proma-dev/` |
+| <img width="48px" src="https://github.com/get-bb.png" alt="BB" /> | [BB](https://getbb.app) | `~/.bb/bb.db`, `$BB_DATA_DIR/bb.db`, `~/.bb-dev/*/bb.db` |
+| <img width="48px" src="https://github.com/alibaba.png" alt="Qoder" /> | [Qoder](https://qoder.com) | `~/.qoder/projects/**/*.jsonl`, `~/.qoder-cn/projects/**/*.jsonl`（ルートは `QODER_CONFIG_DIR` / `QODERCN_CONFIG_DIR` で変更可能） |
+| <img width="48px" src=".github/assets/client-capy.png" alt="Capy" /> | [Capy](https://capy.ai) | `~/.config/tokscale/capy-cache/usage.json` (API sync via `tokscale capy login` + `tokscale capy sync`) |
 
 [🚅 LiteLLMの価格データ](https://github.com/BerriAI/litellm)を使用してリアルタイム価格計算を提供し、階層型価格モデルとキャッシュトークン割引をサポートしています。
 
@@ -195,7 +198,7 @@ AI支援開発の時代において、**トークンは新しいエネルギー*
   - 設定可能なカラーテーマのGitHubスタイル貢献グラフ
   - リアルタイムフィルタリングとソート
   - ゼロフリッカーレンダリング
-- **マルチプラットフォームサポート** - OpenCode、Claude Code、Codex CLI、Prime Agent、Copilot CLI、Cursor IDE、Gemini CLI、Amp、Codebuff、Droid、OpenClaw、Hermes Agent、Pi、Kimchi Coding、Reasonix、Kimi CLI、Kimi Work、Qwen CLI、Roo Code、Kilo、Mux、Kilo CLI、Crush、Goose、Antigravity、Antigravity CLI、Antigravity IDE Extension、Zed、Kiro、Trae、Warp/Oz、Cline、Gajae-Code、Grok Build、Jcode、MiMo Code、Xiaomi MiMo AI、Command Code、Junie、ZCode、OpenCodeReview、CodeBuddy、WorkBuddy、Devin CLI、Devin Desktop、Augment Code、Synthetic、Cherry Studio、LM Studio、Unsloth Studio、Hindsight、fx、Oh My Pi、Muse Code、Aside、Mistral Vibe、Promaの使用量を追跡
+- **マルチプラットフォームサポート** - OpenCode、Claude Code、Codex CLI、Prime Agent、Copilot CLI、Cursor IDE、Gemini CLI、Amp、Codebuff、Droid、OpenClaw、Hermes Agent、Pi、Kimchi Coding、Reasonix、Kimi CLI、Kimi Work、Qwen CLI、Roo Code、Kilo、Mux、Kilo CLI、Crush、Goose、Antigravity、Antigravity CLI、Antigravity IDE Extension、Zed、Kiro、Trae、Warp/Oz、Cline、Gajae-Code、Grok Build、Jcode、MiMo Code、Xiaomi MiMo AI、Command Code、Junie、ZCode、OpenCodeReview、CodeBuddy、WorkBuddy、Devin CLI、Devin Desktop、Augment Code、Synthetic、Cherry Studio、LM Studio、Unsloth Studio、Hindsight、fx、Oh My Pi、Muse Code、Aside、Mistral Vibe、Proma、BB、Qoderの使用量を追跡
 - **リアルタイム価格** - 1時間ディスクキャッシュ付きでLiteLLMから現在の価格を取得；OpenRouter自動フォールバックと新規モデル向けCursor価格サポート
 - **詳細な内訳** - 入力、出力、キャッシュ読み書き、推論トークン追跡
 - **ネイティブRustコア** - 10倍高速な処理のため、すべての解析と集計をRustで実行
@@ -464,7 +467,7 @@ tokscale --client synthetic
 tokscale --client opencode,claude --week --json
 ```
 
-利用可能な値: `opencode`, `claude`, `codex`, `copilot`, `gemini`, `cursor`, `amp`, `codebuff`, `droid`, `openclaw`, `hermes`, `pi`, `prime-agent`, `kimchi`, `kimi`, `qwen`, `roocode`, `kilocode`, `kilo`, `mux`, `crush`, `goose`, `antigravity`, `antigravity-cli`, `antigravity-extension`, `zed`, `kiro`, `trae`, `warp`, `cline`, `gjc`, `grok`, `jcode`, `micode`, `micode-desktop`, `commandcode`, `junie`, `zcode`, `opencodereview`, `codebuddy`, `augment`, `synthetic`, `cherrystudio`, `lmstudio`, `unsloth`, `hindsight`, `muse`、`aside`、`vibe`。
+利用可能な値: `opencode`, `claude`, `codex`, `copilot`, `gemini`, `cursor`, `amp`, `codebuff`, `droid`, `openclaw`, `hermes`, `pi`, `prime-agent`, `kimchi`, `kimi`, `qwen`, `roocode`, `kilocode`, `kilo`, `mux`, `crush`, `goose`, `antigravity`, `antigravity-cli`, `antigravity-extension`, `zed`, `kiro`, `trae`, `warp`, `cline`, `gjc`, `grok`, `jcode`, `micode`, `micode-desktop`, `commandcode`, `junie`, `zcode`, `opencodereview`, `codebuddy`, `augment`, `synthetic`, `cherrystudio`, `lmstudio`, `unsloth`, `hindsight`, `muse`、`aside`、`vibe`、`proma`、`bb`、`qoder`、`capy`。
 
 > **破壊的変更 (v4.0.0)**: クライアント単位のブール型フラグ（`--opencode`、`--claude`、`--codex` など）は削除され、現在はエラーになります。代わりに正規の `--client`/`-c` フラグを使用してください — 例: `tokscale --client opencode,claude`。
 
@@ -1165,7 +1168,7 @@ tokscale sources --json
 - **インタラクティブツールチップ**: ホバーで詳細な日別内訳を表示
 - **日別内訳パネル**: クリックでソース別、モデル別の詳細を確認
 - **年別フィルタリング**: 年間を移動
-- **ソースフィルタリング**: プラットフォーム別フィルター（OpenCode、Claude、Codex、Copilot、Cursor、Gemini、Amp、Codebuff、Droid、OpenClaw、Hermes Agent、Pi、Prime Agent、Kimi、Qwen、Roo Code、Kilo、Mux、Kilo CLI、Crush、Goose、Antigravity、Antigravity CLI、Antigravity IDE Extension、Zed、Kiro、Trae、Warp、Cline、Gajae-Code、Grok Build、Jcode、MiMo Code、Xiaomi MiMo AI、Command Code、Junie、ZCode、OpenCodeReview、CodeBuddy、WorkBuddy、Devin CLI、Devin Desktop、Augment Code、Synthetic、Cherry Studio、LM Studio、Unsloth、Hindsight、Muse Code、Aside、Mistral Vibe、Proma）
+- **ソースフィルタリング**: プラットフォーム別フィルター（OpenCode、Claude、Codex、Copilot、Cursor、Gemini、Amp、Codebuff、Droid、OpenClaw、Hermes Agent、Pi、Prime Agent、Kimi、Qwen、Roo Code、Kilo、Mux、Kilo CLI、Crush、Goose、Antigravity、Antigravity CLI、Antigravity IDE Extension、Zed、Kiro、Trae、Warp、Cline、Gajae-Code、Grok Build、Jcode、MiMo Code、Xiaomi MiMo AI、Command Code、Junie、ZCode、OpenCodeReview、CodeBuddy、WorkBuddy、Devin CLI、Devin Desktop、Augment Code、Synthetic、Cherry Studio、LM Studio、Unsloth、Hindsight、Muse Code、Aside、Mistral Vibe、Proma、BB、Qoder、Capy）
 - **統計パネル**: 総コスト、トークン、活動日数、連続記録
 - **FOUC防止**: Reactハイドレーション前にテーマを適用（フラッシュなし）
 
@@ -1592,6 +1595,9 @@ AIコーディングツールはクロスプラットフォームの場所にセ
 | Aside | `~/.aside/u/<account>/sessions/<session>/messages.jsonl` | `%USERPROFILE%\.aside\u\<account>\sessions\<session>\messages.jsonl` | アカウント別のブラウザ使用量。`messages.jsonl` のみを読み、artifacts、memory、passwords は除外。 |
 | Mistral Vibe | `$VIBE_HOME/logs/session/`（既定: `~/.vibe/logs/session/`） | `%VIBE_HOME%\logs\session\`（既定: `%USERPROFILE%\.vibe\logs\session\`） | 全プラットフォーム共通の `~/.vibe` ルート。各セッションディレクトリの `meta.json` の累積 `stats` のみを読み取り、`messages.jsonl` の会話内容は読み取りません |
 | Proma | `~/.proma/`, `~/.proma-dev/` | `%USERPROFILE%\.proma\`, `%USERPROFILE%\.proma-dev\` | Pi SDK の使用量を表示用コピーより優先し、旧 Claude SDK の履歴と単独の表示ログも読み取ります。[集計方法と制約](docs/proma.md)を参照してください。 |
+| BB | `$BB_DATA_DIR`（既定: `~/.bb/`）、`~/.bb-dev/` | `%BB_DATA_DIR%`（既定: `%USERPROFILE%\.bb\`）、`%USERPROFILE%\.bb-dev\` | `bb.db` SQLite データベース（`threads`、`events` テーブル）を解析。オーケストレーションされたエージェントハーネス全体のプロンプトキャッシュおよび推論トークンの内訳を正確に抽出。BB は Claude Code と Codex を通常のホームで実行するため、両方に記録された応答は `claude` または `codex` の下で 1 回だけ集計されます。`--client bb` のみを指定すると BB が記録した内容をすべて表示します。 |
+| Qoder | `$QODER_CONFIG_DIR/projects/`（既定: `~/.qoder/projects/`）、`$QODERCN_CONFIG_DIR/projects/`（既定: `~/.qoder-cn/projects/`） | `%QODER_CONFIG_DIR%\projects\`（既定: `%USERPROFILE%\.qoder\projects\`）、`%QODERCN_CONFIG_DIR%\projects\`（既定: `%USERPROFILE%\.qoder-cn\projects\`） | Qoder および Qoder CN の JSONL セッション・サブエージェントログを解析。複数ブロックに分割されたアシスタント断片を統合し、マネージドモデルでトークン数が 0 にマスクされている場合は会話テキストからトークン数を推定 |
+| Capy | `~/.config/tokscale/capy-cache/usage.json` (or `$TOKSCALE_CONFIG_DIR/capy-cache/`) | `%APPDATA%\tokscale\capy-cache\usage.json` (or `%TOKSCALE_CONFIG_DIR%\capy-cache\`) | API sync via `tokscale capy login` and `tokscale capy sync` (reports refresh it automatically). Capy runs its agent loop on its servers, including local threads and connected subscriptions such as Codex, so no session log is written locally; token totals come from Capy's usage API per hour (last 30 days) or UTC day (older), per thread and model. Use `tokscale capy login --user <email>` in a multi-member organization to count only your own usage |
 
 > **Devin Desktop のエージェント対応**: ローカル使用量の解析は、NDJSON ストリームで `usage_update` イベントを出力する ACP 接続エージェント（例: Cascade/Windsurf、claude-code、opencode）で機能します。既定の **devin-cloud** エージェントはローカルの `usage_update` を出力しないため、使用量はサーバー側にとどまり、アカウントレベルの API なしには tokscale で追跡できません。
 
@@ -2132,6 +2138,8 @@ Tokscaleは[LiteLLMの価格データベース](https://github.com/BerriAI/litel
 6. ブランチにプッシュ（`git push origin feature/amazing-feature`）
 7. プルリクエストを開く
 
+`packages/frontend` を変更するプルリクエストには、[コントリビューターライセンス契約（CLA）](CLA.md) への一度きりの署名が必要です。CLA チェックがプルリクエストに手順をコメントします。詳しくは [CONTRIBUTING.md](CONTRIBUTING.md) をご覧ください。
+
 ### 開発ガイドライン
 
 - 既存のコードスタイルに従う
@@ -2157,7 +2165,9 @@ Tokscaleは[LiteLLMの価格データベース](https://github.com/BerriAI/litel
 </p>
 
 <p align="center">
-  <strong>MIT © <a href="https://github.com/junhoyeo">Junho Yeo</a></strong>
+  <strong>CLI・コア: MIT © <a href="https://github.com/junhoyeo">Junho Yeo</a> · Web アプリ: AGPL-3.0</strong>
 </p>
+
+CLI とコアライブラリ（`crates/`）は [MIT ライセンス](LICENSE) です。`packages/frontend` の Web アプリは [GNU AGPL v3.0](packages/frontend/LICENSE) で、対象範囲は [`LICENSING.md`](packages/frontend/LICENSING.md) にまとめています。`packages/frontend/src/content` にある Tokscale がまとめたデータは [CC BY 4.0](packages/frontend/src/content/LICENSE.md) です。Tokscale の名前とロゴは[商標ポリシー](TRADEMARKS.md)に従います。
 
 このプロジェクトが興味深いと感じたら、**スターを付けてください ⭐** または[GitHubでフォロー](https://github.com/junhoyeo)して旅に参加してください（すでに1.1k以上が乗船中）。私は24時間コーディングし、定期的に驚くべきものを出荷しています—あなたのサポートは無駄になりません。

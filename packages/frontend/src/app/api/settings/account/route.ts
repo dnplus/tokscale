@@ -9,6 +9,8 @@ import {
   revalidateUsernamePaths,
 } from "@/lib/db/usernameLookup";
 import { revalidateUserGroupLeaderboards } from "@/lib/groups/cache";
+import { expireExploreCache } from "@/lib/explore/cache";
+import { advanceExploreCacheRevision } from "@/lib/explore/revision";
 
 export async function DELETE(request: Request) {
   try {
@@ -17,7 +19,9 @@ export async function DELETE(request: Request) {
     // settings route uses. Account deletion deliberately has no Bearer
     // personal-token path: it is a web Settings UI action, so session-only
     // auth is the conservative default.
-    const session = await getSessionFromRequest(request);
+    const session = await getSessionFromRequest(request, {
+      allowAuthorizationHeader: false,
+    });
     if (!session) {
       return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
     }
@@ -40,10 +44,14 @@ export async function DELETE(request: Request) {
     // Delete the user row — all related data (sessions, apiTokens,
     // submissions → dailyBreakdown, deviceCodes, group memberships)
     // cascades automatically via ON DELETE CASCADE foreign keys.
-    const deletedRows = await db
-      .delete(users)
-      .where(eq(users.id, session.id))
-      .returning({ id: users.id });
+    const deletedRows = await db.transaction(async (tx) => {
+      const deleted = await tx
+        .delete(users)
+        .where(eq(users.id, session.id))
+        .returning({ id: users.id });
+      if (deleted.length > 0) await advanceExploreCacheRevision(tx);
+      return deleted;
+    });
 
     if (deletedRows.length === 0) {
       return NextResponse.json({ error: "User not found" }, { status: 404 });
@@ -56,6 +64,12 @@ export async function DELETE(request: Request) {
       await clearSession();
     } catch {
       // Cookie cleanup is best-effort — the session row is already gone.
+    }
+
+    try {
+      expireExploreCache();
+    } catch (cacheError) {
+      console.error("Explore cache invalidation failed after deletion:", cacheError);
     }
 
     try {

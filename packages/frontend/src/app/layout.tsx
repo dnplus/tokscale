@@ -1,9 +1,10 @@
 import type { Metadata, Viewport } from "next";
 import { connection } from "next/server";
-import { JetBrains_Mono, Figtree } from "next/font/google";
+import { JetBrains_Mono, Figtree, Instrument_Serif } from "next/font/google";
 import NextTopLoader from "nextjs-toploader";
 import { ToastContainer } from "react-toastify";
-import { Analytics } from "@vercel/analytics/next";
+import { WebAnalytics } from "@/components/analytics/WebAnalytics";
+import { isPrerenderedDeployment } from "@/lib/prerender";
 import { Providers } from "@/lib/providers";
 import { getRootMetadata } from "@/lib/seo/rootMetadata";
 import "./globals.css";
@@ -11,6 +12,14 @@ import "react-toastify/dist/ReactToastify.css";
 
 const figtree = Figtree({
   variable: "--font-figtree",
+  subsets: ["latin"],
+  display: "swap",
+});
+
+// Display serif for v2 headlines. Exposed as --font-display; UI text stays Figtree.
+const instrumentSerif = Instrument_Serif({
+  variable: "--font-display",
+  weight: "400",
   subsets: ["latin"],
   display: "swap",
 });
@@ -24,7 +33,9 @@ const jetbrainsMono = JetBrains_Mono({
 export async function generateMetadata(): Promise<Metadata> {
   // APP_URL belongs to the container runtime, not the Docker build. Make
   // metadata request-dynamic so self-hosted deployments emit their own origin.
-  await connection();
+  // Calling connection() here makes every route render per request, so skip it
+  // where the origin is known at build time.
+  if (!isPrerenderedDeployment()) await connection();
   return getRootMetadata();
 }
 
@@ -35,14 +46,14 @@ export const viewport: Viewport = {
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="en" className={`${figtree.variable} ${jetbrainsMono.variable}`}>
+    <html lang="en" className={`${figtree.variable} ${jetbrainsMono.variable} ${instrumentSerif.variable}`}>
       <body className={figtree.className}>
         <NextTopLoader color="#3B82F6" showSpinner={false} />
         <Providers>
           {children}
         </Providers>
         <ToastContainer position="top-right" />
-        <Analytics />
+        {process.env.VERCEL ? <WebAnalytics /> : null}
       </body>
     </html>
   );

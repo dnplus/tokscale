@@ -11,6 +11,7 @@ import {
   type PointerEvent,
 } from "react";
 import styled, { css } from "styled-components";
+import { Select } from "@/components/ui/Select";
 import { SOURCE_DISPLAY_NAMES } from "@/lib/constants";
 import type { DailyContribution } from "@/lib/types";
 import { formatCurrency, formatDate, formatNumber } from "@/lib/utils";
@@ -103,21 +104,25 @@ function clamp(value: number, minimum: number, maximum: number): number {
   return Math.max(minimum, Math.min(maximum, value));
 }
 
+function chartCoordinate(value: number): string {
+  return String(Math.round(value * 100) / 100);
+}
+
 function curvePath(boundary: CubicValueBoundary, maximum: number): string {
   const pointCount = boundary.values.length;
   if (pointCount === 0) return "";
   if (pointCount === 1) {
     const x = xForIndex(0, 1);
     const y = yForValue(boundary.values[0] ?? 0, maximum);
-    return `M ${x - 4} ${y} L ${x + 4} ${y}`;
+    return `M ${chartCoordinate(x - 4)} ${chartCoordinate(y)} L ${chartCoordinate(x + 4)} ${chartCoordinate(y)}`;
   }
   return [
-    `M ${xForIndex(0, pointCount)} ${yForValue(boundary.values[0] ?? 0, maximum)}`,
+    `M ${chartCoordinate(xForIndex(0, pointCount))} ${chartCoordinate(yForValue(boundary.values[0] ?? 0, maximum))}`,
     ...boundary.segments.map((segment) => {
       const fromX = xForIndex(segment.index, pointCount);
       const toX = xForIndex(segment.index + 1, pointCount);
       const third = (toX - fromX) / 3;
-      return `C ${fromX + third} ${yForValue(segment.control1, maximum)} ${toX - third} ${yForValue(segment.control2, maximum)} ${toX} ${yForValue(segment.to, maximum)}`;
+      return `C ${chartCoordinate(fromX + third)} ${chartCoordinate(yForValue(segment.control1, maximum))} ${chartCoordinate(toX - third)} ${chartCoordinate(yForValue(segment.control2, maximum))} ${chartCoordinate(toX)} ${chartCoordinate(yForValue(segment.to, maximum))}`;
     }),
   ].join(" ");
 }
@@ -132,28 +137,28 @@ function stackedAreaPath(
   if (pointCount === 1) {
     const x = xForIndex(0, 1);
     return [
-      `M ${x - 4} ${yForValue(lower.values[0] ?? 0, maximum)}`,
-      `L ${x - 4} ${yForValue(upper.values[0] ?? 0, maximum)}`,
-      `L ${x + 4} ${yForValue(upper.values[0] ?? 0, maximum)}`,
-      `L ${x + 4} ${yForValue(lower.values[0] ?? 0, maximum)}`,
+      `M ${chartCoordinate(x - 4)} ${chartCoordinate(yForValue(lower.values[0] ?? 0, maximum))}`,
+      `L ${chartCoordinate(x - 4)} ${chartCoordinate(yForValue(upper.values[0] ?? 0, maximum))}`,
+      `L ${chartCoordinate(x + 4)} ${chartCoordinate(yForValue(upper.values[0] ?? 0, maximum))}`,
+      `L ${chartCoordinate(x + 4)} ${chartCoordinate(yForValue(lower.values[0] ?? 0, maximum))}`,
       "Z",
     ].join(" ");
   }
 
   return [
-    `M ${xForIndex(0, pointCount)} ${yForValue(upper.values[0] ?? 0, maximum)}`,
+    `M ${chartCoordinate(xForIndex(0, pointCount))} ${chartCoordinate(yForValue(upper.values[0] ?? 0, maximum))}`,
     ...upper.segments.map((segment) => {
       const fromX = xForIndex(segment.index, pointCount);
       const toX = xForIndex(segment.index + 1, pointCount);
       const third = (toX - fromX) / 3;
-      return `C ${fromX + third} ${yForValue(segment.control1, maximum)} ${toX - third} ${yForValue(segment.control2, maximum)} ${toX} ${yForValue(segment.to, maximum)}`;
+      return `C ${chartCoordinate(fromX + third)} ${chartCoordinate(yForValue(segment.control1, maximum))} ${chartCoordinate(toX - third)} ${chartCoordinate(yForValue(segment.control2, maximum))} ${chartCoordinate(toX)} ${chartCoordinate(yForValue(segment.to, maximum))}`;
     }),
-    `L ${xForIndex(pointCount - 1, pointCount)} ${yForValue(lower.values.at(-1) ?? 0, maximum)}`,
+    `L ${chartCoordinate(xForIndex(pointCount - 1, pointCount))} ${chartCoordinate(yForValue(lower.values.at(-1) ?? 0, maximum))}`,
     ...[...lower.segments].reverse().map((segment) => {
       const fromX = xForIndex(segment.index, pointCount);
       const toX = xForIndex(segment.index + 1, pointCount);
       const third = (toX - fromX) / 3;
-      return `C ${toX - third} ${yForValue(segment.control2, maximum)} ${fromX + third} ${yForValue(segment.control1, maximum)} ${fromX} ${yForValue(segment.from, maximum)}`;
+      return `C ${chartCoordinate(toX - third)} ${chartCoordinate(yForValue(segment.control2, maximum))} ${chartCoordinate(fromX + third)} ${chartCoordinate(yForValue(segment.control1, maximum))} ${chartCoordinate(fromX)} ${chartCoordinate(yForValue(segment.from, maximum))}`;
     }),
     "Z",
   ].join(" ");
@@ -415,49 +420,6 @@ const MetricButton = styled.button<{ $active: boolean }>`
   }
 `;
 
-const SelectControl = styled.label`
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  gap: 0.375rem;
-  min-height: 2rem;
-  padding-left: 0.625rem;
-  color: var(--service-text-muted);
-  background: var(--service-surface-muted);
-  border: 1px solid var(--service-border);
-  border-radius: 0.5rem;
-  font-size: 0.75rem;
-
-  &::after {
-    content: "";
-    position: absolute;
-    right: 0.625rem;
-    width: 0.375rem;
-    height: 0.375rem;
-    border-right: 1px solid var(--service-text-muted);
-    border-bottom: 1px solid var(--service-text-muted);
-    transform: translateY(-0.125rem) rotate(45deg);
-    pointer-events: none;
-  }
-
-  &:hover {
-    border-color: var(--service-border-strong);
-  }
-
-  &:focus-within {
-    outline: 2px solid var(--service-focus);
-    outline-offset: 1px;
-  }
-
-  @media (pointer: coarse) {
-    min-height: 2.75rem;
-  }
-`;
-
-const SelectCaption = styled.span`
-  flex: 0 0 auto;
-`;
-
 const NewestFirstControl = styled.label`
   display: inline-flex;
   min-width: 0;
@@ -485,25 +447,14 @@ const NewestFirstControl = styled.label`
   }
 `;
 
-const CompactSelect = styled.select`
-  min-width: 0;
-  max-width: 11rem;
-  height: 100%;
-  padding: 0.25rem 1.75rem 0.25rem 0;
-  appearance: none;
-  color: var(--service-text);
-  background: transparent;
-  border: 0;
-  outline: 0;
-  font: inherit;
-  font-weight: 500;
-  cursor: pointer;
-  color-scheme: dark;
-
-  option {
-    color: var(--service-text);
-    background: var(--service-surface);
-  }
+/** The Select trigger itself is the bordered box; "Display" / "Provider" sit inside it as a prefix. */
+const CompactSelect = styled(Select)`
+  --select-height: 2rem;
+  --select-font-size: 0.75rem;
+  --select-padding-x: 0.625rem;
+  --select-background: var(--service-surface-muted);
+  --select-border-color: var(--service-border);
+  --select-max-width: 15rem;
 `;
 
 const PlotRegion = styled.div`
@@ -1010,14 +961,19 @@ export function ProfileUsageChart({
         : chronologicalChartData,
     [chronologicalChartData, newestFirst],
   );
+  // The paths of a long history are megabytes of text: they were 93% of a
+  // 10 MB profile page. Keep them out of the server HTML; the browser draws
+  // them from the same contributions as soon as the chart mounts.
   const chartStack = useMemo(
     () =>
-      createChartStack(
-        chartData.series,
-        chartData.dates.length,
-        chartData.maxDailyTotal,
-      ),
-    [chartData],
+      isMounted
+        ? createChartStack(
+            chartData.series,
+            chartData.dates.length,
+            chartData.maxDailyTotal,
+          )
+        : { layers: [], maximum: chartData.maxDailyTotal },
+    [chartData, isMounted],
   );
   const { layers } = chartStack;
   const chartMaximum = chartStack.maximum;
@@ -1252,21 +1208,19 @@ export function ProfileUsageChart({
             ))}
           </MetricControl>
 
-          <SelectControl>
-            <SelectCaption>Display</SelectCaption>
-            <CompactSelect
-              aria-label="Usage display"
-              value={view}
-              onChange={(event) =>
-                setView(event.currentTarget.value as UsageView)
-              }
-            >
-              <option value="average">
-                {chartData.averageWindowDays}d average
-              </option>
-              <option value="daily">Daily</option>
-            </CompactSelect>
-          </SelectControl>
+          <CompactSelect
+            prefix="Display"
+            aria-label="Usage display"
+            value={view}
+            options={[
+              {
+                value: "average",
+                label: `${chartData.averageWindowDays}d average`,
+              },
+              { value: "daily", label: "Daily" },
+            ]}
+            onChange={(next) => setView(next as UsageView)}
+          />
         </ControlCluster>
 
         <ControlCluster>
@@ -1282,26 +1236,22 @@ export function ProfileUsageChart({
             />
             <span>Newest first</span>
           </NewestFirstControl>
-          <SelectControl>
-            <SelectCaption>Provider</SelectCaption>
-            <CompactSelect
-              name="profile-usage-provider"
-              aria-label="Usage provider"
-              value={selectedProvider}
-              onChange={(event) =>
-                setProviderFilter(
-                  event.currentTarget.value as UsageProviderFilter,
-                )
-              }
-            >
-              <option value={ALL_USAGE_PROVIDERS}>All</option>
-              {providerTotals.map(({ provider }) => (
-                <option key={provider} value={provider}>
-                  {providerName(provider)}
-                </option>
-              ))}
-            </CompactSelect>
-          </SelectControl>
+          <CompactSelect
+            prefix="Provider"
+            name="profile-usage-provider"
+            aria-label="Usage provider"
+            value={selectedProvider}
+            options={[
+              { value: ALL_USAGE_PROVIDERS, label: "All" },
+              ...providerTotals.map(({ provider }) => ({
+                value: provider,
+                label: providerName(provider),
+              })),
+            ]}
+            onChange={(next) =>
+              setProviderFilter(next as UsageProviderFilter)
+            }
+          />
         </ControlCluster>
       </Controls>
 

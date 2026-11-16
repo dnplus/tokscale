@@ -574,6 +574,15 @@ mod tests {
                 .to_string()
                 .contains("no parseable usage"));
         }
+
+        // Positive control: a reported 0% is usage, not an unknown quota.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let auth = write_auth(tmp.path(), "sk-test");
+        let _guard = EnvVarGuard::remove("OPENCODE_API_KEY");
+        let (url, _) = spawn_usage_server(200, r#"{"usage":{"rolling":{"percent":0}}}"#);
+        let outputs = fetch_blocking(&url, &auth).unwrap();
+        assert_eq!(outputs[0].metrics.len(), 1);
+        assert_eq!(outputs[0].metrics[0].remaining_percent, 100.0);
     }
 
     #[test]

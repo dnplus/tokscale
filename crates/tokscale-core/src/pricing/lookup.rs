@@ -23,6 +23,9 @@ const ORIGINAL_PROVIDER_PREFIXES: &[&str] = &[
     "anthropic/",
     "openai/",
     "google/",
+    // LiteLLM's namespace for Google's own AI Studio API; OpenRouter spells
+    // the same vendor `google/`.
+    "gemini/",
     "meta-llama/",
     "mistralai/",
     "minimax/",
@@ -297,7 +300,8 @@ impl ResolutionEvidence {
 }
 
 /// Why a resolution is not safe to publish to the shared leaderboard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SubmissionSafetyGap {
     /// The considered candidates do not publish the same rates, so the
     /// selected candidate's price is one of several conflicting answers.
@@ -308,6 +312,16 @@ pub enum SubmissionSafetyGap {
     /// A bare model id resolved through another provider's qualified catalog
     /// key, without evidence that the request used that provider's price.
     UnverifiedProviderIdentity,
+}
+
+impl SubmissionSafetyGap {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PriceDisagreement => "price_disagreement",
+            Self::UnverifiedModelIdentity => "unverified_model_identity",
+            Self::UnverifiedProviderIdentity => "unverified_provider_identity",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3886,12 +3900,18 @@ fn key_root_is_cross_provider_alias(key: &str, provider_id: &str) -> bool {
 // @keep: these roots look like providers and are not, which is the whole point.
 /// Dataset key roots that name a SUBSCRIPTION PLAN, not a billing endpoint.
 ///
-/// Models.dev publishes every row under `kimi-for-coding/` with explicit
-/// 0.0/0.0 rates because a Kimi coding subscription is billed by the plan, not
-/// by the token. Rows like these are not a price sheet for anything.
+/// Models.dev publishes the Kimi coding-plan rows at explicit 0.0/0.0
+/// because those plans are billed by the subscription, not by the token.
+/// The roots are `kimi-for-coding/` plus the later regional plans
+/// `kimi-code-plan-cn/` and `kimi-code-plan-global/`. None of them is a
+/// price sheet.
 ///
 /// Underscore-normalized to compare with `normalized_key_root`.
-const ZERO_PRICED_SUBSCRIPTION_NAMESPACES: &[&str] = &["kimi_for_coding"];
+const ZERO_PRICED_SUBSCRIPTION_NAMESPACES: &[&str] = &[
+    "kimi_for_coding",
+    "kimi_code_plan_cn",
+    "kimi_code_plan_global",
+];
 
 /// Whether the key is rooted at a subscription namespace whose rows are
 /// published at $0.00, and so cannot prove a billing identity.
@@ -4437,6 +4457,17 @@ fn exact_match_with_provider_prefixes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn submission_safety_gap_text_matches_json() {
+        for gap in [
+            SubmissionSafetyGap::PriceDisagreement,
+            SubmissionSafetyGap::UnverifiedModelIdentity,
+            SubmissionSafetyGap::UnverifiedProviderIdentity,
+        ] {
+            assert_eq!(serde_json::to_value(gap).unwrap(), gap.as_str());
+        }
+    }
 
     /// Mock LiteLLM data matching real API responses for OpenCode Zen models
     fn mock_litellm() -> HashMap<String, ModelPricing> {
@@ -5789,6 +5820,148 @@ mod tests {
             assert!(result.evidence.alias_applied, "hint: {hint}");
             assert!(result.evidence.is_submission_safe(), "hint: {hint}");
         }
+    }
+
+    #[test]
+    fn hinted_kimi_k31_pro_uses_the_moonshot_api_card() {
+        // Kimi CLI records bare `k3.1-pro` (the parser also strips a
+        // `kimi-code/` prefix). models.dev publishes that model part only on
+        // the regional coding plans at $0.00. Moonshot's own row is the USD
+        // card shared with LiteLLM and OpenRouter: $2 / $10 per 1M and $0.20
+        // cached input. Highspeed is $4 / $20, with the same cached-input
+        // rate. The CNY list is not the dataset currency.
+        let models_dev = HashMap::from([
+            (
+                "kimi-code-plan-cn/k3.1-pro".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.0),
+                    output_cost_per_token: Some(0.0),
+                    cache_read_input_token_cost: Some(0.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "kimi-code-plan-global/k3.1-pro".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.0),
+                    output_cost_per_token: Some(0.0),
+                    cache_read_input_token_cost: Some(0.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "kimi-code-plan-cn/k3.1-pro-highspeed".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.0),
+                    output_cost_per_token: Some(0.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "kimi-code-plan-global/k3.1-pro-highspeed".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(0.0),
+                    output_cost_per_token: Some(0.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "moonshotai/kimi-k3.1-pro".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(2e-6),
+                    output_cost_per_token: Some(1e-5),
+                    cache_read_input_token_cost: Some(2e-7),
+                    ..Default::default()
+                },
+            ),
+            (
+                "moonshotai/kimi-k3.1-pro-highspeed".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(4e-6),
+                    output_cost_per_token: Some(2e-5),
+                    cache_read_input_token_cost: Some(2e-7),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let lookup = PricingLookup::new_with_models_dev(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        let cases = [
+            ("k3.1-pro", "moonshotai/kimi-k3.1-pro", 2e-6, 1e-5, 2e-7),
+            (
+                "kimi-code/k3.1-pro",
+                "moonshotai/kimi-k3.1-pro",
+                2e-6,
+                1e-5,
+                2e-7,
+            ),
+            (
+                "k3.1-pro-highspeed",
+                "moonshotai/kimi-k3.1-pro-highspeed",
+                4e-6,
+                2e-5,
+                2e-7,
+            ),
+        ];
+        for (model, key, input, output, cache_read) in cases {
+            for hint in ["moonshot", "kimi_for_coding"] {
+                let result = lookup
+                    .lookup_with_provider(model, Some(hint))
+                    .unwrap_or_else(|| panic!("{model} / {hint} must price"));
+                assert_eq!(result.matched_key, key, "{model} / {hint}");
+                assert_eq!(result.pricing.input_cost_per_token, Some(input), "{model}");
+                assert_eq!(
+                    result.pricing.output_cost_per_token,
+                    Some(output),
+                    "{model}"
+                );
+                assert_eq!(
+                    result.pricing.cache_read_input_token_cost,
+                    Some(cache_read),
+                    "{model}"
+                );
+                assert_eq!(
+                    result.evidence.kind,
+                    ResolutionKind::ProviderScoped,
+                    "{model} / {hint}"
+                );
+                assert!(result.evidence.alias_applied, "{model} / {hint}");
+                assert!(result.evidence.is_submission_safe(), "{model} / {hint}");
+            }
+        }
+    }
+
+    #[test]
+    fn kimi_code_plan_row_is_not_a_price_sheet() {
+        let models_dev = HashMap::from([(
+            "kimi-code-plan-cn/k3.1-pro".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0),
+                output_cost_per_token: Some(0.0),
+                cache_read_input_token_cost: Some(0.0),
+                ..Default::default()
+            },
+        )]);
+        let lookup = PricingLookup::new_with_models_dev(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        let result = lookup
+            .lookup("kimi-code-plan-cn/k3.1-pro")
+            .expect("the plan row stays reachable");
+        assert_eq!(result.matched_key, "kimi-code-plan-cn/k3.1-pro");
+        assert!(result.evidence.subscription_namespace);
+        assert!(!result.evidence.is_submission_safe());
     }
 
     /// `pricing::aliases` redirects every `kimi-for-coding` model id anybody has
@@ -8054,6 +8227,82 @@ mod tests {
         assert_eq!(result.matched_key, "google/gemini-2.5-pro");
         assert_eq!(result.source, "LiteLLM");
         assert!(!result.matched_key.starts_with("vertex_ai"));
+    }
+
+    // LiteLLM keys Google's own AI Studio API `gemini/<model>`; OpenRouter keys
+    // the same vendor `google/<model>`. Under a `google` hint both match, so the
+    // original-provider tie-break decides, and `gemini/` must count as original.
+    fn gemini_namespace_priced(input: f64, output: f64) -> ModelPricing {
+        ModelPricing {
+            input_cost_per_token: Some(input),
+            output_cost_per_token: Some(output),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn google_hint_prefers_litellm_gemini_namespace_over_openrouter_google() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gemini/gemini-3.8-flash".into(),
+            gemini_namespace_priced(7.5e-7, 3.75e-6),
+        );
+        litellm.insert(
+            "gemini-3.8-flash".into(),
+            gemini_namespace_priced(7.5e-7, 3.75e-6),
+        );
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "google/gemini-3.8-flash".into(),
+            gemini_namespace_priced(8.25e-7, 4.125e-6),
+        );
+        let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+
+        let result = lookup
+            .lookup_with_provider("gemini-3.8-flash", Some("google"))
+            .unwrap();
+        assert_eq!(result.source, "LiteLLM");
+        assert_eq!(result.matched_key, "gemini/gemini-3.8-flash");
+        assert_eq!(result.pricing.input_cost_per_token, Some(7.5e-7));
+    }
+
+    #[test]
+    fn gemini_namespace_is_original_not_reseller() {
+        assert!(is_original_provider("gemini/gemini-3.8-flash"));
+        assert!(!is_reseller_provider("gemini/gemini-3.8-flash"));
+        // `gemini` without a slash is a model-name prefix, not a namespace.
+        assert!(!is_original_provider("gemini-3.8-flash"));
+    }
+
+    // Controls: other vendors keep OpenRouter's prefixed key, and a Google model
+    // only OpenRouter has still prices from OpenRouter.
+    #[test]
+    fn gemini_namespace_leaves_other_vendors_and_openrouter_only_models_alone() {
+        for (hint, bare, prefixed) in [
+            ("anthropic", "claude-x-9", "anthropic/claude-x-9"),
+            ("openai", "gpt-x-9", "openai/gpt-x-9"),
+        ] {
+            let mut litellm = HashMap::new();
+            litellm.insert(bare.into(), gemini_namespace_priced(1e-6, 2e-6));
+            let mut openrouter = HashMap::new();
+            openrouter.insert(prefixed.into(), gemini_namespace_priced(2e-6, 4e-6));
+            let lookup = PricingLookup::new(litellm, openrouter, HashMap::new());
+            let result = lookup.lookup_with_provider(bare, Some(hint)).unwrap();
+            assert_eq!(result.source, "OpenRouter", "hint {hint}");
+            assert_eq!(result.matched_key, prefixed, "hint {hint}");
+        }
+
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "google/gemini-only-or-1".into(),
+            gemini_namespace_priced(3e-6, 6e-6),
+        );
+        let lookup = PricingLookup::new(HashMap::new(), openrouter, HashMap::new());
+        let result = lookup
+            .lookup_with_provider("gemini-only-or-1", Some("google"))
+            .unwrap();
+        assert_eq!(result.source, "OpenRouter");
+        assert_eq!(result.matched_key, "google/gemini-only-or-1");
     }
 
     #[test]

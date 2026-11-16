@@ -109,6 +109,21 @@ vi.mock("@/lib/db", () => ({
     inputTokens: "dailyBreakdown.inputTokens",
     outputTokens: "dailyBreakdown.outputTokens",
   },
+  users: {
+    id: "users.id",
+    leaderboardHidden: "users.leaderboardHidden",
+    updatedAt: "users.updatedAt",
+  },
+  moderationActions: {
+    id: "moderationActions.id",
+    targetUserId: "moderationActions.targetUserId",
+    targetUsername: "moderationActions.targetUsername",
+    actorUserId: "moderationActions.actorUserId",
+    actorUsername: "moderationActions.actorUsername",
+    action: "moderationActions.action",
+    reason: "moderationActions.reason",
+    createdAt: "moderationActions.createdAt",
+  },
 }));
 
 vi.mock("@/lib/validation/submission", () => ({
@@ -305,6 +320,8 @@ function selectResult(columns: Record<string, unknown>, store: Store) {
   if (keys.has("totalTokens")) return [aggregatesRow(store)];
   if (keys.has("id") && keys.has("sessionCount")) return existingSubmissionRow();
   if (keys.has("sessionCount") && keys.has("totalActiveTimeMs")) return [{}];
+  if (keys.has("leaderboardHidden")) return [{ leaderboardHidden: false }];
+  if (keys.has("action") && keys.has("actorUsername")) return [];
   throw new Error(`unexpected SELECT shape: ${[...keys].join(",")}`);
 }
 
@@ -314,6 +331,7 @@ function makeAwaitableBuilder(result: unknown) {
     where: vi.fn(() => builder),
     for: vi.fn(() => builder),
     limit: vi.fn(() => builder),
+    orderBy: vi.fn(() => builder),
     then: (resolve: (value: unknown) => unknown) =>
       Promise.resolve(resolve(result)),
   };
@@ -396,7 +414,10 @@ function installTx(store: Store) {
           }
           return builder;
         }),
-        where: vi.fn(() => Promise.resolve()),
+        where: vi.fn(() => ({
+          returning: vi.fn(() => Promise.resolve([])),
+          then: (resolve: (value: unknown) => unknown) => Promise.resolve(resolve(undefined)),
+        })),
       };
       return builder;
     }),
@@ -681,7 +702,7 @@ describe("POST /api/submit devin-cli recount proof", () => {
     expect(store.device.parserVersions["devin-cli"]).toBe(2);
   });
 
-  it("keeps stored usage from a source the scan could not read", async () => {
+  it("keeps stored usage from a source the scan could not read until the proof covers it", async () => {
     // Two Devin databases fed the stored day: A = 400 tokens of which 50 are
     // duplicate rows, B = 600. Generation 2 reads A while B is gone, so the
     // payload carries 350 for the date and the proof explains only 400 of the
@@ -701,17 +722,18 @@ describe("POST /api/submit devin-cli recount proof", () => {
     }
 
     // B is readable again (with 60 duplicates of its own), so the proof now
-    // covers both databases. The device is past its transition, and a later
-    // proof never lowers counts: the day stays as stored.
+    // covers both databases: its previous side equals the stored cell
+    // exactly, while the observed snapshot only ever held A's 350. The cell
+    // is still in generation-1 units, so the residue is corrected to 890 —
+    // the same result a transition that reads both databases produces.
     const bothDatabases = () =>
       submissionBody([
         { date: "2026-10-08", tokens: 890, cost: 0.89, previous: { tokens: 1_000, cost: 1 } },
       ]);
     await submit(store, bothDatabases());
-    expect(storedClientTokens(store, "2026-10-08", "devin-cli")).toBe(1_000);
-    expect(storedCost(store)).toBeCloseTo(1, 4);
+    expect(storedClientTokens(store, "2026-10-08", "devin-cli")).toBe(890);
+    expect(storedCost(store)).toBeCloseTo(0.89, 4);
 
-    // A device whose transition reads both databases heals the day then.
     const healed = newStore();
     seedDay(healed, "2026-10-08", { "devin-cli": recountCell(1_000, 1) });
     await submit(healed, bothDatabases());
@@ -992,7 +1014,7 @@ describe("POST /api/submit devin-cli recount proof", () => {
     expect((json.warnings ?? []).some((warning) => warning.includes("Corrected"))).toBe(false);
   });
 
-  it("suppresses new growth while the scan sits below the credited baseline, then credits the excess", async () => {
+  it("credits a new day while the scan sits below the credited baseline", async () => {
     const store = newStore();
     seedInflatedDays(store);
 
@@ -1001,23 +1023,23 @@ describe("POST /api/submit devin-cli recount proof", () => {
 
     // The preserved 10-06 day (88M) stays in the credited ledger, but the
     // scanner no longer reports it, so the scan's lifetime (700M) is below
-    // the credited baseline (777M): growth on a brand-new day is suppressed
-    // until the scan exceeds it — the same monotonic rule as before.
-    await submit(
+    // the credited baseline (777M). That deleted history must not hold back
+    // usage on a brand-new day.
+    const json = await submit(
       store,
       submissionBody([...CORRECTED_SCAN, { date: "2026-10-09", tokens: 11_000_000, cost: 11 }]),
     );
-    expect(storedClientTokens(store, "2026-10-09", "devin-cli")).toBeUndefined();
-    expect(storedTokens(store)).toBe(777_000_000);
+    expect(storedClientTokens(store, "2026-10-09", "devin-cli")).toBe(11_000_000);
+    expect(storedTokens(store)).toBe(788_000_000);
+    expect((json.warnings ?? []).some((warning) => warning.includes("Added no Devin CLI tokens"))).toBe(false);
 
-    // Once the scan's lifetime exceeds the credited baseline, the excess is
-    // credited newest-first; the 10-09 cell has the only positive capacity.
+    // Growth on that day is credited up to the day's snapshot total, once.
     await submit(
       store,
       submissionBody([...CORRECTED_SCAN, { date: "2026-10-09", tokens: 101_000_000, cost: 101 }]),
     );
-    expect(storedClientTokens(store, "2026-10-09", "devin-cli")).toBe(13_000_000);
-    expect(storedTokens(store)).toBe(790_000_000);
+    expect(storedClientTokens(store, "2026-10-09", "devin-cli")).toBe(101_000_000);
+    expect(storedTokens(store)).toBe(878_000_000);
   });
 
   it("ignores a proof that does not describe the submitted snapshot", async () => {

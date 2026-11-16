@@ -1,17 +1,25 @@
 use super::{
     UsageFetchDiagnostic, UsageFetchDiagnosticKind, UsageFetchDiagnosticSeverity, UsageFetchReport,
-    UsageMetric, UsageOutput,
+    UsageFreshness, UsageMetric, UsageOutput,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::path::Path;
 
+const PROVIDER: &str = "Warp/Oz";
+
+/// Only a manual `tokscale warp sync` refreshes the cache, so a minutes-old
+/// sync is the normal state; past a day the card is shown as cached and warns.
+const STALE_AFTER_SECONDS: i64 = 24 * 60 * 60;
+
+/// Admit on the file alone so a malformed cache reaches `fetch_report` and is
+/// reported, instead of the provider silently disappearing.
 pub fn has_credentials() -> bool {
-    has_cache_file_at(&crate::warp::get_warp_cache_dir().join("usage.json"))
+    usage_cache_path().is_file()
 }
 
-fn has_cache_file_at(path: &Path) -> bool {
-    path.is_file()
+fn usage_cache_path() -> std::path::PathBuf {
+    crate::warp::get_warp_cache_dir().join("usage.json")
 }
 
 fn build_metrics(usage: &crate::warp::WarpAggregateUsage) -> Vec<UsageMetric> {
@@ -57,23 +65,54 @@ fn build_metrics(usage: &crate::warp::WarpAggregateUsage) -> Vec<UsageMetric> {
     metrics
 }
 
-const PROVIDER: &str = "Warp/Oz";
+/// The cache is written only by `tokscale warp sync`, so an old sync still
+/// shows its numbers, marked as cached with its sync time and a warning that
+/// says how old they are.
+pub fn fetch_report() -> UsageFetchReport {
+    report_at(&usage_cache_path(), Utc::now())
+}
 
-/// The cache is only written by `tokscale warp sync`, so an old sync still
-/// shows its numbers, with a warning that says how old they are.
-pub fn fetch() -> Result<UsageFetchReport> {
-    read_report_at(
-        &crate::warp::get_warp_cache_dir().join("usage.json"),
-        Utc::now(),
-    )
+fn report_at(path: &Path, now: DateTime<Utc>) -> UsageFetchReport {
+    read_report_at(path, now)
+        .unwrap_or_else(|error| UsageFetchReport::from_error(PROVIDER, None, error))
 }
 
 fn read_report_at(path: &Path, now: DateTime<Utc>) -> Result<UsageFetchReport> {
     let content = std::fs::read_to_string(path).context("Warp aggregate usage cache not found")?;
-    let cache = serde_json::from_str(&content).context("Invalid Warp aggregate usage cache")?;
-    let (output, age) = build_output(&cache, now)?;
+    let cache: crate::warp::WarpUsageCache =
+        serde_json::from_str(&content).context("Invalid Warp aggregate usage cache")?;
+    anyhow::ensure!(
+        cache.version == 1,
+        "Unsupported Warp aggregate usage cache version {}",
+        cache.version
+    );
+    let synced_at = DateTime::parse_from_rfc3339(&cache.synced_at)
+        .context("Invalid Warp aggregate usage cache sync timestamp")?;
+    let age = now.signed_duration_since(synced_at);
+    anyhow::ensure!(
+        age >= chrono::Duration::zero(),
+        "Warp aggregate usage cache sync timestamp is in the future"
+    );
+    let stale = age > chrono::Duration::seconds(STALE_AFTER_SECONDS);
+
+    let output = UsageOutput {
+        freshness: Some(UsageFreshness {
+            fetched_at: u64::try_from(synced_at.timestamp())
+                .context("Warp aggregate usage cache sync timestamp is before 1970")?,
+            stale,
+        }),
+        provider: PROVIDER.to_string(),
+        account: None,
+        credential_source: None,
+        plan: None,
+        email: None,
+        metrics: build_metrics(&cache.usage),
+        reset_credits: None,
+        credit_status: None,
+        spend_control: None,
+    };
     let mut diagnostics = Vec::new();
-    if age > chrono::Duration::seconds(super::USAGE_CACHE_MAX_AGE_SECONDS as i64) {
+    if stale {
         diagnostics.push(UsageFetchDiagnostic::with_kind(
             PROVIDER,
             None,
@@ -102,39 +141,6 @@ fn describe_age(age: chrono::Duration) -> String {
     }
 }
 
-fn build_output(
-    cache: &crate::warp::WarpUsageCache,
-    now: DateTime<Utc>,
-) -> Result<(UsageOutput, chrono::Duration)> {
-    anyhow::ensure!(
-        cache.version == 1,
-        "Unsupported Warp aggregate usage cache version {}",
-        cache.version
-    );
-    let synced_at = DateTime::parse_from_rfc3339(&cache.synced_at)
-        .context("Invalid Warp aggregate usage cache source timestamp")?;
-    let age = now.signed_duration_since(synced_at);
-    anyhow::ensure!(
-        age >= chrono::Duration::zero(),
-        "Warp aggregate usage cache source timestamp is in the future"
-    );
-    let metrics = build_metrics(&cache.usage);
-
-    let output = UsageOutput {
-        freshness: None,
-        provider: PROVIDER.to_string(),
-        account: None,
-        credential_source: None,
-        plan: None,
-        email: None,
-        metrics,
-        reset_credits: None,
-        credit_status: None,
-        spend_control: None,
-    };
-    Ok((output, age))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,8 +150,9 @@ mod tests {
         "2026-10-17T12:00:00Z".parse().unwrap()
     }
 
-    fn fixture(synced_at: &str) -> crate::warp::WarpUsageCache {
-        crate::warp::WarpUsageCache {
+    /// Writes a v1 cache reporting a known zero: 0 of 100 requests, $0 spend.
+    fn write_cache(path: &Path, synced_at: &str) {
+        let cache = crate::warp::WarpUsageCache {
             version: 1,
             synced_at: synced_at.to_string(),
             usage: WarpAggregateUsage {
@@ -155,107 +162,99 @@ mod tests {
                 ..Default::default()
             },
             workspaces: Vec::new(),
-        }
+        };
+        std::fs::write(path, serde_json::to_string(&cache).unwrap()).unwrap();
     }
 
     #[test]
-    fn freshness_accepts_current_and_boundary_known_zero_usage() {
-        for timestamp in ["2026-10-17T12:00:00Z", "2026-10-17T11:55:00Z"] {
-            let (output, _) = build_output(&fixture(timestamp), now()).unwrap();
-            assert_eq!(output.metrics.len(), 2);
+    fn cache_age_selects_updated_or_cached_with_sync_time() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("usage.json");
+        for (synced_at, stale, age) in [
+            ("2026-10-17T12:00:00Z", false, None),
+            ("2026-10-17T09:00:00Z", false, None),
+            ("2026-10-16T12:00:00Z", false, None),
+            ("2026-10-16T11:59:59Z", true, Some("24 h")),
+            ("2026-10-15T12:00:00Z", true, Some("2 days")),
+            ("2026-10-10T12:00:00Z", true, Some("7 days")),
+        ] {
+            write_cache(&path, synced_at);
+            let report = report_at(&path, now());
+            assert_eq!(report.outputs.len(), 1, "{synced_at}: the card is kept");
+            let output = &report.outputs[0];
+            let synced = DateTime::parse_from_rfc3339(synced_at).unwrap().timestamp();
+            assert_eq!(
+                output.freshness,
+                Some(UsageFreshness {
+                    fetched_at: synced as u64,
+                    stale,
+                }),
+                "{synced_at}"
+            );
+            // The known zero is still reported as 0% used, stale or not.
             assert_eq!(output.metrics[0].used_percent, 0.0);
-            assert_eq!(output.metrics[0].remaining_percent, 100.0);
             assert_eq!(output.metrics[1].remaining_label.as_deref(), Some("$0.00"));
+            match age {
+                None => assert!(report.diagnostics.is_empty(), "{synced_at}"),
+                Some(age) => {
+                    assert_eq!(report.diagnostics.len(), 1);
+                    let diagnostic = &report.diagnostics[0];
+                    assert_eq!(diagnostic.provider, PROVIDER);
+                    assert_eq!(diagnostic.severity, UsageFetchDiagnosticSeverity::Warning);
+                    assert!(diagnostic.message.contains(age), "{}", diagnostic.message);
+                    assert!(diagnostic.message.contains("tokscale warp sync"));
+                }
+            }
         }
     }
 
     #[test]
-    fn freshness_rejects_future_and_malformed_source_times() {
-        for (timestamp, reason) in [
+    fn untrustworthy_cache_fails_closed_with_a_diagnostic() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("usage.json");
+        let missing = report_at(&path, now());
+        assert!(missing.outputs.is_empty());
+        assert!(missing.diagnostics[0].message.contains("not found"));
+
+        for (content, reason) in [
+            ("malformed".to_string(), "Invalid"),
+            (
+                r#"{"version":1,"usage":{},"workspaces":[]}"#.to_string(),
+                "Invalid",
+            ),
+            (
+                r#"{"version":2,"syncedAt":"2026-10-17T12:00:00Z","usage":{},"workspaces":[]}"#
+                    .to_string(),
+                "version",
+            ),
+        ] {
+            std::fs::write(&path, content).unwrap();
+            let report = report_at(&path, now());
+            assert!(report.outputs.is_empty());
+            assert_eq!(report.diagnostics.len(), 1);
+            assert_eq!(report.diagnostics[0].provider, PROVIDER);
+            assert!(
+                report.diagnostics[0].message.contains(reason),
+                "{}",
+                report.diagnostics[0].message
+            );
+        }
+
+        for (synced_at, reason) in [
             ("2026-10-17T12:00:01Z", "future"),
             ("2026-10-17T12:00:00.001Z", "future"),
             ("", "timestamp"),
             ("not-a-time", "timestamp"),
         ] {
-            let error = build_output(&fixture(timestamp), now())
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains(reason), "{error}");
-        }
-    }
-
-    #[test]
-    fn freshness_rejects_unsupported_producer_version() {
-        let mut cache = fixture("2026-10-17T12:00:00Z");
-        cache.version = 2;
-        let error = build_output(&cache, now()).unwrap_err().to_string();
-        assert!(error.contains("version"), "{error}");
-    }
-
-    #[test]
-    fn freshness_admission_keeps_malformed_cache_visible_for_diagnostics() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let path = temp.path().join("usage.json");
-        assert!(!has_cache_file_at(&path));
-        std::fs::write(&path, "malformed").unwrap();
-        assert!(has_cache_file_at(&path));
-        let report = super::super::fetch_provider_report(
-            "Warp/Oz",
-            read_report_at(&path, now()).map(|report| report.outputs),
-        );
-        assert!(report.outputs.is_empty());
-        assert_eq!(report.diagnostics.len(), 1);
-        assert_eq!(report.diagnostics[0].provider, "Warp/Oz");
-        assert!(report.diagnostics[0].message.contains("Invalid"));
-    }
-
-    #[test]
-    fn freshness_reads_only_explicit_fixture_path() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let path = temp.path().join("usage.json");
-        std::fs::write(
-            &path,
-            serde_json::to_string(&fixture("2026-10-17T11:54:59Z")).unwrap(),
-        )
-        .unwrap();
-        let report = read_report_at(&path, now()).unwrap();
-        assert_eq!(report.outputs.len(), 1);
-        assert!(path.exists());
-        std::fs::write(&path, r#"{"version":1,"usage":{},"workspaces":[]}"#).unwrap();
-        assert!(read_report_at(&path, now())
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid"));
-    }
-
-    #[test]
-    fn stale_cache_keeps_the_card_and_warns_with_its_age() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let path = temp.path().join("usage.json");
-        for (timestamp, age) in [
-            ("2026-10-17T11:54:59Z", "5 min"),
-            ("2026-10-17T09:00:00Z", "3 h"),
-            ("2026-10-10T12:00:00Z", "7 days"),
-        ] {
-            std::fs::write(&path, serde_json::to_string(&fixture(timestamp)).unwrap()).unwrap();
-            let report = read_report_at(&path, now()).unwrap();
-            assert_eq!(
-                report.outputs.len(),
-                1,
-                "a stale cache still shows its card"
+            write_cache(&path, synced_at);
+            let report = report_at(&path, now());
+            assert!(report.outputs.is_empty(), "{synced_at}");
+            assert!(
+                report.diagnostics[0].message.contains(reason),
+                "{}",
+                report.diagnostics[0].message
             );
-            assert_eq!(report.diagnostics.len(), 1);
-            let diagnostic = &report.diagnostics[0];
-            assert_eq!(diagnostic.severity, UsageFetchDiagnosticSeverity::Warning);
-            assert!(diagnostic.message.contains(age), "{}", diagnostic.message);
-            assert!(diagnostic.message.contains("tokscale warp sync"));
         }
-        std::fs::write(
-            &path,
-            serde_json::to_string(&fixture("2026-10-17T11:55:00Z")).unwrap(),
-        )
-        .unwrap();
-        assert!(read_report_at(&path, now()).unwrap().diagnostics.is_empty());
     }
 
     #[test]

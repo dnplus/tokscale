@@ -2,7 +2,7 @@
 //!
 //! Uses rayon for parallel map-reduce operations.
 
-use crate::sessions::UnifiedMessage;
+use crate::sessions::{SharedStr, UnifiedMessage};
 use crate::{
     ClientContributionV2, CostProvenance, CostProvenanceKind, DailyContributionV2, DailyTotalsV2,
     DataSummaryV2, EstimateSource, GraphMeta, GraphResultV2, SessionContributionV2, TokenBreakdown,
@@ -100,11 +100,11 @@ fn aggregate_by_date_parallel(
     }
 
     let estimated_days = (message_count / 10).clamp(30, 400);
-    let daily_map: HashMap<String, DayAccumulator> = messages
+    let daily_map: HashMap<SharedStr, DayAccumulator> = messages
         .filter(|(msg, _)| !crate::claude_desktop::is_undated_balance(msg))
         .fold(
             || HashMap::with_capacity(estimated_days),
-            |mut acc: HashMap<String, DayAccumulator>, (message, source)| {
+            |mut acc: HashMap<SharedStr, DayAccumulator>, (message, source)| {
                 acc.entry(message.date.clone())
                     .or_default()
                     .add_message_with_estimate_source(&message, source);
@@ -135,7 +135,7 @@ fn aggregate_by_date_parallel(
 /// byte-identical contributions.
 #[derive(Default)]
 pub struct DailyFoldV2 {
-    days: HashMap<String, DayAccumulator>,
+    days: HashMap<SharedStr, DayAccumulator>,
 }
 
 impl DailyFoldV2 {
@@ -166,7 +166,7 @@ impl DailyFoldV2 {
         contributions.extend(
             self.days
                 .into_iter()
-                .map(|(date, acc)| acc.into_contribution(date)),
+                .map(|(date, acc)| acc.into_contribution(date.to_string())),
         );
 
         // Sort by date
@@ -222,7 +222,7 @@ pub(crate) struct SessionFoldV2 {
 }
 
 /// A session is identified by its client and id together.
-type SessionKey = (String, String);
+type SessionKey = (SharedStr, SharedStr);
 
 fn session_key(message: &UnifiedMessage) -> SessionKey {
     (message.client.clone(), message.session_id.clone())
@@ -240,7 +240,7 @@ impl SessionFoldV2 {
         let mut contributions: Vec<SessionContributionV2> = self
             .sessions
             .into_iter()
-            .map(|((_, session_id), acc)| acc.into_contribution(session_id))
+            .map(|((_, session_id), acc)| acc.into_contribution(session_id.to_string()))
             .collect();
 
         // Most recently active first; stable sort by session_id when ties.
@@ -602,9 +602,9 @@ impl DayAccumulator {
             .clients
             .entry(key)
             .or_insert_with(|| ClientContributionV2 {
-                client: msg.client.clone(),
+                client: msg.client.to_string(),
                 model_id: crate::canonical_model_id(&msg.model_id),
-                provider_id: msg.provider_id.clone(),
+                provider_id: msg.provider_id.to_string(),
                 tokens: TokenBreakdown::default(),
                 cost: 0.0,
                 messages: 0,
@@ -834,9 +834,9 @@ impl SessionAccumulator {
             .clients
             .entry(key)
             .or_insert_with(|| ClientContributionV2 {
-                client: msg.client.clone(),
+                client: msg.client.to_string(),
                 model_id: normalized_model.clone(),
-                provider_id: msg.provider_id.clone(),
+                provider_id: msg.provider_id.to_string(),
                 tokens: TokenBreakdown::default(),
                 cost: 0.0,
                 messages: 0,
@@ -1121,7 +1121,7 @@ mod tests {
     fn sessions_with_one_id_in_two_clients_stay_separate() {
         let message = |client: &str, tokens: i64| {
             let mut m = mock_unified_message("2026-05-28", tokens, 0.1, "model", client);
-            m.session_id = "shared".to_string();
+            m.session_id = "shared".into();
             m.timestamp = 1_780_000_000_000;
             m
         };
@@ -1147,7 +1147,7 @@ mod tests {
     fn zero_timestamps_do_not_set_first_or_last_seen() {
         let message = |timestamp: i64| {
             let mut m = mock_unified_message("2026-05-28", 10, 0.1, "model", "claude");
-            m.session_id = "s".to_string();
+            m.session_id = "s".into();
             m.timestamp = timestamp;
             m
         };
@@ -1175,14 +1175,14 @@ mod tests {
         let timestamp = datetime.timestamp_millis();
 
         UnifiedMessage {
-            client: client.to_string(),
-            model_id: model.to_string(),
-            provider_id: "test-provider".to_string(),
-            session_id: "test-session".to_string(),
+            client: client.to_string().into(),
+            model_id: model.to_string().into(),
+            provider_id: "test-provider".to_string().into(),
+            session_id: "test-session".to_string().into(),
             workspace_key: None,
             workspace_label: None,
             timestamp,
-            date: date.to_string(),
+            date: date.to_string().into(),
             tokens: TokenBreakdown {
                 input: tokens / 2,
                 output: tokens / 2,
@@ -1207,6 +1207,7 @@ mod tests {
             estimate_status: crate::sessions::EstimateStatus::Unpriced,
             copilot_context: None,
             session_context: Default::default(),
+            claude_entry_uuid: Default::default(),
             machine_label: None,
         }
     }
@@ -1859,14 +1860,14 @@ mod tests {
         cost: f64,
     ) -> UnifiedMessage {
         UnifiedMessage {
-            client: client.to_string(),
-            model_id: model.to_string(),
-            provider_id: provider.to_string(),
-            session_id: session_id.to_string(),
+            client: client.to_string().into(),
+            model_id: model.to_string().into(),
+            provider_id: provider.to_string().into(),
+            session_id: session_id.to_string().into(),
             workspace_key: None,
             workspace_label: None,
             timestamp: timestamp_ms,
-            date: date.to_string(),
+            date: date.to_string().into(),
             tokens,
             cost,
             cost_source: Default::default(),
@@ -1883,6 +1884,7 @@ mod tests {
             estimate_status: crate::sessions::EstimateStatus::Unpriced,
             copilot_context: None,
             session_context: Default::default(),
+            claude_entry_uuid: Default::default(),
             machine_label: None,
             duration_ms: None,
         }
