@@ -1443,19 +1443,23 @@ mod tests {
         "ANTIGRAVITY_SESSION_FILE",
     ];
 
+    const ISOLATED_ENV_KEYS: [&str; 10] = [
+        "HOME",
+        "USERPROFILE",
+        "ANTIGRAVITY_LS_ADDRESS",
+        "ANTIGRAVITY_LS_PORT",
+        "ANTIGRAVITY_CSRF_TOKEN",
+        "ANTIGRAVITY_APP_DATA_DIR",
+        "ANTIGRAVITY_SESSION_FILE",
+        "GEMINI_CLI_HOME",
+        "TOKSCALE_AGY_BIN",
+        "PATH",
+    ];
+
     fn isolate_agy_env(home: &TempDir) -> EnvGuard {
-        let mut env = EnvGuard::capture(&[
-            "HOME",
-            "USERPROFILE",
-            "GEMINI_CLI_HOME",
-            "TOKSCALE_AGY_BIN",
-            "PATH",
-        ]);
-        for key in HOME_ENV_KEYS {
-            env.set(key, home.path());
-        }
-        env.remove("GEMINI_CLI_HOME");
-        env.remove("TOKSCALE_AGY_BIN");
+        let mut env = EnvGuard::capture(&ISOLATED_ENV_KEYS);
+        env.set("HOME", home.path());
+        env.set("USERPROFILE", home.path());
         env.set("PATH", home.path().join("empty-path"));
         env
     }
@@ -1653,6 +1657,8 @@ printf '%s\n' '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{
         }
         env.remove("ANTIGRAVITY_LS_ADDRESS");
         env.remove("ANTIGRAVITY_LS_PORT");
+        env.remove("ANTIGRAVITY_APP_DATA_DIR");
+        env.remove("ANTIGRAVITY_SESSION_FILE");
     }
 
     /// A listener that accepts and then says nothing.
@@ -1790,8 +1796,7 @@ printf '%s\n' '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{
         });
 
         let home = TempDir::new().unwrap();
-        let mut env = EnvGuard::capture(&["HOME", "USERPROFILE", "GEMINI_CLI_HOME"]);
-        env.remove("GEMINI_CLI_HOME");
+        let mut env = EnvGuard::capture(&ISOLATED_ENV_KEYS);
         redirect_home_to_logged_ports(&mut env, &home, &[port_of(&base)]);
 
         let (has_credentials, fetch) = registered_antigravity_provider();
@@ -1851,8 +1856,7 @@ printf '%s\n' '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{
         let (base, seen) = spawn_server(|_path, _calls| (200, FIXTURE_QUOTA.to_string()));
 
         let home = TempDir::new().unwrap();
-        let mut env = EnvGuard::capture(&["HOME", "USERPROFILE", "GEMINI_CLI_HOME"]);
-        env.remove("GEMINI_CLI_HOME");
+        let mut env = EnvGuard::capture(&ISOLATED_ENV_KEYS);
         redirect_home_to_logged_ports(
             &mut env,
             &home,
@@ -1910,8 +1914,7 @@ printf '%s\n' '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{
         let (older_base, newer_base, newer_seen) = spawn_ordered_pair(NEWER_DELAY);
 
         let home = TempDir::new().unwrap();
-        let mut env = EnvGuard::capture(&["HOME", "USERPROFILE", "GEMINI_CLI_HOME"]);
-        env.remove("GEMINI_CLI_HOME");
+        let mut env = EnvGuard::capture(&ISOLATED_ENV_KEYS);
         redirect_home_to_logged_ports(
             &mut env,
             &home,
@@ -2243,8 +2246,7 @@ printf '%s\n' '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{
     #[test]
     #[serial]
     fn per_session_log_ports_survive_past_the_tail_window() {
-        let mut env = EnvGuard::capture(&["HOME", "USERPROFILE", "GEMINI_CLI_HOME"]);
-        env.remove("GEMINI_CLI_HOME");
+        let mut env = EnvGuard::capture(&ISOLATED_ENV_KEYS);
         let home = TempDir::new().unwrap();
         let log_dir = home.path().join(".gemini").join("antigravity-cli");
         std::fs::create_dir_all(&log_dir).unwrap();
@@ -2252,9 +2254,8 @@ printf '%s\n' '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{
         // ~432 KiB, past the 256 KiB tail window.
         let filler = "streamed chunk, diff, and tool output from a long session\n".repeat(12000);
         std::fs::write(log_dir.join("cli.log"), format!("{head}{filler}")).unwrap();
-        for key in HOME_ENV_KEYS {
-            env.set(key, home.path());
-        }
+        env.set("HOME", home.path());
+        env.set("USERPROFILE", home.path());
 
         assert_eq!(ports_from_cli_log(), vec![3417]);
     }
@@ -2265,8 +2266,7 @@ printf '%s\n' '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{
     #[test]
     #[serial]
     fn tail_window_ports_are_tried_before_head_window_ports() {
-        let mut env = EnvGuard::capture(&["HOME", "USERPROFILE", "GEMINI_CLI_HOME"]);
-        env.remove("GEMINI_CLI_HOME");
+        let mut env = EnvGuard::capture(&ISOLATED_ENV_KEYS);
         let home = TempDir::new().unwrap();
         let log_dir = home.path().join(".gemini").join("antigravity-cli");
         std::fs::create_dir_all(&log_dir).unwrap();
@@ -2278,9 +2278,8 @@ printf '%s\n' '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{
             ),
         )
         .unwrap();
-        for key in HOME_ENV_KEYS {
-            env.set(key, home.path());
-        }
+        env.set("HOME", home.path());
+        env.set("USERPROFILE", home.path());
 
         assert_eq!(ports_from_cli_log(), vec![41234, 5001]);
     }

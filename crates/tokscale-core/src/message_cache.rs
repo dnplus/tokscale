@@ -9473,25 +9473,30 @@ mod tests {
         }
     }
 
-    /// Rewrite the Claude shard holding `source` in the v13 envelope, which
-    /// has no entry uuids: what every cache written before them holds.
+    /// Rewrite the Claude shard holding `source` in the fork's v13 envelope,
+    /// which keeps session context but has no entry uuids: what caches written
+    /// before entry uuids hold.
     fn downgrade_claude_shard_to_v13(source: &Path) {
         let identity = CacheIdentity::for_client(ClientId::Claude);
         let shard = cache_shard_path(identity, source);
         let mut envelope: CachedShardEnvelope = bincode::options()
             .deserialize(&fs::read(&shard).unwrap())
             .unwrap();
-        assert_eq!(envelope.format_version, CLAUDE_CACHE_FORMAT_VERSION);
+        assert_eq!(
+            envelope.format_version,
+            CLAUDE_SESSION_CONTEXT_CACHE_FORMAT_VERSION
+        );
         let entries: Vec<(
             CachedSourceEntry,
             Option<crate::sessions::claudecode::ClaudeCheckpoint>,
+            Vec<SessionContext>,
             Vec<crate::sessions::ClaudeEntryUuid>,
         )> = bincode::options().deserialize(&envelope.payload).unwrap();
         let legacy: Vec<_> = entries
             .iter()
-            .map(|(entry, checkpoint, _)| (entry, checkpoint))
+            .map(|(entry, checkpoint, contexts, _)| (entry, checkpoint, contexts))
             .collect();
-        envelope.format_version = LEGACY_CLAUDE_CACHE_FORMAT_VERSION_V13;
+        envelope.format_version = LEGACY_CLAUDE_SESSION_CONTEXT_CACHE_FORMAT_VERSION_V13;
         envelope.payload = bincode::options().serialize(&legacy).unwrap();
         fs::write(&shard, bincode::options().serialize(&envelope).unwrap()).unwrap();
     }
@@ -9601,7 +9606,7 @@ mod tests {
             assert_eq!(totals(), both_matched, "{phase}");
             assert_eq!(
                 claude_shard_format(&source),
-                LEGACY_CLAUDE_CACHE_FORMAT_VERSION_V13,
+                LEGACY_CLAUDE_SESSION_CONTEXT_CACHE_FORMAT_VERSION_V13,
                 "{phase}: an unchanged legacy entry must not be rebuilt"
             );
         }
@@ -9622,7 +9627,10 @@ mod tests {
                 "{phase}"
             );
         }
-        assert_eq!(claude_shard_format(&source), CLAUDE_CACHE_FORMAT_VERSION);
+        assert_eq!(
+            claude_shard_format(&source),
+            CLAUDE_SESSION_CONTEXT_CACHE_FORMAT_VERSION
+        );
     }
 
     #[test]
@@ -11564,14 +11572,18 @@ mod tests {
         write_envelope(
             &shard,
             identity,
-            CLAUDE_CACHE_FORMAT_VERSION,
+            LEGACY_CLAUDE_CACHE_FORMAT_VERSION_V13,
             &vec![(&entry, &entry.claude_checkpoint)],
         );
 
         let ShardReadStatus::Loaded(entries) = read_shard(&shard, identity) else {
-            panic!("a format-{CLAUDE_CACHE_FORMAT_VERSION} Claude shard still loads");
+            panic!("a format-{LEGACY_CLAUDE_CACHE_FORMAT_VERSION_V13} Claude shard still loads");
         };
-        assert_eq!(entries[0].messages, entry.messages);
+        let mut expected_messages = entry.messages.clone();
+        for message in &mut expected_messages {
+            message.claude_entry_uuid = crate::sessions::ClaudeEntryUuid::Unknown;
+        }
+        assert_eq!(entries[0].messages, expected_messages);
         assert_eq!(
             entries[0].retained_message_keys(),
             HashSet::from(["msg_old:req_old".to_string()])

@@ -25662,12 +25662,22 @@ mod tests {
                 .collect();
             assert_eq!(shards.len(), 1);
             // Bincode encodes this struct positionally: format, namespace,
-            // parser version, payload. Keep the existing format and bytes.
-            let (format, namespace, _, _): (u32, String, u32, Vec<u8>) = bincode::options()
+            // parser version, payload. Keep the existing fork session-context
+            // envelope format (1011) and its trailing context fields.
+            let (format, namespace, _, payload): (u32, String, u32, Vec<u8>) = bincode::options()
                 .deserialize(&std::fs::read(&shards[0]).unwrap())
                 .unwrap();
-            assert_eq!(format, 11);
-            let payload = bincode::options().serialize(&vec![old_entry]).unwrap();
+            assert_eq!(format, 1011);
+            let existing: Vec<(
+                message_cache::CachedSourceEntry,
+                Vec<sessions::SessionContext>,
+                Option<sessions::SessionContext>,
+            )> = bincode::options().deserialize(&payload).unwrap();
+            assert_eq!(existing.len(), 1);
+            let (_, contexts, parse_context) = existing.into_iter().next().unwrap();
+            let payload = bincode::options()
+                .serialize(&vec![(old_entry, contexts, parse_context)])
+                .unwrap();
             let envelope = bincode::options()
                 .serialize(&(format, namespace, version, payload))
                 .unwrap();
