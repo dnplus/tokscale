@@ -6680,44 +6680,63 @@ fn test_submit_compacts_repeated_daily_regression_warnings_without_losing_detail
     listener.set_nonblocking(true).unwrap();
     let api = format!("http://{}", listener.local_addr().unwrap());
     let server = std::thread::spawn(move || {
+        // The CLI first asks the receiver what it supports (a body-less GET),
+        // then uploads. Answer the probe as an older receiver would.
         let deadline = Instant::now() + Duration::from_secs(45);
-        let (mut stream, _) = loop {
-            match listener.accept() {
-                Ok(connection) => break connection,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(10));
+        loop {
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("submit did not reach the fixture server: {error}"),
                 }
-                Err(error) => panic!("submit did not reach the fixture server: {error}"),
-            }
-        };
-        // Windows accepted sockets inherit the listener's nonblocking mode.
-        stream.set_nonblocking(false).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .unwrap();
-        {
-            let mut reader = BufReader::new(&mut stream);
-            let mut line = String::new();
+            };
+            // Windows accepted sockets inherit the listener's nonblocking mode.
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
             let mut content_length = 0;
-            loop {
-                line.clear();
-                reader.read_line(&mut line).unwrap();
-                if line == "\r\n" || line.is_empty() {
-                    break;
-                }
-                if let Some((name, value)) = line.split_once(':') {
-                    if name.eq_ignore_ascii_case("content-length") {
-                        content_length = value.trim().parse::<usize>().unwrap();
+            {
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse::<usize>().unwrap();
+                        }
                     }
                 }
+                let mut request = vec![0; content_length];
+                reader.read_exact(&mut request).unwrap();
             }
-            let mut request = vec![0; content_length];
-            reader.read_exact(&mut request).unwrap();
+            if content_length == 0 {
+                write!(
+                    stream,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                continue;
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            break;
         }
-        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
     });
 
     let output = cmd_with_home(tmp.path())
@@ -6787,50 +6806,63 @@ fn test_submit_compacts_missing_client_and_active_time_preservation_warnings() {
     listener.set_nonblocking(true).unwrap();
     let api = format!("http://{}", listener.local_addr().unwrap());
     let server = std::thread::spawn(move || {
+        // The CLI first asks the receiver what it supports (a body-less GET),
+        // then uploads. Answer the probe as an older receiver would.
         let deadline = Instant::now() + Duration::from_secs(45);
-        let (mut stream, _) = loop {
-            match listener.accept() {
-                Ok(connection) => break connection,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(10));
+        loop {
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("submit did not reach the fixture server: {error}"),
                 }
-                Err(error) => panic!("submit did not reach the fixture server: {error}"),
-            }
-        };
-        // Windows accepted sockets inherit the listener's nonblocking mode.
-        stream.set_nonblocking(false).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .unwrap();
-        {
-            let mut reader = BufReader::new(&mut stream);
-            let mut line = String::new();
+            };
+            // Windows accepted sockets inherit the listener's nonblocking mode.
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
             let mut content_length = 0;
-            loop {
-                line.clear();
-                reader.read_line(&mut line).unwrap();
-                if line == "\r\n" || line.is_empty() {
-                    break;
-                }
-                if let Some((name, value)) = line.split_once(':') {
-                    if name.eq_ignore_ascii_case("content-length") {
-                        content_length = value.trim().parse::<usize>().unwrap();
+            {
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse::<usize>().unwrap();
+                        }
                     }
                 }
+                let mut request = vec![0; content_length];
+                reader.read_exact(&mut request).unwrap();
             }
-            let mut request = vec![0; content_length];
-            reader.read_exact(&mut request).unwrap();
+            if content_length == 0 {
+                write!(
+                    stream,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                continue;
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            break;
         }
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        )
-        .unwrap();
     });
 
     let output = cmd_with_home(tmp.path())
@@ -9702,7 +9734,16 @@ fn capy_submit_failed_refresh_does_not_promise_foreign_cached_usage() {
     let output = cmd_with_home(tmp.path())
         .env("CAPY_API_KEY", "capy_scope_b_synthetic")
         .env("TOKSCALE_API_TOKEN", "synthetic-token")
-        .args(["--no-spinner", "submit", "--client", "capy", "--dry-run"])
+        // Without --no-quota a self-hosted receiver still gets a quota-only
+        // submit, which is not the empty-usage exit this test pins.
+        .args([
+            "--no-spinner",
+            "submit",
+            "--client",
+            "capy",
+            "--dry-run",
+            "--no-quota",
+        ])
         .output()
         .unwrap();
     let rendered = format!(

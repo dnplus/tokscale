@@ -25700,7 +25700,10 @@ mod tests {
             let (format, namespace, _, _): (u32, String, u32, Vec<u8>) = bincode::options()
                 .deserialize(&std::fs::read(&shards[0]).unwrap())
                 .unwrap();
-            assert_eq!(format, 11);
+            // The fork writes its own envelope around this layout and still
+            // loads upstream's, which is the shape the old entry is frozen in.
+            assert_eq!(format, 1011);
+            let format = 11u32;
             let payload = bincode::options().serialize(&vec![old_entry]).unwrap();
             let envelope = bincode::options()
                 .serialize(&(format, namespace, version, payload))
